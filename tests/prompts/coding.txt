@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a complete, correct C++17 implementation of a red-black tree with insert, erase and an in-order iterator. Include the rebalancing logic and explain the invariants briefly.<|end_message|><|message_model|><|content_text|>

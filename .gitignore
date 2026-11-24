@@ -1,0 +1,30 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.out
+
+# Model weights (large binaries)
+models/*.gguf
+models/*.safetensors
+models/*.bin
+!models/draft_shortlist.bin
+
+# Logs & profiling
+*.log
+.rocprofv3/
+*.db
+*.csv
+
+# Runtime outputs & dumps
+outputs/
+core
+core.*
+
+# Editor & OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
