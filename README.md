@@ -6,7 +6,7 @@
 
 **Nib** is a native, zero-framework C++17 / AMD RDNA3 HIP inference engine for **Inkling 2 Mini** (26B looped hybrid-attention MoE + Vision + DSpark MTP), built from scratch for **AMD RDNA3 (`gfx1100`, Navi 31) GPUs**.
 
-It fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **21.50 GiB VRAM** (`--slots 1`), **21.89 GiB** (`--slots 4`), or **22.40 GiB** (`--slots 8`), with **zero SGPR/VGPR/private-segment register spills** across every GPU kernel.
+It fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **21.50 GiB VRAM** at startup (`--slots 1`, rising to **22.45 GiB** peak once high-resolution Vision activation buffers are lazily allocated; **21.89 GiB** startup @ `--slots 4`, **22.40 GiB** startup @ `--slots 8`), with **zero SGPR/VGPR/private-segment register spills** across every GPU kernel.
 
 ---
 
@@ -62,7 +62,7 @@ Full BetterBench report: [`docs/betterbench_slots8_262k.html`](docs/betterbench_
 
 ## Capability & Long-Context Verification (`gbench`, RX 7900 XTX, `sparse-224`)
 
-Verified end-to-end against [`google-deepmind/gbench`](https://github.com/google-deepmind/gbench) (`v0.5.0.post1`) over an **8h 12m** continuous soak (**2,289 requests**, **30.97M prompt tokens**, **2.80M completion tokens**, **0 HTTP/engine errors**, **0 empty replies**, steady **22.45 GiB** VRAM with `--slots 1 -c 262848 --kv-type q8_0 --sparse-pages 224 --mtp --mmproj`):
+Verified end-to-end against [`google-deepmind/gbench`](https://github.com/google-deepmind/gbench) (`v0.5.0.post1`) over an **8h 12m** continuous soak (**2,289 requests**, **30.97M prompt tokens**, **2.80M completion tokens**, **0 HTTP/engine errors**, **0 empty replies**, **21.50 GiB** startup → **22.45 GiB** high-res multimodal peak VRAM with `--slots 1 -c 262848 --kv-type q8_0 --sparse-pages 224 --mtp --mmproj`):
 
 | Suite | Mode / Scope | Nib (`NVFP4-Mixed` + `Q8_0` `sp224`) | Median Decode | Reference / Notes |
 |---|---|---:|---:|---|
@@ -118,14 +118,15 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 
 | GPU (`gfx1100` / Navi 31) | CUs / VRAM | Verification | Recommended Config |
 |---|---:|---|---|
-| **RX 7900 XTX** | 96 CU / 24 GiB | **Measured on hardware** | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50 GiB` @ `--slots 1`, `21.89 GiB` @ `--slots 4`, `22.40 GiB` @ `--slots 8`) |
-| **Radeon PRO W7900** | 96 CU / 48 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB`) |
-| **Radeon PRO W7800 32 GB** | 70 CU / 32 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB`) |
+| **RX 7900 XTX** | 96 CU / 24 GiB | **Measured on hardware** | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50 GiB` startup / `22.45 GiB` high-res Vision peak @ `--slots 1`; `21.89 GiB` startup @ `--slots 4`; `22.40 GiB` startup @ `--slots 8`) |
+| **Radeon PRO W7900** | 96 CU / 48 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB` startup, `+0.95 GiB` max Vision scratch) |
+| **Radeon PRO W7800 32 GB** | 70 CU / 32 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB` startup, `+0.95 GiB` max Vision scratch) |
 | **RX 7900 XT** | 84 CU / 20 GiB | **Simulated** (`sim_gpu.sh`) | Up to `131,072` ctx + `--kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`~18.35 GiB`) |
 | **RX 7900 GRE / RX 7800 XT** | 16 GiB | **Not supported** | Does not fit the `~16.4 GiB` `NVFP4-Mixed` base weights |
 
 > **Note on other RDNA3 GPUs**: All benchmarks were measured natively on an **RX 7900 XTX**. Because I could not find anywhere to rent other RDNA3 cards (`W7900`, `W7800`, `7900 XT`), compatibility, VRAM budgets, and WGP co-residency guards for those GPUs were validated using an `LD_PRELOAD` HIP CU/VRAM simulator ([`scripts/sim_gpu.sh`](scripts/sim_gpu.sh)) on the 7900 XTX. Real-hardware reports from owners of those cards are welcome!
 
+- **Vision VRAM**: `mmproj-Inkling-2-Mini-Q8_0.gguf` takes **`0.32 GiB`** at startup; [`VisionEncoder::ensure_scratch`](src/vision_encoder.cpp) lazily allocates high-water-mark ViT activation buffers on demand (up to **`+0.95 GiB`** on high-resolution screenshots → **`1.27 GiB`** peak Vision, **`22.45 GiB`** total at `--slots 1`).
 - **System RAM**: **~390 MiB** steady-state RSS (~`2.0–2.5 GiB` transient during startup staging). Runs on **8 GiB** systems; **32 GiB+** keeps the `16.4 GiB` `mmap`'d GGUF warm in Linux page cache for fast (~2s) restarts.
 
 ---

@@ -14,7 +14,7 @@ End-to-end capability, long-context, multimodal, and serving verification of **N
     --slots 1 -c 262848 --kv-type q8_0 --sparse-pages 224 \
     --host 127.0.0.1 --port 4444
   ```
-- **Steady-State VRAM**: **22.45 GiB** (`21.18 GiB` LLM + KV + MTP + `1.27 GiB` Vision encoder)
+- **VRAM Footprint (`--slots 1`)**: **21.50 GiB** at startup (`21.18 GiB` LLM + KV + MTP + `0.32 GiB` Vision weights), rising to **22.45 GiB** steady-state peak (`1.27 GiB` total Vision = `0.32 GiB` weights + `0.95 GiB` lazily allocated high-resolution ViT activation scratch after ScreenSpot / MMMU-Pro images)
 - **Continuous Soak Telemetry** (across Golden Smoke + 5-Suite Reasoning Sweep + Serving Perf + 5-Suite Fast Bundle):
   - **Uptime**: **8h 12m** continuous (`29,568 s`), zero restarts
   - **Requests Served**: **2,289** total (`0` failed HTTP/engine requests, `0` timeouts, `0` empty replies, `0` `answer_in_thinking` drops)
