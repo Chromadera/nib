@@ -1,0 +1,25 @@
+name: Feature / Performance Request
+description: Suggest an enhancement, API feature, GPU target, or kernel optimization
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What workflow, client, or workload does this unlock or improve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the expected behavior, flags, API fields, or kernel/scheduler approach.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Benchmarks, target GPU (`gfx1100`, etc.), client tool names, or references.

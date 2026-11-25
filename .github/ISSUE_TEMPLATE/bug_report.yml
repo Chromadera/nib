@@ -1,0 +1,56 @@
+name: Bug Report
+description: Report a crash, GPU fault, wrong output, performance regression, or API compatibility issue in Nib
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Clear, concise description of the bug and what you expected instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Nib version
+      description: Output of `./build/nib --version` (or commit SHA).
+      placeholder: "nib 0.1.0 (gfx1100, git 419d833)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Hardware & ROCm environment
+      description: GPU model (e.g. RX 7900 XTX / XT / GRE), VRAM, ROCm version, OS/kernel.
+      placeholder: |
+        - GPU: RX 7900 XTX (24 GiB, gfx1100, 96 CU)
+        - ROCm: 6.x
+        - OS / Kernel: Ubuntu 24.04 / Linux 6.x
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command & flags
+      description: Full `nib` command line (including `--slots`, `-c`, `--kv-type`, `--sparse-pages`, `--mtp`, `--mmproj`, etc.) and any client request parameters (`temperature`, `top_k`, `min_p`, `stream`, images, concurrency).
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal prompt / curl / Python snippet that reproduces the issue.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Server stdout/stderr, `dmesg` GPU fault lines (if any), or `/health` output.
+      render: text
