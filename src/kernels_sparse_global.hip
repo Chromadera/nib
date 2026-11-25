@@ -1832,7 +1832,12 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
     if (cand_end <= cand_begin) {
         return;
     }
-    const int pass1_end = min(q_pos_end / SPARSE_PAGE_SIZE + 1, n_pages);
+    // Pages >= meta.max_pages (SPARSE_MAX_PAGES = 4096, i.e. positions >= 262,144
+    // at -c 262848) have no metadata: they are always inside the mandatory recent
+    // window, launch_kv_update_page_minmax_* never writes them, and reading them
+    // here walked past the end of the per-head metadata (the next head's pages or,
+    // for the last KV head, out of the allocation: GPU memory fault).
+    const int pass1_end = min(min(q_pos_end / SPARSE_PAGE_SIZE + 1, n_pages), meta.max_pages);
 
     const int lane    = (int)threadIdx.x;        // 0..31
     const int warp    = (int)threadIdx.y;        // 0..11
@@ -2500,7 +2505,23 @@ static inline void sparse_hip_free(void * p) {
     }
 }
 
-bool sparse_global_page_meta_alloc(SparseGlobalPageMeta & m, int max_pages, int fmt) {
+// hipMalloc + zero fill: hipMalloc'd VRAM is not guaranteed to be clean, and a
+// page that has never been written must score/select as a finite value (issue #1).
+// Stream-ordered on the engine stream (never the legacy null stream).
+static inline hipError_t sparse_hip_malloc_zero(void ** p, size_t bytes, hipStream_t stream) {
+    hipError_t err = hipMalloc(p, bytes);
+    if (err != hipSuccess) {
+        return err;
+    }
+    err = hipMemsetAsync(*p, 0, bytes, stream);
+    if (err != hipSuccess) {
+        (void)hipFree(*p);
+        *p = nullptr;
+    }
+    return err;
+}
+
+bool sparse_global_page_meta_alloc(SparseGlobalPageMeta & m, int max_pages, int fmt, hipStream_t stream) {
     if (max_pages <= 0) {
         return false;
     }
@@ -2508,18 +2529,18 @@ bool sparse_global_page_meta_alloc(SparseGlobalPageMeta & m, int max_pages, int 
     void * p = nullptr;
 
     if (fmt == SPARSE_META_Q4) {
-        if (hipMalloc(&p, rows) != hipSuccess) {
+        if (sparse_hip_malloc_zero(&p, rows, stream) != hipSuccess) {
             return false;
         }
         m.k_qmm = (uint8_t *)p;
     } else {
-        if (hipMalloc(&p, rows) != hipSuccess) {
+        if (sparse_hip_malloc_zero(&p, rows, stream) != hipSuccess) {
             return false;
         }
         m.k_min_q = (int8_t *)p;
 
         p = nullptr;
-        if (hipMalloc(&p, rows) != hipSuccess) {
+        if (sparse_hip_malloc_zero(&p, rows, stream) != hipSuccess) {
             sparse_hip_free(m.k_min_q);
             m = SparseGlobalPageMeta{};
             return false;
@@ -2529,7 +2550,7 @@ bool sparse_global_page_meta_alloc(SparseGlobalPageMeta & m, int max_pages, int 
 
     p = nullptr;
     const size_t d_bytes = (size_t)N_HEAD_KV * (size_t)max_pages * sizeof(__half);
-    if (hipMalloc(&p, d_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, d_bytes, stream) != hipSuccess) {
         sparse_hip_free(m.k_min_q);
         sparse_hip_free(m.k_max_q);
         sparse_hip_free(m.k_qmm);
@@ -2550,41 +2571,41 @@ void sparse_global_page_meta_free(SparseGlobalPageMeta & m) {
     m = SparseGlobalPageMeta{};
 }
 
-bool sparse_global_scratch_alloc(SparseGlobalScratch & s) {
+bool sparse_global_scratch_alloc(SparseGlobalScratch & s, hipStream_t stream) {
     void * p = nullptr;
     const size_t page_scores_bytes = (size_t)SPARSE_MAX_QB * N_HEAD_KV * SPARSE_MAX_PAGES * sizeof(float);
     const size_t qb_bytes = (size_t)SPARSE_MAX_QB * N_HEAD_KV * GQA_RATIO * HEAD_DIM * sizeof(float);
     const size_t sel_bytes = (size_t)SPARSE_MAX_QB * N_HEAD_KV * SPARSE_MAX_SELECTED * sizeof(int32_t);
     const size_t ns_bytes = (size_t)SPARSE_MAX_QB * N_HEAD_KV * sizeof(int32_t);
 
-    if (hipMalloc(&p, page_scores_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, page_scores_bytes, stream) != hipSuccess) {
         return false;
     }
     s.page_scores = (float *)p;
 
     p = nullptr;
-    if (hipMalloc(&p, qb_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, qb_bytes, stream) != hipSuccess) {
         sparse_global_scratch_free(s);
         return false;
     }
     s.q_min = (float *)p;
 
     p = nullptr;
-    if (hipMalloc(&p, qb_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, qb_bytes, stream) != hipSuccess) {
         sparse_global_scratch_free(s);
         return false;
     }
     s.q_max = (float *)p;
 
     p = nullptr;
-    if (hipMalloc(&p, sel_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, sel_bytes, stream) != hipSuccess) {
         sparse_global_scratch_free(s);
         return false;
     }
     s.selected_pages = (int32_t *)p;
 
     p = nullptr;
-    if (hipMalloc(&p, ns_bytes) != hipSuccess) {
+    if (sparse_hip_malloc_zero(&p, ns_bytes, stream) != hipSuccess) {
         sparse_global_scratch_free(s);
         return false;
     }

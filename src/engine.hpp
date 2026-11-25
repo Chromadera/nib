@@ -214,6 +214,22 @@ public:
     bool verify_topk_to_host(int m, float inv_t,
                              float * out_vals, int32_t * out_ids,
                              float * out_max_l, float * out_sum_exp) const;
+    // Issue #4: exact full-vocab GPU sampling of the first m (<= 8) softcapped
+    // logit rows in buf_logits_ (the m verify rows, or row 0 after a decode
+    // step).  Row r draws from p(x) ~ exp((l_x - max) / T) restricted to
+    // { x : p(x) >= min_p * p_max } \ { excl[r] } (excl[r] < 0: no exclusion)
+    // and reports Z and e_excl so the caller can form p(excl) = e_excl / Z.
+    // See launch_mtp_sample_full.  Only 8 ints + 32 floats cross the bus.
+    bool sample_rows_full_to_host(int m, float inv_t, float min_p,
+                                  const int32_t * excl, uint64_t seed,
+                                  int32_t * out_tok, float * out_stats) const;
+    // Heterogeneous batched decode variant: samples `n` (1..MAX_CONCURRENT_SLOTS)
+    // selected rows in buf_logits_, each with its own (row_idx, inv_t, min_p, seed),
+    // in a single GPU launch + sync.  Uses salt=0 so seeded output is batch-invariant.
+    bool sample_batch_rows_full_to_host(int n, const int32_t * row_idx,
+                                        const float * inv_t, const float * min_p,
+                                        const uint64_t * seeds,
+                                        int32_t * out_tok, float * out_stats) const;
 
     const uint16_t * taps()       const { return d_taps_; }
     const int32_t  * target_ids() const { return d_target_; }   // device [MAX_VERIFY_TOKENS]
@@ -362,6 +378,11 @@ private:
     float     * h_verify_topk_vals_ = nullptr; // pinned [MAX_VERIFY_TOKENS * 256]
     int32_t   * h_verify_topk_ids_  = nullptr; // pinned [MAX_VERIFY_TOKENS * 256]
     float     * h_verify_stats_     = nullptr; // pinned [MAX_VERIFY_TOKENS * 2]
+    float     * d_sample_scratch_   = nullptr; // [MTP_SAMPLE_SCRATCH_WORDS] (issue #4 GPU sampler)
+    int32_t   * d_sample_tok_       = nullptr; // [MAX_VERIFY_TOKENS]
+    float     * d_sample_stats_     = nullptr; // [MAX_VERIFY_TOKENS * 4]
+    int32_t   * h_sample_tok_       = nullptr; // pinned [MAX_VERIFY_TOKENS]
+    float     * h_sample_stats_     = nullptr; // pinned [MAX_VERIFY_TOKENS * 4]
     float    ** d_hist_ptrs_ = nullptr;  // [N_LAYER_SLOTS] device array of sconv hist pointers
     bool        mtp_batched_head_ = true; // one m-row lm_head GEMV instead of m launches
     std::function<void(const uint16_t *, const int32_t *, int, int)> tap_hook_;

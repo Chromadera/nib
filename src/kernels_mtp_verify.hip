@@ -346,4 +346,247 @@ void launch_mtp_verify_topk(const float * logits, int m, int vocab_size, float i
         logits, vocab_size, inv_t, out_vals, out_ids, out_max_l, out_sum_exp);
 }
 
+// ===========================================================================
+// Exact full-vocab GPU sampler (issue #4).  See kernels_mtp_verify.h.
+// ===========================================================================
+
+// Philox4x32-10 (Salmon et al., "Parallel random numbers: as easy as 1, 2, 3").
+static __device__ __forceinline__ uint4 mtp_philox4x32_10(uint4 c, uint32_t k0, uint32_t k1) {
+    #pragma unroll
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t hi0 = __umulhi(0xD2511F53u, c.x);
+        const uint32_t lo0 = 0xD2511F53u * c.x;
+        const uint32_t hi1 = __umulhi(0xCD9E8D57u, c.z);
+        const uint32_t lo1 = 0xCD9E8D57u * c.z;
+        c = make_uint4(hi1 ^ c.y ^ k0, lo1, hi0 ^ c.w ^ k1, lo0);
+        k0 += 0x9E3779B9u;
+        k1 += 0xBB67AE85u;
+    }
+    return c;
+}
+
+// log of an Exp(1) variate for vocab entry x of row r.  w is uniform on
+// (0, 1) with 2^-32 granularity near 0 (exact small values: the race is decided
+// by the SMALL exponentials) and is clamped below 1 so E is never 0 or inf.
+static __device__ __forceinline__ float mtp_log_exp1(uint32_t x, uint32_t r, uint32_t k0, uint32_t k1) {
+    const uint4 h = mtp_philox4x32_10(make_uint4(x, r, 0u, 0u), k0, k1);
+    float w = (float)(h.x | 1u) * 2.3283064365386963e-10f;   // (0, 1]
+    w = fminf(w, 0.99999994f);                                // largest float < 1
+    const float e = -log1pf(-w);                              // Exp(1), in [2.3e-10, 16.6]
+    return logf(e);
+}
+
+// Larger key wins; equal keys -> smaller index (deterministic).
+static __device__ __forceinline__ void mtp_best_merge(float & bk, int & bi, float ok, int oi) {
+    if (ok > bk || (ok == bk && (unsigned)oi < (unsigned)bi)) {
+        bk = ok;
+        bi = oi;
+    }
+}
+
+// K1: per-(row, chunk) max.
+__launch_bounds__(256)
+static __global__ void mtp_sample_max_kernel(const float * __restrict__ logits,
+                                             int vocab_size, int row_stride,
+                                             MtpSampleBatchParams params,
+                                             float * __restrict__ part_max) {
+    const int b = (int)blockIdx.x;
+    const int r = (int)blockIdx.y;
+    const int tid = (int)threadIdx.x;
+    const int chunk = (vocab_size + MTP_SAMPLE_BLOCKS - 1) / MTP_SAMPLE_BLOCKS;
+    const int x0 = b * chunk;
+    const int x1 = min(vocab_size, x0 + chunk);
+    const int src_row = params.row_idx[r];
+    const float * row = logits + (size_t)src_row * (size_t)row_stride;
+
+    float mx = -INFINITY;
+    for (int x = x0 + tid; x < x1; x += 256) {
+        mx = fmaxf(mx, row[x]);
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        mx = fmaxf(mx, __shfl_xor(mx, off, 32));
+    }
+    __shared__ float s_m[8];
+    if ((tid & 31) == 0) {
+        s_m[tid >> 5] = mx;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = s_m[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) {
+            m = fmaxf(m, s_m[w]);
+        }
+        part_max[r * MTP_SAMPLE_BLOCKS + b] = m;
+    }
+}
+
+// K2: per-(row, chunk) Z partial + race winner over keep \ {excl}.
+__launch_bounds__(256)
+static __global__ void mtp_sample_race_kernel(const float * __restrict__ logits,
+                                              int vocab_size, int row_stride,
+                                              MtpSampleBatchParams params,
+                                              const float * __restrict__ part_max,
+                                              float * __restrict__ part_z,
+                                              float * __restrict__ part_key,
+                                              int32_t * __restrict__ part_idx) {
+    const int b = (int)blockIdx.x;
+    const int r = (int)blockIdx.y;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int chunk = (vocab_size + MTP_SAMPLE_BLOCKS - 1) / MTP_SAMPLE_BLOCKS;
+    const int x0 = b * chunk;
+    const int x1 = min(vocab_size, x0 + chunk);
+    const int src_row = params.row_idx[r];
+    const float * row = logits + (size_t)src_row * (size_t)row_stride;
+
+    __shared__ float s_gmax;
+    if (tid < 32) {
+        float m = part_max[r * MTP_SAMPLE_BLOCKS + lane];   // MTP_SAMPLE_BLOCKS == 32
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            m = fmaxf(m, __shfl_xor(m, off, 32));
+        }
+        if (tid == 0) {
+            s_gmax = m;
+        }
+    }
+    __syncthreads();
+    const float    gmax  = s_gmax;
+    const int      ex    = params.excl[r];
+    const float    inv_t = params.inv_t[r];
+    const float    min_p = params.min_p[r];
+    const uint32_t k0    = params.k0[r];
+    const uint32_t k1    = params.k1[r];
+    const uint32_t salt  = params.salt[r];
+
+    float z  = 0.0f;
+    float bk = -INFINITY;
+    int   bi = -1;
+    for (int x = x0 + tid; x < x1; x += 256) {
+        const float s = (row[x] - gmax) * inv_t;
+        const float e = expf(s);
+        if (e >= min_p) {                       // min_p <= 0: keep all
+            z += e;
+            if (x != ex) {
+                mtp_best_merge(bk, bi, s - mtp_log_exp1((uint32_t)x, salt, k0, k1), x);
+            }
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        z += __shfl_xor(z, off, 32);
+        mtp_best_merge(bk, bi, __shfl_xor(bk, off, 32), __shfl_xor(bi, off, 32));
+    }
+    __shared__ float s_z[8];
+    __shared__ float s_k[8];
+    __shared__ int   s_i[8];
+    if (lane == 0) {
+        s_z[warp] = z;
+        s_k[warp] = bk;
+        s_i[warp] = bi;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float tz = 0.0f;
+        float tk = -INFINITY;
+        int   ti = -1;
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            tz += s_z[w];
+            mtp_best_merge(tk, ti, s_k[w], s_i[w]);
+        }
+        part_z[r * MTP_SAMPLE_BLOCKS + b]   = tz;
+        part_key[r * MTP_SAMPLE_BLOCKS + b] = tk;
+        part_idx[r * MTP_SAMPLE_BLOCKS + b] = ti;
+    }
+}
+
+// K3: one wave per row combines the 32 chunk partials (fixed order).
+__launch_bounds__(32)
+static __global__ void mtp_sample_combine_kernel(const float * __restrict__ logits, int row_stride,
+                                                 MtpSampleBatchParams params,
+                                                 const float * __restrict__ part_max,
+                                                 const float * __restrict__ part_z,
+                                                 const float * __restrict__ part_key,
+                                                 const int32_t * __restrict__ part_idx,
+                                                 int32_t * __restrict__ out_tok,
+                                                 float * __restrict__ out_stats) {
+    const int r = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    float m  = part_max[r * MTP_SAMPLE_BLOCKS + lane];
+    float z  = part_z[r * MTP_SAMPLE_BLOCKS + lane];
+    float bk = part_key[r * MTP_SAMPLE_BLOCKS + lane];
+    int   bi = part_idx[r * MTP_SAMPLE_BLOCKS + lane];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        m = fmaxf(m, __shfl_xor(m, off, 32));
+        z += __shfl_xor(z, off, 32);
+        mtp_best_merge(bk, bi, __shfl_xor(bk, off, 32), __shfl_xor(bi, off, 32));
+    }
+    if (lane == 0) {
+        const int   src_row = params.row_idx[r];
+        const int   ex      = params.excl[r];
+        const float inv_t   = params.inv_t[r];
+        const float min_p   = params.min_p[r];
+        float e_ex = 0.0f;
+        float k_ex = 0.0f;
+        if (ex >= 0) {
+            e_ex = expf((logits[(size_t)src_row * (size_t)row_stride + (size_t)ex] - m) * inv_t);
+            k_ex = (e_ex >= min_p) ? 1.0f : 0.0f;
+        }
+        out_tok[r] = (bk > -INFINITY) ? bi : -1;
+        out_stats[4 * r + 0] = m;
+        out_stats[4 * r + 1] = z;
+        out_stats[4 * r + 2] = e_ex;
+        out_stats[4 * r + 3] = k_ex;
+    }
+}
+
+void launch_mtp_sample_full_batch(const float * logits, int m, int vocab_size, int row_stride,
+                                  const MtpSampleBatchParams & params, float * scratch,
+                                  int32_t * out_tok, float * out_stats, hipStream_t stream) {
+    static_assert(MTP_SAMPLE_BLOCKS == 32, "K2/K3 reduce the chunk partials with one wave");
+    if (logits == nullptr || scratch == nullptr || out_tok == nullptr || out_stats == nullptr ||
+        m < 1 || m > MTP_SAMPLE_MAX_ROWS || vocab_size < MTP_SAMPLE_BLOCKS || row_stride < vocab_size) {
+        return;
+    }
+    const int np = MTP_SAMPLE_MAX_ROWS * MTP_SAMPLE_BLOCKS;
+    float   * part_max = scratch;
+    float   * part_z   = scratch + np;
+    float   * part_key = scratch + 2 * np;
+    int32_t * part_idx = reinterpret_cast<int32_t *>(scratch + 3 * np);
+    const dim3 grid(MTP_SAMPLE_BLOCKS, (unsigned)m);
+    mtp_sample_max_kernel<<<grid, 256, 0, stream>>>(logits, vocab_size, row_stride, params, part_max);
+    mtp_sample_race_kernel<<<grid, 256, 0, stream>>>(logits, vocab_size, row_stride, params,
+                                                     part_max, part_z, part_key, part_idx);
+    mtp_sample_combine_kernel<<<dim3((unsigned)m), 32, 0, stream>>>(logits, row_stride, params,
+                                                                    part_max, part_z, part_key, part_idx,
+                                                                    out_tok, out_stats);
+}
+
+void launch_mtp_sample_full(const float * logits, int m, int vocab_size, int row_stride,
+                            float inv_t, float min_p, const MtpSampleExcl & excl,
+                            uint64_t seed, float * scratch,
+                            int32_t * out_tok, float * out_stats, hipStream_t stream) {
+    if (m < 1 || m > MTP_SAMPLE_MAX_ROWS) return;
+    MtpSampleBatchParams params{};
+    const uint32_t k0 = (uint32_t)seed;
+    const uint32_t k1 = (uint32_t)(seed >> 32);
+    const float mp = (min_p > 0.0f) ? min_p : 0.0f;
+    for (int r = 0; r < m; ++r) {
+        params.row_idx[r] = r;
+        params.excl[r]    = excl.tok[r];
+        params.inv_t[r]   = inv_t;
+        params.min_p[r]   = mp;
+        params.k0[r]      = k0;
+        params.k1[r]      = k1;
+        params.salt[r]    = (uint32_t)r;
+    }
+    launch_mtp_sample_full_batch(logits, m, vocab_size, row_stride, params, scratch,
+                                 out_tok, out_stats, stream);
+}
+
 } // namespace inkling

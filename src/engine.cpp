@@ -111,6 +111,10 @@ InklingEngine::~InklingEngine() {
     if (h_verify_topk_vals_){ (void)hipHostFree(h_verify_topk_vals_); }
     if (h_verify_topk_ids_) { (void)hipHostFree(h_verify_topk_ids_); }
     if (h_verify_stats_)    { (void)hipHostFree(h_verify_stats_); }
+    if (h_sample_tok_)      { (void)hipHostFree(h_sample_tok_); }
+    if (h_sample_stats_)    { (void)hipHostFree(h_sample_stats_); }
+    h_sample_tok_ = nullptr;
+    h_sample_stats_ = nullptr;
     h_verify_meta_ = nullptr;
     h_verify_topk_vals_ = nullptr;
     h_verify_topk_ids_ = nullptr;
@@ -132,12 +136,24 @@ InklingEngine::~InklingEngine() {
 }
 
 template <typename T>
-static T * alloc_gpu(size_t count, std::vector<void *> & track, size_t & total_bytes) {
+static T * alloc_gpu(size_t count, std::vector<void *> & track, size_t & total_bytes,
+                     hipStream_t stream) {
     void * ptr = nullptr;
     size_t bytes = count * sizeof(T);
     // Round up to 256-byte alignment for clean coalescing
     size_t alloc_bytes = (bytes + 255) & ~size_t(255);
     HIP_CHECK(hipMalloc(&ptr, alloc_bytes));
+    // Issue #1: never hand out uninitialised VRAM.  hipMalloc does not zero
+    // (whether the pages come back clean depends on the kernel driver and on
+    // what this process freed before, e.g. the GGUF repack staging buffers),
+    // and several decode kernels read slots they then weight by exactly 0
+    // (partial 8-key FA groups, padded tiles).  0 * NaN = NaN, so a garbage
+    // fp16 KV scale turned into NaN logits -> argmax INT32_MAX -> an
+    // out-of-bounds embedding gather on the next step (crash / GPU hang).
+    // The fill is stream-ordered on the engine stream (every consumer runs on
+    // it): a legacy-null-stream hipMemset here would instantiate an extra HW
+    // queue for the rest of the process and measurably slows prefill (-3.5%).
+    HIP_CHECK(hipMemsetAsync(ptr, 0, alloc_bytes, stream));
     track.push_back(ptr);
     total_bytes += alloc_bytes;
     return reinterpret_cast<T *>(ptr);
@@ -234,13 +250,13 @@ void InklingEngine::alloc_state_and_scratch() {
         kv.cap     = cap;
         kv.kv_type = (int32_t)cfg_.kv_type;
         kv.is_swa  = swa;
-        kv.k_qs    = alloc_gpu<int8_t>((size_t)cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_);
-        kv.k_d     = alloc_gpu<__half>((size_t)cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_);
-        kv.v_qs    = alloc_gpu<int8_t>((size_t)cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_);
-        kv.v_d     = alloc_gpu<__half>((size_t)cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_);
-        kv.k_pos   = alloc_gpu<int32_t>((size_t)cap,                                state_allocs_, total_vram_bytes_);
+        kv.k_qs    = alloc_gpu<int8_t>((size_t)cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_, stream_);
+        kv.k_d     = alloc_gpu<__half>((size_t)cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_, stream_);
+        kv.v_qs    = alloc_gpu<int8_t>((size_t)cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_, stream_);
+        kv.v_d     = alloc_gpu<__half>((size_t)cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_, stream_);
+        kv.k_pos   = alloc_gpu<int32_t>((size_t)cap,                                state_allocs_, total_vram_bytes_, stream_);
 
-        sconv_slots_[s].hist = alloc_gpu<float>((size_t)N_SCONV_CHANNELS * N_CONV_HIST, state_allocs_, total_vram_bytes_);
+        sconv_slots_[s].hist = alloc_gpu<float>((size_t)N_SCONV_CHANNELS * N_CONV_HIST, state_allocs_, total_vram_bytes_, stream_);
 
         slot_swa_kv_[0][s] = kv;
         slot_sconv_[0][s]  = sconv_slots_[s];
@@ -255,91 +271,91 @@ void InklingEngine::alloc_state_and_scratch() {
                 kv.cap     = cfg_.swa_cap;
                 kv.kv_type = (int32_t)cfg_.kv_type;
                 kv.is_swa  = true;
-                kv.k_qs    = alloc_gpu<int8_t>((size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_);
-                kv.k_d     = alloc_gpu<__half>((size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_);
-                kv.v_qs    = alloc_gpu<int8_t>((size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_);
-                kv.v_d     = alloc_gpu<__half>((size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_);
-                kv.k_pos   = alloc_gpu<int32_t>((size_t)cfg_.swa_cap,                                state_allocs_, total_vram_bytes_);
+                kv.k_qs    = alloc_gpu<int8_t>((size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_, stream_);
+                kv.k_d     = alloc_gpu<__half>((size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_, stream_);
+                kv.v_qs    = alloc_gpu<int8_t>((size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head, state_allocs_, total_vram_bytes_, stream_);
+                kv.v_d     = alloc_gpu<__half>((size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head, state_allocs_, total_vram_bytes_, stream_);
+                kv.k_pos   = alloc_gpu<int32_t>((size_t)cfg_.swa_cap,                                state_allocs_, total_vram_bytes_, stream_);
             }
-            slot_sconv_[c][s].hist = alloc_gpu<float>((size_t)N_SCONV_CHANNELS * N_CONV_HIST, state_allocs_, total_vram_bytes_);
+            slot_sconv_[c][s].hist = alloc_gpu<float>((size_t)N_SCONV_CHANNELS * N_CONV_HIST, state_allocs_, total_vram_bytes_, stream_);
         }
     }
 
     // 2. Device metadata & token IDs
-    d_meta_      = alloc_gpu<StepMeta>(1,          state_allocs_, total_vram_bytes_);
-    d_argmax_id_ = alloc_gpu<int32_t>(1,           state_allocs_, total_vram_bytes_);
-    d_token_ids_ = alloc_gpu<int32_t>(MAX_UBATCH,  state_allocs_, total_vram_bytes_);
+    d_meta_      = alloc_gpu<StepMeta>(1,          state_allocs_, total_vram_bytes_, stream_);
+    d_argmax_id_ = alloc_gpu<int32_t>(1,           state_allocs_, total_vram_bytes_, stream_);
+    d_token_ids_ = alloc_gpu<int32_t>(MAX_UBATCH,  state_allocs_, total_vram_bytes_, stream_);
 
     // 3. Dedicated non-aliasing residual stream buffers ([MAX_UBATCH, N_EMBD])
     const size_t embd_buf = (size_t)MAX_UBATCH * N_EMBD;
-    buf_a_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
-    buf_b_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
-    buf_ffn_inp_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
-    buf_blk0_    = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
-    buf_prelude_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
+    buf_a_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
+    buf_b_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
+    buf_ffn_inp_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
+    buf_blk0_    = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
+    buf_prelude_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
     for (int p = 0; p < 3; ++p) {
-        buf_pass_b6_[p]  = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
-        buf_pass_b12_[p] = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
+        buf_pass_b6_[p]  = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
+        buf_pass_b12_[p] = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
     }
     for (int p = 0; p < 2; ++p) {
-        buf_pass_out_[p] = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
+        buf_pass_out_[p] = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
     }
-    buf_b18_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_);
+    buf_b18_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
 
     // 4. Layer workspace scratch
-    buf_mixed_       = alloc_gpu<float>(4 * embd_buf,                       state_allocs_, total_vram_bytes_);
-    buf_messages_    = alloc_gpu<float>(4 * embd_buf,                       state_allocs_, total_vram_bytes_);
+    buf_mixed_       = alloc_gpu<float>(4 * embd_buf,                       state_allocs_, total_vram_bytes_, stream_);
+    buf_messages_    = alloc_gpu<float>(4 * embd_buf,                       state_allocs_, total_vram_bytes_, stream_);
     for (int j = 0; j < 3; ++j) {
-        buf_ctrl_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_);
-        buf_norm_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_);
+        buf_ctrl_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
+        buf_norm_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
     }
-    buf_ctrl_gate_   = alloc_gpu<float>(3 * (size_t)MAX_UBATCH * LOOP_GATE_RANK, state_allocs_, total_vram_bytes_);
-    buf_proj_qkv_    = alloc_gpu<float>((size_t)MAX_UBATCH * 8600,          state_allocs_, total_vram_bytes_);
-    buf_proj_k_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_);
-    buf_proj_v_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_);
-    buf_q_prep_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_);
-    buf_rel_table_   = alloc_gpu<float>((size_t)MAX_UBATCH * N_HEAD * N_REL_EXTENT, state_allocs_, total_vram_bytes_);
-    buf_fa_out_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_);
-    buf_wo_out_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_);
-    buf_x_norm_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_);
-    buf_topk_ids_    = alloc_gpu<int32_t>((size_t)MAX_UBATCH * TOP_K,       state_allocs_, total_vram_bytes_);
-    buf_topk_w_      = alloc_gpu<float>((size_t)MAX_UBATCH * TOP_K,         state_allocs_, total_vram_bytes_);
+    buf_ctrl_gate_   = alloc_gpu<float>(3 * (size_t)MAX_UBATCH * LOOP_GATE_RANK, state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_qkv_    = alloc_gpu<float>((size_t)MAX_UBATCH * 8600,          state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_k_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_v_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_, stream_);
+    buf_q_prep_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_, stream_);
+    buf_rel_table_   = alloc_gpu<float>((size_t)MAX_UBATCH * N_HEAD * N_REL_EXTENT, state_allocs_, total_vram_bytes_, stream_);
+    buf_fa_out_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_, stream_);
+    buf_wo_out_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
+    buf_x_norm_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
+    buf_topk_ids_    = alloc_gpu<int32_t>((size_t)MAX_UBATCH * TOP_K,       state_allocs_, total_vram_bytes_, stream_);
+    buf_topk_w_      = alloc_gpu<float>((size_t)MAX_UBATCH * TOP_K,         state_allocs_, total_vram_bytes_, stream_);
     // 512 floats per verify row (Step 8C runs the A/B/C kernels with grid.y = row,
     // each row owning its own self-resetting barrier sector).
-    buf_router_scratch_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 512,  state_allocs_, total_vram_bytes_);
-    buf_mix_scratch_    = alloc_gpu<float>(16384,                           state_allocs_, total_vram_bytes_);
-    buf_moe_act_dec_ = alloc_gpu<float>((size_t)TOP_K * N_FF_EXP,           state_allocs_, total_vram_bytes_);
-    buf_moe_out_     = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_);
+    buf_router_scratch_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 512,  state_allocs_, total_vram_bytes_, stream_);
+    buf_mix_scratch_    = alloc_gpu<float>(16384,                           state_allocs_, total_vram_bytes_, stream_);
+    buf_moe_act_dec_ = alloc_gpu<float>((size_t)TOP_K * N_FF_EXP,           state_allocs_, total_vram_bytes_, stream_);
+    buf_moe_out_     = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
     const size_t fa_tmp_rows = (size_t)std::max(64, 8 * MAX_UBATCH);
-    buf_fa_tmp_o_    = alloc_gpu<float>(fa_tmp_rows * N_HEAD * HEAD_DIM,    state_allocs_, total_vram_bytes_);
-    buf_fa_tmp_m_    = alloc_gpu<float2>(fa_tmp_rows * N_HEAD,              state_allocs_, total_vram_bytes_);
-    buf_fa_done_     = alloc_gpu<int32_t>(128,                              state_allocs_, total_vram_bytes_);
+    buf_fa_tmp_o_    = alloc_gpu<float>(fa_tmp_rows * N_HEAD * HEAD_DIM,    state_allocs_, total_vram_bytes_, stream_);
+    buf_fa_tmp_m_    = alloc_gpu<float2>(fa_tmp_rows * N_HEAD,              state_allocs_, total_vram_bytes_, stream_);
+    buf_fa_done_     = alloc_gpu<int32_t>(128,                              state_allocs_, total_vram_bytes_, stream_);
     // Step 8A: only ppl / oracle read every row's logits.  gen / bench / vision /
     // selftest read the last row (prefill) or a single decode row plus the 8
     // speculative verify rows, so 8 * VOCAB_UNPADDED (6.1 MiB) instead of
     // MAX_UBATCH * VOCAB_UNPADDED (391 MiB) frees ~385 MiB of VRAM.
     const int logits_rows = cfg_.need_all_logits_buf ? MAX_UBATCH : MAX_VERIFY_TOKENS;
-    buf_logits_      = alloc_gpu<float>((size_t)logits_rows * VOCAB_UNPADDED, state_allocs_, total_vram_bytes_);
+    buf_logits_      = alloc_gpu<float>((size_t)logits_rows * VOCAB_UNPADDED, state_allocs_, total_vram_bytes_, stream_);
 
     // 5. Grouped MoE prefill scratchpad
     const size_t max_slots = (size_t)MAX_UBATCH * TOP_K;
-    moe_scratch_.exp_counts  = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_);
-    moe_scratch_.exp_offsets = alloc_gpu<int32_t>(N_EXPERT + 1,             state_allocs_, total_vram_bytes_);
-    moe_scratch_.exp_cursors = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_);
-    moe_scratch_.perm_tok    = alloc_gpu<int32_t>(max_slots,                state_allocs_, total_vram_bytes_);
-    moe_scratch_.perm_w      = alloc_gpu<float>(max_slots,                  state_allocs_, total_vram_bytes_);
-    moe_scratch_.perm_x      = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_);
-    moe_scratch_.perm_act    = alloc_gpu<float>(max_slots * N_FF_EXP,       state_allocs_, total_vram_bytes_);
-    moe_scratch_.perm_down   = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_);
-    moe_scratch_.tile_exp    = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_);
-    moe_scratch_.tile_m0     = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_);
-    moe_scratch_.d_num_tiles = alloc_gpu<int32_t>(1,                        state_allocs_, total_vram_bytes_);
+    moe_scratch_.exp_counts  = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.exp_offsets = alloc_gpu<int32_t>(N_EXPERT + 1,             state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.exp_cursors = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_tok    = alloc_gpu<int32_t>(max_slots,                state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_w      = alloc_gpu<float>(max_slots,                  state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_x      = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_act    = alloc_gpu<float>(max_slots * N_FF_EXP,       state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_down   = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.tile_exp    = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.tile_m0     = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.d_num_tiles = alloc_gpu<int32_t>(1,                        state_allocs_, total_vram_bytes_, stream_);
 
     // 6. Device-side decode meta chaining (token history + exact host-built tau(pos) table)
     tok_hist_cap_ = cfg_.max_ctx + 2048;
-    d_tok_hist_   = alloc_gpu<int32_t>(tok_hist_cap_, state_allocs_, total_vram_bytes_);
+    d_tok_hist_   = alloc_gpu<int32_t>(tok_hist_cap_, state_allocs_, total_vram_bytes_, stream_);
     tau_tab_cap_  = cfg_.max_ctx + 2048;
-    d_tau_tab_    = alloc_gpu<float>(tau_tab_cap_, state_allocs_, total_vram_bytes_);
+    d_tau_tab_    = alloc_gpu<float>(tau_tab_cap_, state_allocs_, total_vram_bytes_, stream_);
     {
         std::vector<float> tau((size_t)tau_tab_cap_);
         for (int32_t p = 0; p < tau_tab_cap_; ++p) {
@@ -359,7 +375,7 @@ void InklingEngine::alloc_state_and_scratch() {
             if (is_swa_slot(s)) {
                 continue;
             }
-            if (!sparse_global_page_meta_alloc(sparse_meta_[s], max_pages, cfg_.sparse_meta)) {
+            if (!sparse_global_page_meta_alloc(sparse_meta_[s], max_pages, cfg_.sparse_meta, stream_)) {
                 std::fprintf(stderr,
                     "InklingEngine: sparse Global page metadata allocation failed (%d pages)\n",
                     max_pages);
@@ -367,7 +383,7 @@ void InklingEngine::alloc_state_and_scratch() {
             }
             total_vram_bytes_ += sparse_global_page_meta_bytes(max_pages, cfg_.sparse_meta);
         }
-        if (!sparse_global_scratch_alloc(sparse_scratch_)) {
+        if (!sparse_global_scratch_alloc(sparse_scratch_, stream_)) {
             std::fprintf(stderr, "InklingEngine: sparse Global selection scratch allocation failed\n");
             std::abort();
         }
@@ -381,6 +397,14 @@ void InklingEngine::alloc_state_and_scratch() {
     std::memset(h_meta_pinned_, 0, sizeof(StepMeta));
     *h_argmax_pinned_ = 0;
 
+    // 8b. Issue #4: exact full-vocab GPU sampler scratch (4.1 KiB + 160 B; used by
+    //     both the MTP verify rows and the plain decode row).
+    d_sample_scratch_ = alloc_gpu<float>(MTP_SAMPLE_SCRATCH_WORDS, state_allocs_, total_vram_bytes_, stream_);
+    d_sample_tok_     = alloc_gpu<int32_t>(MAX_VERIFY_TOKENS,     state_allocs_, total_vram_bytes_, stream_);
+    d_sample_stats_   = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 4, state_allocs_, total_vram_bytes_, stream_);
+    HIP_CHECK(hipHostMalloc((void **)&h_sample_tok_,   MAX_VERIFY_TOKENS * sizeof(int32_t)));
+    HIP_CHECK(hipHostMalloc((void **)&h_sample_stats_, (size_t)MAX_VERIFY_TOKENS * 4 * sizeof(float)));
+
     // 9. Batched m-row decode scratch (only when n_slots > 1; also shared with MTP verify)
     if (cfg_.n_slots > 1) {
         alloc_batch_scratch();
@@ -390,25 +414,25 @@ void InklingEngine::alloc_state_and_scratch() {
 
 void InklingEngine::alloc_batch_scratch() {
     if (batch_scratch_ready_) return;
-    d_verify_meta_    = alloc_gpu<StepMeta>(MAX_VERIFY_TOKENS, state_allocs_, total_vram_bytes_);
-    d_target_         = alloc_gpu<int32_t>(MAX_VERIFY_TOKENS, state_allocs_, total_vram_bytes_);
-    d_verify_unique_  = alloc_gpu<int32_t>(64, state_allocs_, total_vram_bytes_);
-    d_verify_mask_    = alloc_gpu<uint32_t>(64, state_allocs_, total_vram_bytes_);
-    d_verify_slot_    = alloc_gpu<int32_t>(64 * TOP_K, state_allocs_, total_vram_bytes_);
-    d_verify_w_       = alloc_gpu<float>(64 * TOP_K, state_allocs_, total_vram_bytes_);
-    d_verify_cnt_     = alloc_gpu<int32_t>(64, state_allocs_, total_vram_bytes_);
-    d_verify_list_    = alloc_gpu<int32_t>(64 * TOP_K, state_allocs_, total_vram_bytes_);
-    d_num_unique_     = alloc_gpu<int32_t>(1, state_allocs_, total_vram_bytes_);
+    d_verify_meta_    = alloc_gpu<StepMeta>(MAX_VERIFY_TOKENS, state_allocs_, total_vram_bytes_, stream_);
+    d_target_         = alloc_gpu<int32_t>(MAX_VERIFY_TOKENS, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_unique_  = alloc_gpu<int32_t>(64, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_mask_    = alloc_gpu<uint32_t>(64, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_slot_    = alloc_gpu<int32_t>(64 * TOP_K, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_w_       = alloc_gpu<float>(64 * TOP_K, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_cnt_     = alloc_gpu<int32_t>(64, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_list_    = alloc_gpu<int32_t>(64 * TOP_K, state_allocs_, total_vram_bytes_, stream_);
+    d_num_unique_     = alloc_gpu<int32_t>(1, state_allocs_, total_vram_bytes_, stream_);
     buf_moe_slot_     = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * TOP_K * N_EMBD,
-                                         state_allocs_, total_vram_bytes_);
+                                         state_allocs_, total_vram_bytes_, stream_);
     buf_verify_act_   = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * TOP_K * N_FF_EXP,
-                                         state_allocs_, total_vram_bytes_);
+                                         state_allocs_, total_vram_bytes_, stream_);
     buf_verify_mixed_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 3 * N_EMBD,
-                                         state_allocs_, total_vram_bytes_);
+                                         state_allocs_, total_vram_bytes_, stream_);
     buf_verify_msg_   = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 4 * N_EMBD,
-                                         state_allocs_, total_vram_bytes_);
+                                         state_allocs_, total_vram_bytes_, stream_);
     buf_verify_gate_  = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 3 * LOOP_GATE_RANK,
-                                         state_allocs_, total_vram_bytes_);
+                                         state_allocs_, total_vram_bytes_, stream_);
     HIP_CHECK(hipHostMalloc((void **)&h_target_pinned_, MAX_VERIFY_TOKENS * sizeof(int32_t)));
     HIP_CHECK(hipHostMalloc((void **)&h_verify_meta_,   MAX_VERIFY_TOKENS * sizeof(StepMeta)));
     std::memset(h_target_pinned_, 0, MAX_VERIFY_TOKENS * sizeof(int32_t));
@@ -2249,21 +2273,21 @@ static inline StepMeta make_step_meta(int32_t token_id, int32_t pos, int32_t swa
 // ============================================================================
 bool InklingEngine::enable_mtp_io() {
     if (mtp_io_) return true;
-    d_taps_        = alloc_gpu<uint16_t>((size_t)MAX_UBATCH * 4 * N_EMBD,           state_allocs_, total_vram_bytes_);
+    d_taps_        = alloc_gpu<uint16_t>((size_t)MAX_UBATCH * 4 * N_EMBD,           state_allocs_, total_vram_bytes_, stream_);
     d_verify_raw_  = alloc_gpu<float>((size_t)N_LAYER_SLOTS * MAX_VERIFY_TOKENS * N_SCONV_CHANNELS,
-                                      state_allocs_, total_vram_bytes_);
+                                      state_allocs_, total_vram_bytes_, stream_);
     d_hist_bak_    = alloc_gpu<float>((size_t)N_LAYER_SLOTS * N_SCONV_CHANNELS * N_CONV_HIST,
-                                      state_allocs_, total_vram_bytes_);
-    float ** d_hist_ptrs = alloc_gpu<float *>(N_LAYER_SLOTS, state_allocs_, total_vram_bytes_);
+                                      state_allocs_, total_vram_bytes_, stream_);
+    float ** d_hist_ptrs = alloc_gpu<float *>(N_LAYER_SLOTS, state_allocs_, total_vram_bytes_, stream_);
     d_hist_ptrs_ = d_hist_ptrs;
     {
         std::vector<float *> hp((size_t)N_LAYER_SLOTS);
         for (int s = 0; s < N_LAYER_SLOTS; ++s) hp[(size_t)s] = sconv_slots_[s].hist;
         HIP_CHECK(hipMemcpy(d_hist_ptrs, hp.data(), hp.size() * sizeof(float *), hipMemcpyHostToDevice));
     }
-    d_verify_topk_vals_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK, state_allocs_, total_vram_bytes_);
-    d_verify_topk_ids_  = alloc_gpu<int32_t>((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK, state_allocs_, total_vram_bytes_);
-    d_verify_stats_     = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 2, state_allocs_, total_vram_bytes_);
+    d_verify_topk_vals_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_topk_ids_  = alloc_gpu<int32_t>((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK, state_allocs_, total_vram_bytes_, stream_);
+    d_verify_stats_     = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 2, state_allocs_, total_vram_bytes_, stream_);
     HIP_CHECK(hipHostMalloc(&h_verify_topk_vals_, (size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK * sizeof(float)));
     HIP_CHECK(hipHostMalloc(&h_verify_topk_ids_,  (size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK * sizeof(int32_t)));
     HIP_CHECK(hipHostMalloc(&h_verify_stats_,     (size_t)MAX_VERIFY_TOKENS * 2 * sizeof(float)));
@@ -2324,7 +2348,7 @@ void InklingEngine::capture_verify_graph(int idx, int m) {
     if (idx < 0 || idx >= MAX_VERIFY_TOKENS || verify_graph_ready_[idx]) return;
     HIP_CHECK(hipStreamSynchronize(stream_));
     hipGraph_t g = nullptr;
-    HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal));
+    HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal));
     graph_capturing_ = true;
     record_verify_pass(m);
     graph_capturing_ = false;
@@ -2465,6 +2489,68 @@ bool InklingEngine::verify_topk_to_host(int m, float inv_t,
     return true;
 }
 
+bool InklingEngine::sample_rows_full_to_host(int m, float inv_t, float min_p,
+                                             const int32_t * excl, uint64_t seed,
+                                             int32_t * out_tok, float * out_stats) const {
+    static_assert(MAX_VERIFY_TOKENS <= MTP_SAMPLE_MAX_ROWS, "sampler row capacity");
+    if (m < 1 || m > MAX_VERIFY_TOKENS || !(inv_t > 0.0f) || !std::isfinite(inv_t) ||
+        out_tok == nullptr || out_stats == nullptr || d_sample_scratch_ == nullptr) {
+        return false;
+    }
+    MtpSampleExcl ex{};
+    for (int r = 0; r < MTP_SAMPLE_MAX_ROWS; ++r) {
+        const int32_t t = (excl != nullptr && r < m) ? excl[r] : -1;
+        ex.tok[r] = (t >= 0 && t < VOCAB_UNPADDED) ? t : -1;
+    }
+    launch_mtp_sample_full(buf_logits_, m, VOCAB_UNPADDED, VOCAB_UNPADDED, inv_t, min_p, ex, seed,
+                           d_sample_scratch_, d_sample_tok_, d_sample_stats_, stream_);
+    HIP_CHECK(hipMemcpyAsync(h_sample_tok_, d_sample_tok_, (size_t)m * sizeof(int32_t),
+                             hipMemcpyDeviceToHost, stream_));
+    HIP_CHECK(hipMemcpyAsync(h_sample_stats_, d_sample_stats_, (size_t)m * 4 * sizeof(float),
+                             hipMemcpyDeviceToHost, stream_));
+    HIP_CHECK(hipStreamSynchronize(stream_));
+    std::memcpy(out_tok, h_sample_tok_, (size_t)m * sizeof(int32_t));
+    std::memcpy(out_stats, h_sample_stats_, (size_t)m * 4 * sizeof(float));
+    return true;
+}
+
+bool InklingEngine::sample_batch_rows_full_to_host(int n, const int32_t * row_idx,
+                                                   const float * inv_t, const float * min_p,
+                                                   const uint64_t * seeds,
+                                                   int32_t * out_tok, float * out_stats) const {
+    static_assert(MAX_CONCURRENT_SLOTS <= MAX_VERIFY_TOKENS, "batch sampler row capacity");
+    static_assert(MAX_VERIFY_TOKENS <= MTP_SAMPLE_MAX_ROWS, "sampler row capacity");
+    if (n < 1 || n > MAX_VERIFY_TOKENS ||
+        row_idx == nullptr || inv_t == nullptr || min_p == nullptr || seeds == nullptr ||
+        out_tok == nullptr || out_stats == nullptr || d_sample_scratch_ == nullptr) {
+        return false;
+    }
+    MtpSampleBatchParams params{};
+    for (int i = 0; i < n; ++i) {
+        if (row_idx[i] < 0 || row_idx[i] >= MAX_VERIFY_TOKENS ||
+            !(inv_t[i] > 0.0f) || !std::isfinite(inv_t[i])) {
+            return false;
+        }
+        params.row_idx[i] = row_idx[i];
+        params.excl[i]    = -1;
+        params.inv_t[i]   = inv_t[i];
+        params.min_p[i]   = (min_p[i] > 0.0f) ? min_p[i] : 0.0f;
+        params.k0[i]      = (uint32_t)seeds[i];
+        params.k1[i]      = (uint32_t)(seeds[i] >> 32);
+        params.salt[i]    = 0u;
+    }
+    launch_mtp_sample_full_batch(buf_logits_, n, VOCAB_UNPADDED, VOCAB_UNPADDED, params,
+                                 d_sample_scratch_, d_sample_tok_, d_sample_stats_, stream_);
+    HIP_CHECK(hipMemcpyAsync(h_sample_tok_, d_sample_tok_, (size_t)n * sizeof(int32_t),
+                             hipMemcpyDeviceToHost, stream_));
+    HIP_CHECK(hipMemcpyAsync(h_sample_stats_, d_sample_stats_, (size_t)n * 4 * sizeof(float),
+                             hipMemcpyDeviceToHost, stream_));
+    HIP_CHECK(hipStreamSynchronize(stream_));
+    std::memcpy(out_tok, h_sample_tok_, (size_t)n * sizeof(int32_t));
+    std::memcpy(out_stats, h_sample_stats_, (size_t)n * 4 * sizeof(float));
+    return true;
+}
+
 void InklingEngine::verify_rollback(int pos_start, int commit, int m) {
     if (!mtp_io_) return;
     if (commit < 1) commit = 1;
@@ -2507,7 +2593,7 @@ void InklingEngine::capture_decode_graph() {
     batch_slots_active_ = false;
     verify_m_ = 0;
     HIP_CHECK(hipStreamSynchronize(stream_));
-    HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal));
+    HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal));
     graph_capturing_ = true;
     record_forward_pass(/*n_tokens=*/1, /*pos_start=*/0, d_meta_, /*compute_all_logits=*/false);
     graph_capturing_ = false;
@@ -2981,7 +3067,7 @@ bool InklingEngine::decode_batch(
                 batch_graphs_.erase(victim);
             }
             hipGraph_t g = nullptr;
-            HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal));
+            HIP_CHECK(hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal));
             graph_capturing_ = true;
             record_batch_body();
             graph_capturing_ = false;

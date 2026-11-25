@@ -749,6 +749,32 @@ static int32_t sample_logits(const std::vector<float> & logits, const SamplePara
     return sample_logits_ptr(logits.data(), (int)logits.size(), sp, rng);
 }
 
+// Issue #4: settings whose kept set is { x : p(x) >= min_p * p_max } over the
+// WHOLE vocabulary (no top-k cut, no nucleus cut) are sampled exactly on the GPU
+// (InklingEngine::sample_rows_full_to_host) instead of copying all 200,058
+// logits to the host and sorting them.  Same target distribution as
+// sample_logits_ptr: softmax(l / T), min-p filter, renormalise.
+static bool use_gpu_full_sampler(const SampleParams & sp) {
+    return sp.temperature > 1e-5f &&
+           (sp.top_k <= 0 || sp.top_k >= VOCAB_UNPADDED) &&
+           !(sp.top_p > 0.0f && sp.top_p < 1.0f);
+}
+
+// One exact draw from logit row 0 of the engine's logits buffer (the row the
+// last decode step wrote).  Falls back to `fallback` if the sampler fails.
+static int32_t sample_decode_row_gpu(const InklingEngine & eng, const SampleParams & sp,
+                                     std::mt19937_64 & rng, int32_t fallback) {
+    const int32_t excl[1] = { -1 };
+    int32_t tok[1] = { -1 };
+    float stats[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    const uint64_t seed = rng();
+    if (!eng.sample_rows_full_to_host(1, 1.0f / sp.temperature, sp.min_p, excl, seed, tok, stats) ||
+        tok[0] < 0 || tok[0] >= VOCAB_UNPADDED || !(stats[1] > 0.0f)) {
+        return fallback;
+    }
+    return tok[0];
+}
+
 // 100% mathematically lossless speculative rejection sampling for temperature > 0.
 // Draft token `draft_tok` is treated as a point-mass proposal q(x) = 1[x == draft_tok]:
 //   - Accept `draft_tok` with probability p(draft_tok), where p is the exact target
@@ -2744,6 +2770,56 @@ private:
             const int32_t * target = eng_.host_target_ids();
             while (acc < m - 1 && target[acc] == drafts[acc]) ++acc;
             next = target[acc];
+        } else if (use_gpu_full_sampler(job->sp)) {
+            // Issue #4: exact speculative sampling with a point-mass proposal
+            // q = delta(draft) (the drafter's tokens are deterministic), all on
+            // the GPU sampler -- no per-logit host traffic:
+            //   accept draft d with probability min(1, p(d) / q(d)) = p(d) = e_d / Z;
+            //   on rejection draw from norm(max(0, p - q)) = p(x) / (1 - p(d)), x != d,
+            //   which is exactly the GPU draw over keep \ {d} (row r, excl = d);
+            //   if every draft is accepted, the bonus token is a plain draw from p
+            //   (row m-1, excl = -1).
+            // The residual draws use Philox streams independent of the host's
+            // acceptance coins, so pre-drawing every row's residual is exact.
+            int32_t excl[8];
+            int32_t stok[8];
+            float   sstat[8 * 4];
+            for (int r = 0; r < m; ++r) excl[r] = (r < m - 1) ? drafts[r] : -1;
+            (void)hipEventRecord(ev1_, eng_.stream());
+            const bool s_ok = eng_.sample_rows_full_to_host(
+                m, 1.0f / job->sp.temperature, job->sp.min_p, excl, job->rng(), stok, sstat);
+            (void)hipEventRecord(ev2_, eng_.stream());
+            (void)hipStreamSynchronize(eng_.stream());
+            float tk_ms = 0.0f;
+            (void)hipEventElapsedTime(&tk_ms, ev1_, ev2_);
+            v_ms += tk_ms;
+            bool s_valid = s_ok;
+            for (int r = 0; s_valid && r < m; ++r) {
+                if (!(sstat[4 * r + 1] > 0.0f) || !std::isfinite(sstat[4 * r + 1])) s_valid = false;
+            }
+            if (!s_valid) {
+                const int32_t * target = eng_.host_target_ids();
+                while (acc < m - 1 && target[acc] == drafts[acc]) ++acc;
+                next = target[acc];
+            } else {
+                std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+                bool all_accepted = true;
+                for (int r = 0; r < m - 1; ++r) {
+                    const float z   = sstat[4 * r + 1];
+                    const float p_d = (sstat[4 * r + 3] > 0.5f) ? std::min(1.0f, sstat[4 * r + 2] / z) : 0.0f;
+                    if (u01(job->rng) < p_d || stok[r] < 0) {
+                        // stok < 0: keep \ {d} is empty, i.e. p(d) = 1 (accept).
+                        ++acc;
+                    } else {
+                        next = stok[r];
+                        all_accepted = false;
+                        break;
+                    }
+                }
+                if (all_accepted) {
+                    next = (stok[m - 1] >= 0) ? stok[m - 1] : eng_.host_target_ids()[m - 1];
+                }
+            }
         } else {
             // Lossless speculative rejection sampling for temperature > 0 (top_k, min_p, top_p).
             std::array<float,   8 * MTP_VERIFY_TOPK> topk_vals{};
@@ -2929,7 +3005,9 @@ private:
                         continue;
                     }
                 }
-                int32_t next = eng_.decode_step(job->cur_tok, job->need_logits ? &single_logits : nullptr);
+                const bool gpu_samp = job->need_logits && use_gpu_full_sampler(job->sp);
+                int32_t next = eng_.decode_step(job->cur_tok,
+                                                (job->need_logits && !gpu_samp) ? &single_logits : nullptr);
                 if (next < 0) {
                     slot_cache_valid_[0] = false;
                     slot_cache_span_[0] = 0;
@@ -2941,8 +3019,9 @@ private:
                     update_cache_span(0);
                 }
                 if (drafter_ != nullptr) drafter_in_sync_ = false;
-                const int32_t sampled = job->need_logits
-                    ? sample_logits(single_logits, job->sp, job->rng) : next;
+                const int32_t sampled = gpu_samp
+                    ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
+                    : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
                 (void)emit_token(job, sampled);
                 continue;
             }
@@ -2971,7 +3050,7 @@ private:
             int32_t b_argmax[MAX_CONCURRENT_SLOTS];
             std::shared_ptr<StreamJob> b_jobs[MAX_CONCURRENT_SLOTS];
             int B = 0;
-            bool any_need_logits = false;
+            bool any_need_cpu_logits = false;
             for (int c = 0; c < eng_.num_slots(); ++c) {
                 auto job = active_slots_[c];
                 if (job == nullptr || job->state != JOB_DECODING) continue;
@@ -2989,14 +3068,18 @@ private:
                 b_slots[B] = c;
                 b_toks[B]  = job->cur_tok;
                 b_jobs[B]  = job;
-                if (job->need_logits) any_need_logits = true;
+                if (job->need_logits && !use_gpu_full_sampler(job->sp)) {
+                    any_need_cpu_logits = true;
+                }
                 ++B;
             }
 
             if (B == 1) {
                 const int c = b_slots[0];
                 auto & job = b_jobs[0];
-                int32_t next = eng_.decode_slot_single(c, b_toks[0], job->need_logits ? &single_logits : nullptr);
+                const bool gpu_samp = job->need_logits && use_gpu_full_sampler(job->sp);
+                int32_t next = eng_.decode_slot_single(c, b_toks[0],
+                                                       (job->need_logits && !gpu_samp) ? &single_logits : nullptr);
                 if (next < 0) {
                     slot_cache_valid_[c] = false;
                     slot_cache_span_[c] = 0;
@@ -3007,17 +3090,51 @@ private:
                         update_cache_span(c);
                     }
                     if (c == 0 && drafter_ != nullptr) drafter_in_sync_ = false;
-                    const int32_t sampled = job->need_logits
-                        ? sample_logits(single_logits, job->sp, job->rng) : next;
+                    const int32_t sampled = gpu_samp
+                        ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
+                        : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
                     (void)emit_token(job, sampled);
                 }
             } else if (B >= 2) {
-                if (any_need_logits) {
+                if (any_need_cpu_logits) {
                     const size_t need = (size_t)B * VOCAB_UNPADDED;
                     if (batch_logits_.size() < need) batch_logits_.resize(need);
                 }
                 bool ok = eng_.decode_batch(b_slots, b_toks, B, b_argmax,
-                                            any_need_logits ? batch_logits_.data() : nullptr);
+                                            any_need_cpu_logits ? batch_logits_.data() : nullptr);
+                int32_t gpu_sampled[MAX_CONCURRENT_SLOTS] = {};
+                bool    gpu_sampled_ok[MAX_CONCURRENT_SLOTS] = {};
+                if (ok) {
+                    int      n_gpu = 0;
+                    int32_t  g_rows[MAX_CONCURRENT_SLOTS];
+                    float    g_inv_t[MAX_CONCURRENT_SLOTS];
+                    float    g_min_p[MAX_CONCURRENT_SLOTS];
+                    uint64_t g_seeds[MAX_CONCURRENT_SLOTS];
+                    for (int r = 0; r < B; ++r) {
+                        auto & job = b_jobs[r];
+                        if (job->need_logits && use_gpu_full_sampler(job->sp)) {
+                            g_rows[n_gpu]  = r;
+                            g_inv_t[n_gpu] = 1.0f / job->sp.temperature;
+                            g_min_p[n_gpu] = job->sp.min_p;
+                            g_seeds[n_gpu] = job->rng();
+                            ++n_gpu;
+                        }
+                    }
+                    if (n_gpu > 0) {
+                        int32_t g_tok[MAX_CONCURRENT_SLOTS];
+                        float   g_stats[MAX_CONCURRENT_SLOTS * 4];
+                        if (eng_.sample_batch_rows_full_to_host(n_gpu, g_rows, g_inv_t, g_min_p, g_seeds,
+                                                                g_tok, g_stats)) {
+                            for (int k = 0; k < n_gpu; ++k) {
+                                const int r = g_rows[k];
+                                if (g_tok[k] >= 0 && g_tok[k] < VOCAB_UNPADDED && g_stats[4 * k + 1] > 0.0f) {
+                                    gpu_sampled[r]    = g_tok[k];
+                                    gpu_sampled_ok[r] = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 for (int r = 0; r < B; ++r) {
                     const int c = b_slots[r];
                     auto & job = b_jobs[r];
@@ -3032,10 +3149,12 @@ private:
                         slot_cached_toks_[c].push_back(b_toks[r]);
                         update_cache_span(c);
                     }
-                    const int32_t sampled = job->need_logits
-                        ? sample_logits_ptr(batch_logits_.data() + (size_t)r * VOCAB_UNPADDED,
-                                            VOCAB_UNPADDED, job->sp, job->rng)
-                        : b_argmax[r];
+                    const int32_t sampled = !job->need_logits
+                        ? b_argmax[r]
+                        : (use_gpu_full_sampler(job->sp)
+                            ? (gpu_sampled_ok[r] ? gpu_sampled[r] : b_argmax[r])
+                            : sample_logits_ptr(batch_logits_.data() + (size_t)r * VOCAB_UNPADDED,
+                                                VOCAB_UNPADDED, job->sp, job->rng));
                     (void)emit_token(job, sampled);
                 }
             }

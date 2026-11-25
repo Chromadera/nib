@@ -190,11 +190,17 @@ DSparkDrafter::~DSparkDrafter() {
     allocs_.clear();
 }
 
-static void * dsg_alloc(std::vector<void *> & allocs, size_t bytes, size_t & total) {
+static void * dsg_alloc(std::vector<void *> & allocs, size_t bytes, size_t & total, hipStream_t stream) {
     void * p = nullptr;
     const size_t b = (bytes + 255) & ~size_t(255);
     if (hipMalloc(&p, b) != hipSuccess) {
         throw std::runtime_error("DSparkDrafter: hipMalloc failed");
+    }
+    // hipMalloc'd VRAM is not guaranteed to be clean (issue #1).  Ordered on the
+    // drafter (= engine) stream, never the legacy null stream.
+    if (hipMemsetAsync(p, 0, b, stream) != hipSuccess) {
+        (void)hipFree(p);
+        throw std::runtime_error("DSparkDrafter: hipMemsetAsync failed");
     }
     allocs.push_back(p);
     total += b;
@@ -261,7 +267,7 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
                     host[r * 4 + c] = (uint16_t)(u >> 16);
                 }
             }
-            uint16_t * d = static_cast<uint16_t *>(dsg_alloc(allocs_, sizeof(host), vram_bytes_));
+            uint16_t * d = static_cast<uint16_t *>(dsg_alloc(allocs_, sizeof(host), vram_bytes_, stream_));
             if (hipMemcpyAsync(d, host, sizeof(host), hipMemcpyHostToDevice, stream_) != hipSuccess) {
                 throw std::runtime_error("mtp: alpha upload failed");
             }
@@ -270,13 +276,13 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
 
         // ---- one reusable BF16 staging buffer for the row-concatenations ----
         const size_t max_rows = (size_t)2 * inter_;
-        uint16_t * stage = static_cast<uint16_t *>(dsg_alloc(allocs_, max_rows * H * 2, vram_bytes_));
+        uint16_t * stage = static_cast<uint16_t *>(dsg_alloc(allocs_, max_rows * H * 2, vram_bytes_, stream_));
 
         auto upload_bf16 = [&](const std::string & name, std::initializer_list<int64_t> shape) {
             const STTensor & t = hdr.at(name);
             if (t.dtype != "BF16") throw std::runtime_error("mtp: " + name + " is not BF16");
             const size_t bytes = (size_t)t.bytes();
-            uint16_t * d = static_cast<uint16_t *>(dsg_alloc(allocs_, bytes, vram_bytes_));
+            uint16_t * d = static_cast<uint16_t *>(dsg_alloc(allocs_, bytes, vram_bytes_, stream_));
             if (hipMemcpyAsync(d, data + t.a, bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) {
                 throw std::runtime_error("mtp: upload of " + name + " failed");
             }
@@ -297,8 +303,8 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
             }
             out.rows = (int)rows;
             out.K = (int)K;
-            out.qs = static_cast<int8_t *>(dsg_alloc(allocs_, (size_t)rows * K, vram_bytes_));
-            out.d  = static_cast<__half *>(dsg_alloc(allocs_, (size_t)rows * (K / 32) * 2, vram_bytes_));
+            out.qs = static_cast<int8_t *>(dsg_alloc(allocs_, (size_t)rows * K, vram_bytes_, stream_));
+            out.d  = static_cast<__half *>(dsg_alloc(allocs_, (size_t)rows * (K / 32) * 2, vram_bytes_, stream_));
             launch_dspark_repack_q8(stage, (int)rows, (int)K, out.qs, out.d, stream_);
         };
 
@@ -357,8 +363,8 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
         const uint16_t * hb = upload_bf16("markov_head.hidden_out.bias", {H});
 
         // ---- fold_w / fold_b (FP64 on the GPU) -----------------------------
-        fold_w_ = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)vocab_ * RANK * 2, vram_bytes_));
-        fold_b_ = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)vocab_ * 2, vram_bytes_));
+        fold_w_ = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)vocab_ * RANK * 2, vram_bytes_, stream_));
+        fold_b_ = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)vocab_ * 2, vram_bytes_, stream_));
         launch_dspark_fold_head(w.lm_head, hw, hb, vocab_, fold_w_, fold_b_, stream_);
         if (std::getenv("INKLING_MTP_NO_FOLD") != nullptr) {  // A/B: is the fold or the hidden wrong?
             (void)hipMemsetAsync(fold_b_, 0, (size_t)vocab_ * 2, stream_);
@@ -370,15 +376,15 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
             Layer & L = layers_[l];
             if (L.local) {
                 const size_t slots = (size_t)WINDOW + BLOCK;
-                L.k_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV * 2, vram_bytes_));
-                L.v_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV * 2, vram_bytes_));
-                L.ctx_pos = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)WINDOW * 4, vram_bytes_));
+                L.k_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV * 2, vram_bytes_, stream_));
+                L.v_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV * 2, vram_bytes_, stream_));
+                L.ctx_pos = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)WINDOW * 4, vram_bytes_, stream_));
             } else {
                 const size_t slots = (size_t)ctx_;
-                L.k_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV, vram_bytes_));
-                L.d_ctx = static_cast<__half *>(dsg_alloc(allocs_, slots * N_HEAD_KV * 4 * 2, vram_bytes_));
-                L.v_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV, vram_bytes_));
-                L.vd_ctx = static_cast<__half *>(dsg_alloc(allocs_, slots * N_HEAD_KV * 4 * 2, vram_bytes_));
+                L.k_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV, vram_bytes_, stream_));
+                L.d_ctx = static_cast<__half *>(dsg_alloc(allocs_, slots * N_HEAD_KV * 4 * 2, vram_bytes_, stream_));
+                L.v_ctx = static_cast<int8_t *>(dsg_alloc(allocs_, slots * N_KV, vram_bytes_, stream_));
+                L.vd_ctx = static_cast<__half *>(dsg_alloc(allocs_, slots * N_HEAD_KV * 4 * 2, vram_bytes_, stream_));
             }
         }
 
@@ -417,10 +423,10 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
             const int rows = short_K_ + MAX_CTX_ROWS;
             short_head_.rows = rows;
             short_head_.K = N_EMBD;
-            short_head_.qs = static_cast<int8_t *>(dsg_alloc(allocs_, (size_t)rows * N_EMBD, vram_bytes_));
-            short_head_.d  = static_cast<__half *>(dsg_alloc(allocs_, (size_t)rows * (N_EMBD / 32) * 2, vram_bytes_));
-            short_map_ = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)rows * 4, vram_bytes_));
-            short_ids_ = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)rows * 4, vram_bytes_));
+            short_head_.qs = static_cast<int8_t *>(dsg_alloc(allocs_, (size_t)rows * N_EMBD, vram_bytes_, stream_));
+            short_head_.d  = static_cast<__half *>(dsg_alloc(allocs_, (size_t)rows * (N_EMBD / 32) * 2, vram_bytes_, stream_));
+            short_map_ = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)rows * 4, vram_bytes_, stream_));
+            short_ids_ = static_cast<int32_t *>(dsg_alloc(allocs_, (size_t)rows * 4, vram_bytes_, stream_));
             if (hipMemsetAsync(short_map_, 0, (size_t)rows * 4, stream_) != hipSuccess) {
                 throw std::runtime_error("mtp: short map memset failed");
             }
@@ -429,12 +435,12 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
             }
             launch_dspark_gather_q8(w.lm_head, short_ids_, short_K_, short_head_.qs, short_head_.d,
                                     0, short_map_, stream_);
-            base_ = static_cast<float *>(dsg_alloc(allocs_, (size_t)GAMMA * rows * 4, vram_bytes_));
+            base_ = static_cast<float *>(dsg_alloc(allocs_, (size_t)GAMMA * rows * 4, vram_bytes_, stream_));
             launch_dspark_fill(base_, (int64_t)GAMMA * rows, -INFINITY, stream_);
         }
 
         // ---- per-call scratch ----------------------------------------------
-        auto raw = [&](size_t bytes) { return dsg_alloc(allocs_, bytes, vram_bytes_); };
+        auto raw = [&](size_t bytes) { return dsg_alloc(allocs_, bytes, vram_bytes_, stream_); };
         res_      = static_cast<uint16_t *>(raw((size_t)BLOCK * H * 2));
         xn_       = static_cast<uint16_t *>(raw((size_t)BLOCK * H * 2));
         q_        = static_cast<uint16_t *>(raw((size_t)BLOCK * N_Q * 2));
@@ -471,7 +477,7 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
             throw std::runtime_error("mtp: dp host alloc failed");
         }
         std::memset(h_dp_, 0, sizeof(DSparkDraftParams));
-        d_dp_ = static_cast<DSparkDraftParams *>(dsg_alloc(allocs_, sizeof(DSparkDraftParams), vram_bytes_));
+        d_dp_ = static_cast<DSparkDraftParams *>(dsg_alloc(allocs_, sizeof(DSparkDraftParams), vram_bytes_, stream_));
         if (hipStreamSynchronize(stream_) != hipSuccess) {
             throw std::runtime_error("mtp: init stream sync failed");
         }
@@ -577,7 +583,7 @@ void DSparkDrafter::commit(const uint16_t * d_feats, int n, int start) {
             // i.e. right after a prefill chunk, which already syncs).
             if (hipStreamSynchronize(stream_) == hipSuccess) {
                 hipGraph_t g = nullptr;
-                if (hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal) == hipSuccess) {
+                if (hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal) == hipSuccess) {
                     run_commit_piece(d_feats, BLOCK, start, /*last=*/true, d_dp_);
                     if (hipStreamEndCapture(stream_, &g) == hipSuccess) {
                         if (hipGraphInstantiate(&commit_graph_exec_, g, nullptr, nullptr, 0) != hipSuccess) {
@@ -654,9 +660,9 @@ double DSparkDrafter::debug_gemv_check() {
             hx[(size_t)r * N_EMBD + i] = (uint16_t)(u >> 16);
         }
     }
-    uint16_t * dx = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)m * N_EMBD * 2, vram_bytes_));
-    float * ym = static_cast<float *>(dsg_alloc(allocs_, (size_t)m * VOCAB_UNPADDED * 4, vram_bytes_));
-    float * y1 = static_cast<float *>(dsg_alloc(allocs_, (size_t)VOCAB_UNPADDED * 4, vram_bytes_));
+    uint16_t * dx = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)m * N_EMBD * 2, vram_bytes_, stream_));
+    float * ym = static_cast<float *>(dsg_alloc(allocs_, (size_t)m * VOCAB_UNPADDED * 4, vram_bytes_, stream_));
+    float * y1 = static_cast<float *>(dsg_alloc(allocs_, (size_t)VOCAB_UNPADDED * 4, vram_bytes_, stream_));
     (void)hipMemcpyAsync(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice, stream_);
     SoaQ8Matrix head = w_->lm_head;
     launch_dspark_gemv(head, dx, N_EMBD, true, m, ym, VOCAB_UNPADDED, stream_);
@@ -664,7 +670,7 @@ double DSparkDrafter::debug_gemv_check() {
     for (int r = 0; r < m; ++r) {
         std::vector<float> xf((size_t)N_EMBD);
         for (int i = 0; i < N_EMBD; ++i) xf[(size_t)i] = h_bf2f(hx[(size_t)r * N_EMBD + i]);
-        float * dxf = static_cast<float *>(dsg_alloc(allocs_, (size_t)N_EMBD * 4, vram_bytes_));
+        float * dxf = static_cast<float *>(dsg_alloc(allocs_, (size_t)N_EMBD * 4, vram_bytes_, stream_));
         (void)hipMemcpyAsync(dxf, xf.data(), xf.size() * 4, hipMemcpyHostToDevice, stream_);
         launch_soa_q8_gemv(head, dxf, y1, stream_);
         std::vector<float> hm((size_t)VOCAB_UNPADDED), h1((size_t)VOCAB_UNPADDED);
@@ -690,12 +696,12 @@ double DSparkDrafter::debug_shortlist_check() {
         u += 0x7fffu + ((u >> 16) & 1u);
         hx[(size_t)i] = (uint16_t)(u >> 16);
     }
-    uint16_t * dx = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)N_EMBD * 2, vram_bytes_));
-    float * ys = static_cast<float *>(dsg_alloc(allocs_, (size_t)short_head_.rows * 4, vram_bytes_));
-    float * yl = static_cast<float *>(dsg_alloc(allocs_, (size_t)VOCAB_UNPADDED * 4, vram_bytes_));
+    uint16_t * dx = static_cast<uint16_t *>(dsg_alloc(allocs_, (size_t)N_EMBD * 2, vram_bytes_, stream_));
+    float * ys = static_cast<float *>(dsg_alloc(allocs_, (size_t)short_head_.rows * 4, vram_bytes_, stream_));
+    float * yl = static_cast<float *>(dsg_alloc(allocs_, (size_t)VOCAB_UNPADDED * 4, vram_bytes_, stream_));
     std::vector<float> xf((size_t)N_EMBD);
     for (int i = 0; i < N_EMBD; ++i) xf[(size_t)i] = h_bf2f(hx[(size_t)i]);
-    float * dxf = static_cast<float *>(dsg_alloc(allocs_, (size_t)N_EMBD * 4, vram_bytes_));
+    float * dxf = static_cast<float *>(dsg_alloc(allocs_, (size_t)N_EMBD * 4, vram_bytes_, stream_));
     (void)hipMemcpyAsync(dx, hx.data(), hx.size() * 2, hipMemcpyHostToDevice, stream_);
     (void)hipMemcpyAsync(dxf, xf.data(), xf.size() * 4, hipMemcpyHostToDevice, stream_);
     SoaQ8Matrix hv = short_head_;
@@ -780,7 +786,7 @@ void DSparkDrafter::capture_draft_graphs() {
     for (int b : buckets) {
         const int cap = std::min(b, ctx_);
         hipGraph_t g = nullptr;
-        if (hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal) != hipSuccess) {
+        if (hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal) != hipSuccess) {
             std::fprintf(stderr, "[dspark] graph capture begin failed (bucket %d)\n", b);
             return;
         }

@@ -124,10 +124,12 @@ inline size_t sparse_global_scratch_bytes() {
          + (size_t)SPARSE_MAX_QB * N_HEAD_KV * sizeof(int32_t);
 }
 
+// Both allocators zero-fill on `stream` (stream-ordered): hipMalloc'd VRAM is
+// not guaranteed to be clean (issue #1).
 bool sparse_global_page_meta_alloc(SparseGlobalPageMeta & m, int max_pages,
-                                   int fmt = SPARSE_META_Q8);
+                                   int fmt, hipStream_t stream);
 void sparse_global_page_meta_free(SparseGlobalPageMeta & m);
-bool sparse_global_scratch_alloc(SparseGlobalScratch & s);
+bool sparse_global_scratch_alloc(SparseGlobalScratch & s, hipStream_t stream);
 void sparse_global_scratch_free(SparseGlobalScratch & s);
 
 // First mandatory local page for a prefill query block starting at q_pos_start:

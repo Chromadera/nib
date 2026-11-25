@@ -285,6 +285,10 @@ size_t nelem_of(const TensorInfo & t)
 // ---------------------------------------------------------------------------
 // Device helpers
 // ---------------------------------------------------------------------------
+// Stream the loader works on; alloc_tracked zero-fills on it (stream-ordered
+// before every upload / repack that writes the allocation).
+static hipStream_t g_alloc_zero_stream = nullptr;
+
 void * alloc_tracked(ModelWeights & w, size_t bytes)
 {
     if (bytes == 0) {
@@ -295,6 +299,19 @@ void * alloc_tracked(ModelWeights & w, size_t bytes)
     if (err != hipSuccess) {
         throw std::runtime_error(std::string("hipMalloc failed: ") + hipGetErrorString(err) +
                                  " (" + std::to_string(bytes) + " bytes)");
+    }
+    // Zero the whole allocation (incl. any SoA padding the repack never
+    // writes): hipMalloc'd VRAM is not guaranteed to be clean (issue #1).
+    // Ordered on the loader stream; never the legacy null stream (an extra HW
+    // queue for the rest of the process costs ~3.5% prefill throughput).
+    if (g_alloc_zero_stream == nullptr) {
+        (void)hipFree(p);
+        throw std::runtime_error("alloc_tracked: loader stream not set");
+    }
+    err = hipMemsetAsync(p, 0, bytes, g_alloc_zero_stream);
+    if (err != hipSuccess) {
+        (void)hipFree(p);
+        throw std::runtime_error(std::string("hipMemset failed: ") + hipGetErrorString(err));
     }
     w.gpu_allocs.push_back(p);
     w.total_vram_bytes += bytes;
@@ -617,11 +634,13 @@ bool load_inkling_gguf(
         if (hipStreamCreate(&stream) != hipSuccess) {
             throw std::runtime_error("hipStreamCreate failed");
         }
+        g_alloc_zero_stream = stream;
         auto stream_guard = [&]() {
             if (stream != nullptr) {
                 (void)hipStreamDestroy(stream);
                 stream = nullptr;
             }
+            g_alloc_zero_stream = nullptr;
         };
 
         {
@@ -1003,6 +1022,7 @@ bool load_inkling_gguf(
             (void)hipStreamDestroy(stream);
             stream = nullptr;
         }
+        g_alloc_zero_stream = nullptr;
         munmap_guard();
         throw;
     }

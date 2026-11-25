@@ -314,6 +314,139 @@ bool st_prefill_fixture(InklingEngine & eng, DSparkDrafter * dr, const std::vect
     return eng.prefill(prompt, false, logits);
 }
 
+// Issue #4: the exact GPU full-vocab sampler against the analytic distribution
+// of the same logit row (row 0 of the engine's logits buffer = `logits`, the
+// softcapped row the last decode step produced).  Fixed seeds -> deterministic.
+//   * Z, p(excl) and the kept set must match the host's double-precision softmax.
+//   * N bonus draws (no exclusion) must follow p:            chi-square gate.
+//   * N residual draws (excl = argmax) must never return the excluded token and
+//     must follow p(x) / (1 - p(argmax)), x != argmax:     chi-square gate.
+//   * a min_p run must never leave { x : p(x) >= min_p * p_max }.
+int run_selftest_sampler(InklingEngine & eng, const std::vector<float> & logits) {
+    const int V = VOCAB_UNPADDED;
+    if ((int)logits.size() < V) return 1;
+    int failures = 0;
+    const int32_t amax = (int32_t)(std::max_element(logits.begin(), logits.begin() + V) - logits.begin());
+
+    // T = 1.5 flattens the row so the tail actually gets exercised.
+    const float temp = 1.5f;
+    const float inv_t = 1.0f / temp;
+    const double mx = (double)logits[(size_t)amax];
+    std::vector<double> p((size_t)V);
+    double z = 0.0;
+    for (int x = 0; x < V; ++x) {
+        p[(size_t)x] = std::exp(((double)logits[(size_t)x] - mx) * (double)inv_t);
+        z += p[(size_t)x];
+    }
+    for (double & v : p) v /= z;
+
+    auto chi_square = [&](const std::vector<int> & cnt, int n, int32_t excl, double & chi, int & dof) {
+        // Bins: every token with expected count >= 5, plus one pooled tail bin.
+        const double pe = (excl >= 0) ? p[(size_t)excl] : 0.0;
+        const double norm = 1.0 / (1.0 - pe);
+        chi = 0.0;
+        dof = -1;
+        double tail_e = 0.0;
+        long long tail_o = 0;
+        for (int x = 0; x < V; ++x) {
+            if (x == excl) continue;
+            const double e = (double)n * p[(size_t)x] * norm;
+            if (e >= 5.0) {
+                const double d = (double)cnt[(size_t)x] - e;
+                chi += d * d / e;
+                ++dof;
+            } else {
+                tail_e += e;
+                tail_o += cnt[(size_t)x];
+            }
+        }
+        if (tail_e >= 5.0) {
+            const double d = (double)tail_o - tail_e;
+            chi += d * d / tail_e;
+            ++dof;
+        }
+    };
+
+    const int n_draw = 20000;
+    for (int mode = 0; mode < 2; ++mode) {
+        const int32_t excl = (mode == 0) ? -1 : amax;
+        std::vector<int> cnt((size_t)V, 0);
+        int bad = 0;
+        double z_rel = 0.0, pd_err = 0.0;
+        for (int i = 0; i < n_draw; ++i) {
+            int32_t tok = -1;
+            float st[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const uint64_t seed = 0x9E3779B97F4A7C15ull * (uint64_t)(i + 1) + (uint64_t)mode;
+            if (!eng.sample_rows_full_to_host(1, inv_t, 0.0f, &excl, seed, &tok, st)) { ++bad; break; }
+            if (tok < 0 || tok >= V || tok == excl) { ++bad; continue; }
+            ++cnt[(size_t)tok];
+            if (i == 0) {
+                z_rel = std::fabs((double)st[1] / z - 1.0);
+                if (excl >= 0) pd_err = std::fabs((double)st[2] / (double)st[1] - p[(size_t)excl]);
+            }
+        }
+        double chi = 0.0;
+        int dof = 0;
+        chi_square(cnt, n_draw, excl, chi, dof);
+        // ~6 sigma above the chi-square mean (dof) for a deterministic, non-flaky gate.
+        const double lim = (double)dof + 6.0 * std::sqrt(2.0 * (double)std::max(dof, 1));
+        const bool ok = (bad == 0) && (chi <= lim) && (z_rel < 1e-4) && (pd_err < 1e-5);
+        std::printf("[selftest] sampler %-8s T=%.1f: %d draws, bad=%d, chi2=%.1f (dof=%d, gate %.1f), |Z/Z_ref-1|=%.2e, |p(excl)-ref|=%.2e, p(argmax)=%.4f -> %s\n",
+                    (mode == 0) ? "bonus" : "residual", temp, n_draw, bad, chi, dof, lim, z_rel, pd_err,
+                    p[(size_t)amax], ok ? "PASS" : "FAIL");
+        if (!ok) ++failures;
+    }
+
+    // min_p: no draw may fall outside the kept set.
+    {
+        const float min_p = 0.05f;
+        int out_of_set = 0, bad = 0;
+        for (int i = 0; i < 4000; ++i) {
+            int32_t tok = -1;
+            float st[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            const int32_t excl = -1;
+            if (!eng.sample_rows_full_to_host(1, inv_t, min_p, &excl, 0xA5A5ull + (uint64_t)i, &tok, st) ||
+                tok < 0 || tok >= V) { ++bad; continue; }
+            if (p[(size_t)tok] < (double)min_p * p[(size_t)amax] * (1.0 - 1e-5)) ++out_of_set;
+        }
+        const bool ok = (bad == 0 && out_of_set == 0);
+        std::printf("[selftest] sampler min_p=%.2f: 4000 draws, bad=%d, outside kept set=%d -> %s\n",
+                    min_p, bad, out_of_set, ok ? "PASS" : "FAIL");
+        if (!ok) ++failures;
+    }
+
+    // Heterogeneous batch sampler: 4 items with distinct (inv_t, min_p, seed) must
+    // match 4 independent solo draws bit-for-bit (batch-invariance of seeded sampling).
+    {
+        const int32_t  rows[4]  = { 0, 0, 0, 0 };
+        const float    invts[4] = { 1.0f / 0.6f, 1.0f / 1.0f, 1.0f / 1.5f, 1.0f / 2.0f };
+        const float    minps[4] = { 0.0f, 0.05f, 0.0f, 0.10f };
+        const uint64_t seeds[4] = { 0x1111222233334444ull, 0x5555666677778888ull,
+                                    0x9999AAAABBBBCCCCull, 0xDDDDEEEEFFFF0001ull };
+        int32_t b_tok[4] = { -1, -1, -1, -1 };
+        float   b_st[16] = {};
+        int mismatches = 0;
+        bool ok = eng.sample_batch_rows_full_to_host(4, rows, invts, minps, seeds, b_tok, b_st);
+        if (ok) {
+            for (int k = 0; k < 4; ++k) {
+                int32_t s_tok = -1;
+                float   s_st[4] = {};
+                const int32_t excl = -1;
+                if (!eng.sample_rows_full_to_host(1, invts[k], minps[k], &excl, seeds[k], &s_tok, s_st) ||
+                    s_tok != b_tok[k] || s_st[1] != b_st[4 * k + 1]) {
+                    ++mismatches;
+                }
+            }
+        }
+        ok = ok && (mismatches == 0);
+        std::printf("[selftest] sampler batch(4x heterogeneous): mismatches=%d -> %s\n",
+                    mismatches, ok ? "PASS" : "FAIL");
+        if (!ok) ++failures;
+    }
+    std::fflush(stdout);
+    return failures;
+}
+
 SelftestResult run_selftest_mtp(InklingEngine & eng, DSparkDrafter & dr, float threshold, bool bench) {
     SelftestResult res;
     const std::vector<int32_t> prompt = { 1, 100, 200, 300, 400 };
@@ -792,6 +925,7 @@ int main(int argc, char ** argv) {
         std::printf("[SELFTEST] Prefill vs Decode (5 tokens): next_pf=%d next_dec=%d | max_diff=%.5f | cos_sim=%.7f\n",
                     next_pf, next_dec, max_diff, cos_sim);
         int failures = (cos_sim > 0.999) ? 0 : 1;
+        failures += run_selftest_sampler(eng, logits_dec);
         if (!mtp_path.empty()) {
             DSparkDrafter dr;
             if (!eng.enable_mtp_io()) { std::fprintf(stderr, "enable_mtp_io failed\n"); return 1; }

@@ -135,7 +135,10 @@ static __global__ void embed_norm_2304_kernel(
     const int warp_id = tid >> 5;
     const int lane_id = tid & 31;
 
-    const int32_t tok_id = (d_meta != nullptr) ? d_meta->token_id : d_token_ids[t];
+    int32_t tok_id = (d_meta != nullptr) ? d_meta->token_id : d_token_ids[t];
+    if ((uint32_t)tok_id >= (uint32_t)VOCAB_UNPADDED) {
+        tok_id = 0;   // never gather outside the embedding table (issue #1)
+    }
 
     const int32_t * row_qs = (const int32_t *)(embd_qs + (size_t)tok_id * N_EMBD);
     const __half  * row_d  = embd_d + (size_t)tok_id * (N_EMBD / 32);
@@ -3295,7 +3298,8 @@ static __global__ void argmax_f32_stage2_kernel(int32_t * __restrict__ d_out_id)
         }
     }
     if (lane == 0) {
-        *d_out_id = bi;
+        // All-NaN input never wins a comparison: never emit the INT32_MAX sentinel.
+        *d_out_id = (bi == INT32_MAX) ? 0 : bi;
     }
 }
 
@@ -3437,6 +3441,12 @@ static __global__ void logit_softcap_argmax_kernel(
             }
         }
         if (lane == 0) {
+            // NaN logits never win a comparison, so an all-NaN row would leave the
+            // INT32_MAX sentinel here and the next graph step would gather embedding
+            // row 2^31-1 (issue #1: GPU fault / hang).  Always emit a valid id.
+            if (bi < 0 || bi >= vocab_size) {
+                bi = 0;
+            }
             *d_out_id = bi;
             if (d_meta_next != nullptr) {
                 // Single-thread deterministic meta advance for the next decode step:

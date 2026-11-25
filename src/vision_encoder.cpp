@@ -311,6 +311,7 @@ bool VisionEncoder::init(const std::string & mmproj_path, hipStream_t stream) {
         auto alloc_w = [&](size_t bytes) -> void * {
             void * p = nullptr;
             V_HIP_CHECK(hipMalloc(&p, bytes));
+            V_HIP_CHECK(hipMemsetAsync(p, 0, bytes, stream_));   // never read uninitialised VRAM (issue #1)
             weight_allocs_.push_back(p);
             weight_vram_bytes_ += bytes;
             return p;
@@ -454,6 +455,7 @@ bool VisionEncoder::ensure_scratch(int n_patches, int n_merged, int w_pad, int h
     auto alloc_s = [&](size_t bytes) -> void * {
         void * p = nullptr;
         V_HIP_CHECK(hipMalloc(&p, bytes));
+        V_HIP_CHECK(hipMemsetAsync(p, 0, bytes, stream_));   // never read uninitialised VRAM (issue #1)
         scratch_allocs_.push_back(p);
         scratch_vram_bytes_ += bytes;
         return p;
