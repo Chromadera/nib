@@ -926,7 +926,24 @@ struct PromptSegment {
     bool is_image = false;
     std::string text;
     std::vector<uint8_t> image_bytes;
+    std::vector<int32_t> toks;   // text: pre-tokenized ids (HTTP thread)
+    uint64_t hash1 = 0;          // image: 128-bit content hash of image_bytes
+    uint64_t hash2 = 0;
+    int n_tokens = 0;            // image: ViT token count (set once encoded)
 };
+
+// Two independent 64-bit mixes over the image bytes -> 128-bit content identity.
+static void image_content_hash(const std::vector<uint8_t> & b, uint64_t & h1, uint64_t & h2) {
+    uint64_t a = 1469598103934665603ULL;
+    uint64_t x = 0x9E3779B97F4A7C15ULL ^ (uint64_t)b.size();
+    for (uint8_t c : b) {
+        a ^= c; a *= 1099511628211ULL;
+        x = (x + c + 1ULL) * 0xff51afd7ed558ccdULL;
+        x ^= x >> 29;
+    }
+    h1 = a;
+    h2 = x * 0xc4ceb9fe1a85ec53ULL;
+}
 
 static std::string format_effort_str(const JsonVal * v) {
     double num = 0.7; // default: medium
@@ -1123,6 +1140,7 @@ static bool build_inkling_chat_segments(
                     push_text(rtok + "<|content_image|>");
                     PromptSegment img;
                     img.is_image = true;
+                    image_content_hash(bytes, img.hash1, img.hash2);
                     img.image_bytes = std::move(bytes);
                     segs.push_back(std::move(img));
                     push_text("<|end_message|>");
@@ -1202,6 +1220,15 @@ struct GenResult {
     double mtp_avg_accepted = 0.0;
     double mtp_draft_ms = 0.0;
     double mtp_verify_ms = 0.0;
+};
+
+// One segment of a slot's cached multimodal prologue (see slot_mm_prologue_).
+struct SlotCacheSeg {
+    bool is_image = false;
+    int ntok = 0;                 // image: ViT token count
+    uint64_t hash1 = 0;           // image: 128-bit content hash
+    uint64_t hash2 = 0;
+    std::vector<int32_t> toks;    // text: token ids
 };
 
 struct ActivityRecord {
@@ -1922,6 +1949,7 @@ private:
         if (drafter_) drafter_->reset();
         drafter_in_sync_ = (drafter_ != nullptr);
         for (int c = 0; c < MAX_CONCURRENT_SLOTS; ++c) {
+            slot_mm_prologue_[c].clear();
             slot_cached_toks_[c].clear();
             slot_cache_valid_[c] = false;
             slot_cache_span_[c] = 0;
@@ -1995,8 +2023,23 @@ private:
         return sp;
     }
 
+    int64_t slot_cached_total(int c) const {
+        int64_t n = (int64_t)slot_cached_toks_[c].size();
+        for (const auto & s : slot_mm_prologue_[c]) {
+            n += s.is_image ? (int64_t)s.ntok : (int64_t)s.toks.size();
+        }
+        return n;
+    }
+
+    void clear_slot_cache(int c) {
+        slot_mm_prologue_[c].clear();
+        slot_cached_toks_[c].clear();
+        slot_cache_valid_[c] = false;
+        slot_cache_span_[c] = 0;
+    }
+
     void update_cache_span(int c) {
-        if (!slot_cache_valid_[c] || slot_cached_toks_[c].empty()) {
+        if (!slot_cache_valid_[c] || slot_cached_total(c) <= 0) {
             slot_cache_span_[c] = 0;
             return;
         }
@@ -2005,11 +2048,76 @@ private:
             slot_cache_span_[c] = 1;
             return;
         }
-        const int32_t sz = (int32_t)slot_cached_toks_[c].size();
+        const int32_t sz = (int32_t)slot_cached_total(c);
         int sp = (sz + eng_.slot_ctx() - 1) / eng_.slot_ctx();
         if (sp < 1) sp = 1;
         if (sp > n_slots - c) sp = n_slots - c;
         slot_cache_span_[c] = sp;
+    }
+
+    // Longest prefix of `cand` that is already resident in slot c's KV (scheduler thread).
+    // Returns the token count (0 = miss). On a hit, *resume_seg / *resume_off give the
+    // candidate segment + intra-segment token offset where prefill must continue.
+    //   text-only candidate : prologue must be empty; slot_cached_toks_ must equal prompt_toks[0:n].
+    //   multimodal candidate : prologue segments must match one-to-one (text ids exact, images by
+    //                          128-bit hash), then slot_cached_toks_ must be a prefix of the
+    //                          remaining text. Matched image segments get n_tokens filled in.
+    int match_slot_prefix(int c, StreamJob & cand, int * resume_seg, int * resume_off) {
+        *resume_seg = 0;
+        *resume_off = 0;
+        if (!slot_cache_valid_[c]) return 0;
+        const auto & pro = slot_mm_prologue_[c];
+        const auto & tail = slot_cached_toks_[c];
+        const int64_t total = slot_cached_total(c);
+        if (total <= 0 || (int64_t)eng_.slot_pos(c) != total) return 0;
+
+        if (!cand.has_images) {
+            if (!pro.empty()) return 0;
+            const int n = (int)tail.size();
+            if ((int)cand.prompt_toks.size() <= n) return 0;
+            if (!std::equal(tail.begin(), tail.end(), cand.prompt_toks.begin())) return 0;
+            return n;
+        }
+
+        auto & segs = cand.segs;
+        const size_t nseg = segs.size();
+        auto skip_empty = [&](size_t & i) {
+            while (i < nseg && !segs[i].is_image && segs[i].toks.empty()) ++i;
+        };
+        size_t si = 0;
+        for (const auto & cs : pro) {
+            skip_empty(si);
+            if (si >= nseg || segs[si].is_image != cs.is_image) return 0;
+            if (cs.is_image) {
+                if (segs[si].hash1 != cs.hash1 || segs[si].hash2 != cs.hash2) return 0;
+                segs[si].n_tokens = cs.ntok;
+            } else {
+                if (segs[si].toks != cs.toks) return 0;
+            }
+            ++si;
+        }
+        if (!tail.empty()) {
+            size_t got = 0;
+            while (got < tail.size()) {
+                skip_empty(si);
+                if (si >= nseg || segs[si].is_image) return 0;
+                const auto & st = segs[si].toks;
+                const size_t take = std::min(st.size(), tail.size() - got);
+                if (std::memcmp(st.data(), tail.data() + got, take * sizeof(int32_t)) != 0) return 0;
+                got += take;
+                if (take < st.size()) {
+                    // Tail ends inside this text segment: resume with its remaining tokens
+                    *resume_seg = (int)si;
+                    *resume_off = (int)take;
+                    return (int)total;
+                }
+                ++si;
+            }
+        }
+        skip_empty(si);
+        if (si >= nseg) return 0; // nothing left to prefill -> no logits
+        *resume_seg = (int)si;
+        return (int)total;
     }
 
     // Any write into segments [start_seg, start_seg + span) overwrites Global KV
@@ -2197,6 +2305,8 @@ private:
             int chosen_span = 1;
             bool chosen_prefix_hit = false;
             int chosen_prefix_len = 0;
+            int chosen_resume_seg = 0;
+            int chosen_resume_off = 0;
 
             // Segments reserved by already-active jobs waiting to expand in-place
             bool expand_reserved[MAX_CONCURRENT_SLOTS] = {};
@@ -2252,6 +2362,8 @@ private:
 
                     int best_hit_slot = -1;
                     int best_hit_len  = 0;
+                    int best_hit_seg  = 0;
+                    int best_hit_off  = 0;
                     int best_free_slot = -1;
                     int64_t best_free_score = INT64_MIN;
 
@@ -2266,23 +2378,21 @@ private:
                         }
                         if (!ok) continue;
 
-                        // Check exact prefix cache hit on slot c
-                        if (!cand->has_images && slot_cache_valid_[c] &&
-                            eng_.slot_pos(c) == (int)slot_cached_toks_[c].size() &&
-                            !slot_cached_toks_[c].empty() &&
-                            cand->prompt_toks.size() > slot_cached_toks_[c].size()) {
-                            const int plen = (int)slot_cached_toks_[c].size();
-                            // On slot 0 with MTP enabled, only forfeit a tiny prefix hit (< 2048 tok)
-                            // to resync the drafter; never throw away a large cached prefix!
-                            const bool skip_for_mtp =
-                                (c == 0 && drafter_ != nullptr && cand->allow_mtp &&
-                                 !drafter_in_sync_ && plen < 2048);
-                            if (!skip_for_mtp &&
-                                std::equal(slot_cached_toks_[c].begin(), slot_cached_toks_[c].end(),
-                                           cand->prompt_toks.begin())) {
-                                if (plen > best_hit_len) {
+                        // Check exact prefix cache hit on slot c (text and multimodal)
+                        {
+                            int rseg = 0, roff = 0;
+                            const int plen = match_slot_prefix(c, *cand, &rseg, &roff);
+                            if (plen > 0) {
+                                // On slot 0 with MTP enabled, only forfeit a tiny prefix hit (< 2048 tok)
+                                // to resync the drafter; never throw away a large cached prefix!
+                                const bool skip_for_mtp =
+                                    (c == 0 && drafter_ != nullptr && cand->allow_mtp &&
+                                     !drafter_in_sync_ && plen < 2048);
+                                if (!skip_for_mtp && plen > best_hit_len) {
                                     best_hit_len = plen;
                                     best_hit_slot = c;
+                                    best_hit_seg = rseg;
+                                    best_hit_off = roff;
                                 }
                             }
                         }
@@ -2367,6 +2477,8 @@ private:
                         chosen_span = min_span;
                         chosen_prefix_hit = true;
                         chosen_prefix_len = best_hit_len;
+                        chosen_resume_seg = best_hit_seg;
+                        chosen_resume_off = best_hit_off;
                         chosen_idx = idx;
                         break;
                     }
@@ -2398,12 +2510,9 @@ private:
                                 while (align < min_span) align <<= 1;
                                 if (w % align == 0) wscore += 50;
                             }
-                            if (!cand->has_images && slot_cache_valid_[w] &&
-                                !slot_cached_toks_[w].empty() &&
-                                cand->prompt_toks.size() > slot_cached_toks_[w].size() &&
-                                std::equal(slot_cached_toks_[w].begin(), slot_cached_toks_[w].end(),
-                                           cand->prompt_toks.begin())) {
-                                wscore += 200;
+                            {
+                                int rseg = 0, roff = 0;
+                                if (match_slot_prefix(w, *cand, &rseg, &roff) > 0) wscore += 200;
                             }
                             if (wscore > best_w_score) {
                                 best_w_score = wscore;
@@ -2476,6 +2585,7 @@ private:
                     next_job->prefill_offset = chosen_prefix_len;
                 } else {
                     eng_.reset_slot(chosen_slot, chosen_span);
+                    slot_mm_prologue_[chosen_slot].clear();
                     slot_cached_toks_[chosen_slot].clear();
                     slot_cache_valid_[chosen_slot] = false;
                     slot_cache_span_[chosen_slot] = 0;
@@ -2486,19 +2596,44 @@ private:
                     next_job->prefill_offset = 0;
                 }
             } else {
-                // Multimodal turn: always reset chosen slot with its allocated span
-                eng_.reset_slot(chosen_slot, chosen_span);
-                slot_cached_toks_[chosen_slot].clear();
-                slot_cache_valid_[chosen_slot] = false;
-                slot_cache_span_[chosen_slot] = 0;
-                if (chosen_slot == 0 && drafter_ != nullptr) {
-                    drafter_->reset();
-                    drafter_in_sync_ = true;
+                // Multimodal turn. With a prefix hit (identical prologue images + text) the
+                // slot's KV is replayed and only the remaining segments are prefilled;
+                // otherwise reset the slot with its allocated span.
+                next_job->live_prompt_toks.store(next_job->est_prompt_toks, std::memory_order_relaxed);
+                if (chosen_prefix_hit) {
+                    if (eng_.slot_span(chosen_slot) < chosen_span) {
+                        (void)eng_.expand_slot_span(chosen_slot, chosen_span);
+                    } else if (eng_.slot_span(chosen_slot) > chosen_span) {
+                        (void)eng_.shrink_slot_span(chosen_slot, chosen_span);
+                    }
+                    next_job->sched_cache_hit_tokens = chosen_prefix_len;
+                    next_job->seg_idx = (size_t)chosen_resume_seg;
+                    next_job->seg_offset = 0;
+                    if (chosen_resume_off > 0) {
+                        // Resume inside a text segment: pre-load its not-yet-cached remainder.
+                        const auto & st = next_job->segs[next_job->seg_idx].toks;
+                        next_job->cur_seg_toks.assign(st.begin() + chosen_resume_off, st.end());
+                        next_job->sched_prompt_tokens += (int)next_job->cur_seg_toks.size();
+                        next_job->sched_prompt_tokens = chosen_prefix_len + (int)next_job->cur_seg_toks.size();
+                        next_job->live_prompt_toks.store(next_job->sched_prompt_tokens, std::memory_order_relaxed);
+                    }
+                    next_job->cur_vis_loaded = false;
+                } else {
+                    next_job->sched_prompt_tokens = 0; // accumulated as segments are encoded
+                    eng_.reset_slot(chosen_slot, chosen_span);
+                    slot_mm_prologue_[chosen_slot].clear();
+                    slot_cached_toks_[chosen_slot].clear();
+                    slot_cache_valid_[chosen_slot] = false;
+                    slot_cache_span_[chosen_slot] = 0;
+                    if (chosen_slot == 0 && drafter_ != nullptr) {
+                        drafter_->reset();
+                        drafter_in_sync_ = true;
+                    }
+                    next_job->seg_idx = 0;
+                    next_job->seg_offset = 0;
+                    next_job->cur_seg_toks.clear();
+                    next_job->cur_vis_loaded = false;
                 }
-                next_job->seg_idx = 0;
-                next_job->seg_offset = 0;
-                next_job->cur_seg_toks.clear();
-                next_job->cur_vis_loaded = false;
             }
         }
     }
@@ -2522,6 +2657,7 @@ private:
                 if (!try_expand_slot(job, needed_pos)) {
                     if (job->waiting_expand) return; // paused until neighbor drains
                     eng_.reset_slot(c, 1);
+                    slot_mm_prologue_[c].clear();
                     slot_cached_toks_[c].clear();
                     slot_cache_valid_[c] = false;
                     slot_cache_span_[c] = 0;
@@ -2536,6 +2672,7 @@ private:
             if (!eng_.prefill_slot_chunk(c, job->prompt_toks.data() + job->prefill_offset, chunk,
                                          is_last, is_last ? &logits : nullptr)) {
                 eng_.reset_slot(c, 1);
+                slot_mm_prologue_[c].clear();
                 slot_cached_toks_[c].clear();
                 slot_cache_valid_[c] = false;
                 slot_cache_span_[c] = 0;
@@ -2567,7 +2704,7 @@ private:
             const auto & seg = job->segs[job->seg_idx];
             if (!seg.is_image) {
                 if (job->seg_offset == 0 && job->cur_seg_toks.empty()) {
-                    job->cur_seg_toks = bpe_.encode(seg.text);
+                    job->cur_seg_toks = seg.toks;
                     if (job->cur_seg_toks.empty()) {
                         ++job->seg_idx;
                         continue;
@@ -2623,6 +2760,7 @@ private:
                         return;
                     }
                     job->cur_vis_loaded = true;
+                    job->segs[job->seg_idx].n_tokens = job->cur_vis.n_tokens;
                     job->seg_offset = 0;
                     job->sched_prompt_tokens += job->cur_vis.n_tokens;
                     job->live_prompt_toks.store(job->sched_prompt_tokens, std::memory_order_relaxed);
@@ -2672,10 +2810,54 @@ private:
         finish_job(job, "stop", true, 500, "No logits produced after multimodal prefill");
     }
 
+    // Publish the just-prefilled multimodal prompt as the slot's reusable prefix:
+    //   prologue = segments up to and including the last image, tail = text after it.
+    // Image segments are identified by content hash (+ their ViT token count), so a later
+    // request carrying byte-identical images and identical text replays this KV.
+    void commit_multimodal_prefix(const std::shared_ptr<StreamJob> & job) {
+        const int c = job->slot;
+        clear_slot_cache(c);
+        size_t last_img = SIZE_MAX;
+        for (size_t i = 0; i < job->segs.size(); ++i) {
+            if (job->segs[i].is_image) last_img = i;
+        }
+        auto & pro = slot_mm_prologue_[c];
+        for (size_t i = 0; i <= last_img && last_img != SIZE_MAX; ++i) {
+            const auto & sg = job->segs[i];
+            if (sg.is_image) {
+                SlotCacheSeg cs;
+                cs.is_image = true;
+                cs.ntok = sg.n_tokens;
+                cs.hash1 = sg.hash1;
+                cs.hash2 = sg.hash2;
+                if (cs.ntok <= 0) { clear_slot_cache(c); return; } // never encoded -> not replayable
+                pro.push_back(std::move(cs));
+            } else if (!sg.toks.empty()) {
+                SlotCacheSeg cs;
+                cs.toks = sg.toks;
+                pro.push_back(std::move(cs));
+            }
+        }
+        auto & tail = slot_cached_toks_[c];
+        if (last_img != SIZE_MAX) {
+            for (size_t i = last_img + 1; i < job->segs.size(); ++i) {
+                if (!job->segs[i].is_image && !job->segs[i].toks.empty()) {
+                    tail.insert(tail.end(), job->segs[i].toks.begin(), job->segs[i].toks.end());
+                }
+            }
+        }
+        // The recorded prefix must describe exactly what sits in the slot's KV.
+        if (slot_cached_total(c) != (int64_t)eng_.slot_pos(c) || slot_cached_total(c) <= 0) {
+            clear_slot_cache(c);
+            return;
+        }
+        slot_cache_valid_[c] = true;
+        update_cache_span(c);
+    }
+
     void finish_multimodal_prefill(const std::shared_ptr<StreamJob> & job, const std::vector<float> & logits) {
         const int c = job->slot;
-        slot_cache_valid_[c] = false; // image embeddings are not token-replayable
-        slot_cache_span_[c] = 0;
+        commit_multimodal_prefix(job);
         const int32_t max_reachable = span_ctx_limit(c, eng_.num_slots() - c);
         const int max_avail = std::max(1, max_reachable - eng_.slot_pos(c) - 8);
         if (job->max_tokens > max_avail) job->max_tokens = max_avail;
@@ -3155,12 +3337,15 @@ private:
             job->est_prompt_toks = (int)job->prompt_toks.size();
             job->live_prompt_toks.store((int)job->prompt_toks.size(), std::memory_order_relaxed);
         } else {
+            // Pre-tokenize every text segment on the HTTP thread (exact ids; shared by the
+            // scheduler's prefix matcher and the multimodal prefill loop).
             int est = 0;
-            for (const auto & sg : segs) {
+            for (auto & sg : segs) {
                 if (sg.is_image) {
                     est += 1024; // conservative per-image token estimate for initial span sizing
                 } else if (!sg.text.empty()) {
-                    est += (int)bpe_.encode(sg.text).size();
+                    sg.toks = bpe_.encode(sg.text);
+                    est += (int)sg.toks.size();
                 }
             }
             if (est + 16 >= req_max_ctx) {
@@ -3681,6 +3866,13 @@ private:
     int slot_span_[MAX_CONCURRENT_SLOTS] = {};                          // GPU thread owned
     int slot_span_pub_[MAX_CONCURRENT_SLOTS] = {};                      // sched_mu_ guarded snapshot
     int seg_owner_[MAX_CONCURRENT_SLOTS] = {};                          // GPU thread owned (-1 = free, else base slot)
+    // Per-slot prefix cache. A cached prefix is [prologue segments][trailing tokens]:
+    //   - slot_mm_prologue_  : multimodal prompt up to and including its last image
+    //                          (text segments as token ids, images as 128-bit hash + token count)
+    //   - slot_cached_toks_  : everything after it (remaining prompt text + committed decode tokens)
+    // Both are compared against the incoming request, so a multimodal turn whose image
+    // bytes are unchanged replays the KV instead of re-running the ViT + prefill.
+    std::vector<SlotCacheSeg> slot_mm_prologue_[MAX_CONCURRENT_SLOTS];
     std::vector<int32_t> slot_cached_toks_[MAX_CONCURRENT_SLOTS];
     bool slot_cache_valid_[MAX_CONCURRENT_SLOTS] = {};
     int slot_cache_span_[MAX_CONCURRENT_SLOTS] = {};
