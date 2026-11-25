@@ -75,8 +75,19 @@ static double compute_nll_from_logits(
     return nll;
 }
 
+#ifndef NIB_VERSION
+#define NIB_VERSION "0.1.0"
+#endif
+#ifndef NIB_GIT_SHA
+#define NIB_GIT_SHA "unknown"
+#endif
+#ifndef NIB_GPU_TARGET
+#define NIB_GPU_TARGET "gfx1100"
+#endif
+
 static void print_usage(const char * argv0) {
     std::fprintf(stderr,
+        "Nib v%s (%s)\n"
         "Usage: %s <mode> [options]\n"
         "Modes:\n"
         "  bench    -m <gguf> [-c <max_ctx=262144>] [-d 0,8192,32768] [-p 512] [-n 128] [-r 3] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--no-graph]\n"
@@ -88,8 +99,9 @@ static void print_usage(const char * argv0) {
         "  vision   -m <gguf> --mmproj <mmproj.gguf> --image <img.png> [--prompt <text>] [-c 262144] [-d 0] [-n 256] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--bench-vision 5] [--dump-embeds <path>] [--no-graph]\n"
         "  serve    -m <gguf> [--host 127.0.0.1] [--port 4444] [--model-name inkling-2-mini] [--slots 4] [-c 262848] [--strict-slot-ctx] [--max-slot-ctx N] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4]\n"
         "           [--default-temp 0.6] [--default-top-p 0.95] [--default-top-k 40] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
-        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp]\n",
-        argv0);
+        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp]\n"
+        "  --version  Print Nib version and target GPU architecture\n",
+        NIB_VERSION, NIB_GPU_TARGET, argv0);
 }
 
 
@@ -705,6 +717,18 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::string mode = argv[1];
+    if (mode == "--version" || mode == "-V" || mode == "-v" || mode == "version") {
+        if (std::strcmp(NIB_GIT_SHA, "unknown") != 0 && NIB_GIT_SHA[0] != '\0') {
+            std::printf("nib %s (%s, git %s)\n", NIB_VERSION, NIB_GPU_TARGET, NIB_GIT_SHA);
+        } else {
+            std::printf("nib %s (%s)\n", NIB_VERSION, NIB_GPU_TARGET);
+        }
+        return 0;
+    }
+    if (mode == "--help" || mode == "-h" || mode == "help") {
+        print_usage(argv[0]);
+        return 0;
+    }
     const char * env_model  = std::getenv("NIB_MODEL");
     const char * env_mmproj = std::getenv("NIB_MMPROJ");
     std::string model_path  = (env_model && env_model[0])   ? env_model  : "models/Inkling-2-Mini-NVFP4-Mixed.gguf";

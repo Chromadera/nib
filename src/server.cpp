@@ -1528,9 +1528,13 @@ public:
                 }
             }
 
+#ifndef NIB_VERSION
+#define NIB_VERSION "0.1.0"
+#endif
             const auto now = std::chrono::steady_clock::now();
             std::ostringstream oss;
             oss << "{\"status\":\"ok\""
+                << ",\"version\":" << json_str(NIB_VERSION)
                 << ",\"model\":" << json_str(cfg_.model_name)
                 << ",\"max_ctx\":" << eng_.max_ctx()
                 << ",\"request_max_ctx\":" << request_max_ctx()
@@ -4143,8 +4147,8 @@ int run_http_server(
     const char * ctx_mode = (eng.num_slots() <= 1) ? "solo"
                           : (req_max <= eng.slot_ctx()) ? "strict"
                           : "elastic";
-    std::printf("[nib] listening on http://%s:%d\n",
-                cfg.host.c_str(), cfg.port);
+    std::printf("[nib] v%s listening on http://%s:%d\n",
+                NIB_VERSION, cfg.host.c_str(), cfg.port);
     std::printf("[nib] Web UI: http://%s:%d/  |  OpenAI API: http://%s:%d/v1/chat/completions\n",
                 cfg.host.c_str(), cfg.port, cfg.host.c_str(), cfg.port);
     std::printf("[nib] Config: ctx=%d slots=%d(%d/slot, req_max=%d, %s) kv=%s sparse_pages=%d temp=%.2f mtp=%s vision=%s vram=%.2f GiB\n",

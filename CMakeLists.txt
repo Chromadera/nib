@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(nib LANGUAGES CXX)
+project(nib VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
 set(HIP_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH "HIP compiler")
 set(GPU_TARGET "gfx1100" CACHE STRING "AMD RDNA3 GPU target (e.g. gfx1100)")
+
+set(NIB_GIT_SHA "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _nib_git_sha
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_nib_git_sha)
+        set(NIB_GIT_SHA "${_nib_git_sha}")
+    endif()
+endif()
 
 function(add_hip_object target_name hip_src)
     set(obj_file "${CMAKE_CURRENT_BINARY_DIR}/${target_name}.o")
@@ -96,7 +111,12 @@ target_include_directories(nib PRIVATE
     "${ROCM_PATH}/include"
 )
 
-target_compile_definitions(nib PRIVATE __HIP_PLATFORM_AMD__)
+target_compile_definitions(nib PRIVATE
+    __HIP_PLATFORM_AMD__
+    NIB_VERSION="${PROJECT_VERSION}"
+    NIB_GIT_SHA="${NIB_GIT_SHA}"
+    NIB_GPU_TARGET="${GPU_TARGET}"
+)
 target_compile_options(nib PRIVATE -O3 -march=native -Wall -Wextra -Wno-unused-parameter)
 
 target_link_directories(nib PRIVATE "${ROCM_PATH}/lib")
