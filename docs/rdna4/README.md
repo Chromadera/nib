@@ -269,3 +269,28 @@ neutral; a forced build showed 3.0-4.0x):
 Numerics vs the `v_dot2` fallback: greedy 32/32 tokens identical, WikiText-2 PPL
 6.5295 vs 6.5071. Configuration: `-c 262144 --kv-type q4_0 --sparse-pages 224`,
 `MAX_UBATCH` 2560, MoE tile BN=64 (16 KB LDS -> 4 CTAs/CU).
+
+## Measured and rejected on gfx1201
+
+All numbers are `pp2560` on an R9700, `-c 131072 --kv-type q4_0 --sparse-pages 224`,
+against the shipped build in the same session (r=3; the depth-32K column is the
+low-variance one). Recorded so nobody re-runs them:
+
+| variant | @32K | verdict |
+|---|---:|---|
+| MoE tile TM=128 (FM=2, 8 accum chains) | 4098 (-6.4%) | per-expert rows average ~160, so a 128-row tile stages 256 rows for 160 of work |
+| MoE tile TM=192 (one CTA, B staged once) | 3599 (-6.2%) | 40 KB LDS drops it to 1 CTA/CU |
+| MoE tile BN=64 (16 KB, 4 CTAs/CU) | -7.7% | occupancy is not the limiter |
+| NVFP4 super-step 8/6 (deeper prefetch) | 4313 (-1.5%) | +18 VGPRs |
+| A/B fragment hoist out of the MMA loop | 4341 (-1.0%) | LDS is no longer the limiter after the 8-half fix |
+| dense `<64,128,4,2>` preferred for M>512 | 4304 (-2.4%) | 128x128 amortises better at M=2560 |
+| FA prefill NWARPS_GLOB=18 / 9 | -1.1% / -1.2% | 12 is a strict optimum |
+| FA prefill BC=32 / 64 | -1.7% / -3.1% | 48 is the optimum |
+| `--amdgpu-unroll-threshold=800 / 1600` | -0.4% / -0.7% | already unrolled |
+| Queued-launch K+V fusion | +0.09% | launch count is not the cost |
+
+Two structural findings behind those rows: the grouped MoE runs at ~59 TFLOPS against a
+70-78 TFLOPS rocBLAS reference at the same aggregate shape (and 25 TFLOPS for the same work
+as 128 separate per-expert GEMMs, which is why the grouping matters), and the residual ~1.2x
+staging overhead comes from per-expert row quantisation, which a single large GEMM does not
+pay.
