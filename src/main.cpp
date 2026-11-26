@@ -15,6 +15,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <sys/stat.h>
 #include <vector>
 
 using namespace inkling;
@@ -99,11 +100,161 @@ static void print_usage(const char * argv0) {
         "  vision   -m <gguf> --mmproj <mmproj.gguf> --image <img.png> [--prompt <text>] [-c 262144] [-d 0] [-n 256] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--bench-vision 5] [--dump-embeds <path>] [--no-graph]\n"
         "  serve    -m <gguf> [--host 127.0.0.1] [--port 4444] [--model-name inkling-2-mini] [--slots 4] [-c 262848] [--strict-slot-ctx] [--max-slot-ctx N] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4]\n"
         "           [--default-temp 0.6] [--default-top-p 0.95] [--default-top-k 40] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
-        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp]\n"
-        "  --version  Print Nib version and target GPU architecture\n",
+        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp] [--cpu-embd]\n"
+        "  --version  Print Nib version and target GPU architecture\n"
+        "VRAM options (bench / gen / vision / serve):\n"
+        "  --cpu-embd | --no-cpu-embd   token_embd.weight (~469 MiB) in pinned GPU-mapped host RAM instead of VRAM\n"
+        "                               (off by default; on < 22 GiB GPUs it is auto-enabled with --mtp + vision)\n"
+        "  --vision-keep-scratch        keep the ViT workspace resident between images (default: freed after each encode)\n"
+        "  On GPUs with < 22 GiB VRAM, an unset --kv-type defaults to q4_1 and an unset -c is capped to keep\n"
+        "  >= 768 MiB (>= ~1 GiB with vision) VRAM free; explicit flags are always respected.\n",
         NIB_VERSION, NIB_GPU_TARGET, argv0);
 }
 
+
+// ============================================================================
+// VRAM-aware defaults for tight (< 22 GiB) RDNA3 cards (e.g. 20 GB RX 7900 XT)
+// ============================================================================
+// On >= 22 GiB GPUs nothing changes except an explicit --cpu-embd.  Below that,
+// and only for flags the user did not pass explicitly:
+//   * --kv-type      -> q4_1
+//   * --cpu-embd     -> on when both MTP and vision are loaded, or when the
+//                       projected free VRAM after load is < 1 GiB
+//   * -c / --ctx-size -> largest ctx (multiple of 1024 per slot) whose projected
+//                       footprint leaves >= kHeadroom free (more with vision: the
+//                       worst-case transient ViT workspace + 512 MiB)
+// Footprint = weights (GGUF size, minus tok_embd if on host) + MTP (file + 96 MiB)
+// + mmproj weights + engine KV/scratch (InklingEngine::estimate_state_bytes) +
+// ~0.42 GiB HIP runtime / code objects / graphs (measured ~0.41 GiB on RX 7900 XT).
+namespace {
+
+constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMiB = 1024.0 * 1024.0;
+
+static size_t file_size_or_zero(const std::string & p) {
+    struct stat st;
+    if (p.empty() || ::stat(p.c_str(), &st) != 0 || st.st_size <= 0) return 0;
+    return (size_t)st.st_size;
+}
+
+struct VramProfileIn {
+    std::string mode;
+    std::string model_path;
+    std::string mtp_path;
+    std::string mmproj_path;
+    bool        vision_on     = false;
+    bool        explicit_ctx  = false;
+    bool        explicit_kv   = false;
+    int         cpu_embd_flag = -1;  // -1 unset, 0 --no-cpu-embd, 1 --cpu-embd
+};
+
+static const char * kv_name_of(KVType t) {
+    return (t == KV_Q4_1) ? "q4_1" : (t == KV_Q4_0) ? "q4_0" : "q8_0";
+}
+
+static void apply_vram_profile(EngineConfig & cfg, const VramProfileIn & in) {
+    if (in.cpu_embd_flag >= 0) cfg.cpu_embd = (in.cpu_embd_flag == 1);
+
+    size_t dev_free = 0, dev_total = 0;
+    if (hipSetDevice(0) != hipSuccess || hipMemGetInfo(&dev_free, &dev_total) != hipSuccess || dev_total == 0) {
+        (void)hipGetLastError();
+        return;
+    }
+    const size_t kTightBelow = (size_t)22 * 1024 * 1024 * 1024;
+    if (dev_total >= kTightBelow) return;   // 24 GB XTX & up: zero behavioural change
+
+    std::printf("[vram] tight GPU: %.2f GiB total, %.2f GiB free -> VRAM-aware defaults for unset flags\n",
+                (double)dev_total / kGiB, (double)dev_free / kGiB);
+    cfg.report_state_estimate = true;
+
+    if (!in.explicit_kv && cfg.kv_type != KV_Q4_1) {
+        cfg.kv_type = KV_Q4_1;
+        std::printf("[vram]   --kv-type not set -> q4_1 (5.0 bits/val, ~40%% of q8_0 KV bytes; PPL-neutral on this model)\n");
+    }
+
+    const bool   mtp_on     = !in.mtp_path.empty();
+    const size_t model_b    = file_size_or_zero(in.model_path);
+    if (model_b == 0) {
+        std::printf("[vram]   cannot stat model '%s'; keeping -c %d\n", in.model_path.c_str(), cfg.max_ctx);
+        return;
+    }
+    const size_t tok_embd_b = (size_t)VOCAB_PADDED * N_EMBD + (size_t)VOCAB_PADDED * (N_EMBD / 32) * sizeof(__half);
+    const size_t mtp_b      = mtp_on ? file_size_or_zero(in.mtp_path) + (size_t)96 * 1024 * 1024 : 0;
+    const size_t vis_w_b    = in.vision_on ? file_size_or_zero(in.mmproj_path) : 0;
+    const size_t vis_ws_b   = in.vision_on ? VisionEncoder().estimate_max_encode_bytes() : 0;
+    const size_t runtime_b  = (size_t)(0.42 * kGiB);   // measured ~0.41 GiB on RX 7900 XT / WSL2 (MTP + vision + graphs)
+    const size_t headroom_b = in.vision_on
+        ? std::max((size_t)768 * 1024 * 1024, vis_ws_b + (size_t)512 * 1024 * 1024)
+        : (size_t)768 * 1024 * 1024;
+
+    // Free VRAM projected after loading everything with `c` and `host_embd`.
+    auto projected_free = [&](const EngineConfig & c, bool host_embd) -> double {
+        const double used = (double)(model_b - (host_embd ? tok_embd_b : 0)) + (double)mtp_b + (double)vis_w_b
+                          + (double)runtime_b + (double)InklingEngine::estimate_state_bytes(c, mtp_on);
+        return (double)dev_free - used;
+    };
+
+    if (in.cpu_embd_flag < 0 && mtp_on && in.vision_on && !cfg.cpu_embd) {
+        cfg.cpu_embd = true;
+        std::printf("[vram]   --cpu-embd not set, MTP + vision both loaded -> tok_embd in pinned host RAM (+%.1f MiB VRAM)\n",
+                    (double)tok_embd_b / kMiB);
+    }
+
+    const int     n_slots = std::max(1, std::min(cfg.n_slots, (int)MAX_CONCURRENT_SLOTS));
+    const int32_t step    = 1024 * n_slots;          // slot_ctx stays a multiple of 1024 (16 KV pages)
+    const int32_t floor_c = std::max(step, 8192);
+
+    if (!in.explicit_ctx) {
+        auto fit_ctx = [&](bool host_embd) -> int32_t {
+            EngineConfig c = cfg;
+            const int32_t hi = (cfg.max_ctx / step) * step;
+            for (int32_t ctx = hi; ctx >= floor_c; ctx -= step) {
+                c.max_ctx = ctx;
+                if (projected_free(c, host_embd) >= (double)headroom_b) return ctx;
+            }
+            return 0;
+        };
+        int32_t ctx = fit_ctx(cfg.cpu_embd);
+        if (ctx == 0 && !cfg.cpu_embd && in.cpu_embd_flag < 0) {
+            cfg.cpu_embd = true;
+            std::printf("[vram]   even -c %d does not keep %.0f MiB free -> --cpu-embd auto-enabled\n",
+                        floor_c, (double)headroom_b / kMiB);
+            ctx = fit_ctx(true);
+        }
+        if (ctx == 0) {
+            ctx = floor_c;
+            std::printf("[vram]   WARNING: projected footprint exceeds VRAM even at -c %d; expect OOM or GTT spill "
+                        "(drop --mtp / vision, or free VRAM held by other processes)\n", ctx);
+        }
+        if (ctx != cfg.max_ctx) {
+            std::printf("[vram]   -c not set -> auto -c %d (%d slot%s x %d)\n",
+                        ctx, n_slots, n_slots > 1 ? "s" : "", n_slots > 1 ? ctx / n_slots : ctx);
+            cfg.max_ctx = ctx;
+        }
+    } else {
+        double pf = projected_free(cfg, cfg.cpu_embd);
+        if (pf < 1024.0 * kMiB && !cfg.cpu_embd && in.cpu_embd_flag < 0) {
+            cfg.cpu_embd = true;
+            std::printf("[vram]   explicit -c %d leaves only ~%.0f MiB free -> --cpu-embd auto-enabled (+%.1f MiB)\n",
+                        cfg.max_ctx, pf / kMiB, (double)tok_embd_b / kMiB);
+            pf = projected_free(cfg, true);
+        }
+        if (pf < (double)headroom_b) {
+            std::printf("[vram]   WARNING: explicit -c %d projects only ~%.0f MiB free VRAM (< %.0f MiB target); "
+                        "risk of OOM / PCIe GTT spill\n", cfg.max_ctx, pf / kMiB, (double)headroom_b / kMiB);
+        }
+    }
+
+    std::printf("[vram]   profile: -c %d | kv=%s | cpu_embd=%s | mtp=%s | vision=%s | projected free after load ~%.0f MiB "
+                "(target >= %.0f MiB%s)\n",
+                cfg.max_ctx, kv_name_of(cfg.kv_type), cfg.cpu_embd ? "on" : "off",
+                mtp_on ? "on" : "off", in.vision_on ? "on" : "off",
+                projected_free(cfg, cfg.cpu_embd) / kMiB, (double)headroom_b / kMiB,
+                in.vision_on ? ", incl. worst-case ViT workspace" : "");
+    std::fflush(stdout);
+}
+
+} // namespace
 
 // ============================================================================
 // Step 8A: DSpark MTP speculative generation loop
@@ -151,9 +302,10 @@ bool mtp_session_init(MtpSession & s, const std::string & mtp_path, InklingEngin
     });
     s.active = true;
     if (verbose) {
-        std::printf("[mtp] drafter online (threshold=%.2f, ctx=%d, shortlist=%d rows, vram=%.2f GiB total)\n",
-                    threshold, s.drafter->ctx(), s.drafter->short_rows(),
-                    (double)eng.total_vram_bytes() / (1024.0 * 1024.0 * 1024.0));
+        const double mtp_gib = (double)s.drafter->vram_bytes() / (1024.0 * 1024.0 * 1024.0);
+        const double tot_gib = (double)(eng.total_vram_bytes() + s.drafter->vram_bytes()) / (1024.0 * 1024.0 * 1024.0);
+        std::printf("[mtp] drafter online (threshold=%.2f, ctx=%d, shortlist=%d rows, mtp=%.2f GiB, vram=%.2f GiB total)\n",
+                    threshold, s.drafter->ctx(), s.drafter->short_rows(), mtp_gib, tot_gib);
         std::fflush(stdout);
     }
     return true;
@@ -762,6 +914,10 @@ int main(int argc, char ** argv) {
     int n_reps       = 3;
     int bench_vision = 0;
     bool decode_ub1  = false;
+    bool explicit_ctx = false;
+    bool explicit_kv  = false;
+    int  cpu_embd_flag = -1;          // -1 unset, 0 --no-cpu-embd, 1 --cpu-embd
+    bool vision_keep_scratch = false;
 
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -775,8 +931,12 @@ int main(int argc, char ** argv) {
         else if (a == "--bench-vision" && i + 1 < argc) bench_vision = std::atoi(argv[++i]);
         else if (a == "-t" && i + 1 < argc) tokens_path = argv[++i];
         else if (a == "-o" && i + 1 < argc) out_path = argv[++i];
-        else if (a == "-c" && i + 1 < argc) cfg.max_ctx = std::atoi(argv[++i]);
+        else if ((a == "-c" || a == "--ctx-size") && i + 1 < argc) { cfg.max_ctx = std::atoi(argv[++i]); explicit_ctx = true; }
+        else if (a == "--cpu-embd") cpu_embd_flag = 1;
+        else if (a == "--no-cpu-embd") cpu_embd_flag = 0;
+        else if (a == "--vision-keep-scratch") vision_keep_scratch = true;
         else if (a == "--kv-type" && i + 1 < argc) {
+            explicit_kv = true;
             std::string kt = argv[++i];
             if (kt == "q8_0") cfg.kv_type = KV_Q8_0;
             else if (kt == "q4_1") cfg.kv_type = KV_Q4_1;
@@ -919,6 +1079,22 @@ int main(int argc, char ** argv) {
 
     if (!mtp_path.empty() && cfg.verify_batch == 0 && !explicit_no_verify_batch) {
         cfg.verify_batch = 1;   // Step 8C: batched m-token verify is the default for MTP
+    }
+
+    if (mode == "selftest") {
+        if (cpu_embd_flag >= 0) cfg.cpu_embd = (cpu_embd_flag == 1);   // explicit only (repack check)
+    } else if (mode == "serve" || mode == "gen" || mode == "bench" || mode == "vision") {
+        VramProfileIn vin;
+        vin.mode          = mode;
+        vin.model_path    = model_path;
+        vin.mtp_path      = mtp_path;
+        vin.mmproj_path   = mmproj_path;
+        vin.vision_on     = (mode == "vision") ||
+                            (mode == "serve" && !no_vision && file_size_or_zero(mmproj_path) > 0);
+        vin.explicit_ctx  = explicit_ctx;
+        vin.explicit_kv   = explicit_kv;
+        vin.cpu_embd_flag = cpu_embd_flag;
+        apply_vram_profile(cfg, vin);
     }
 
     if (mode == "selftest") {
@@ -1238,6 +1414,7 @@ int main(int argc, char ** argv) {
 
         VisionEncoder vision;
         if (!vision.init(mmproj_path, eng.stream())) return 1;
+        vision.set_keep_scratch(vision_keep_scratch);
 
         BpeTokenizer bpe;
         bpe.init(eng.tokenizer());
@@ -1256,8 +1433,22 @@ int main(int argc, char ** argv) {
                     vres.preproc_ms, vres.gpu_ms, total_vram_gib,
                     (double)eng.total_vram_bytes() / (1024.0 * 1024.0 * 1024.0),
                     (double)vision.vram_bytes() / (1024.0 * 1024.0 * 1024.0));
+        {
+            size_t fr = 0, tot = 0;
+            (void)hipMemGetInfo(&fr, &tot);
+            std::printf("[vision] ViT workspace %.1f MiB (%s) | embeds out %.1f MiB | vision resident %.1f MiB | device free %.1f MiB\n",
+                        (double)vision.last_workspace_bytes() / (1024.0 * 1024.0),
+                        vision.keep_scratch() ? "kept resident" : "released after encode",
+                        (double)vision.output_bytes() / (1024.0 * 1024.0),
+                        (double)vision.vram_bytes() / (1024.0 * 1024.0),
+                        (double)fr / (1024.0 * 1024.0));
+        }
 
         if (bench_vision > 0) {
+            // Synthetic microbenchmark: keep the arena resident so the loop times the
+            // ViT, not hipMalloc/hipFree churn; restore the policy afterwards.
+            const bool prev_keep = vision.keep_scratch();
+            vision.set_keep_scratch(true);
             std::vector<double> gpu_times;
             for (int r = 0; r < bench_vision; ++r) {
                 VisionEncodeResult tmp;
@@ -1270,6 +1461,7 @@ int main(int argc, char ** argv) {
             double sd = (gpu_times.size() > 1) ? std::sqrt(var / (gpu_times.size() - 1)) : 0.0;
             std::printf("[vision-bench] %d reps (warmed): gpu_encode = %.2f ± %.2f ms (%.1f img/s)\n",
                         bench_vision, mean, sd, 1000.0 / mean);
+            vision.set_keep_scratch(prev_keep);
         }
 
         if (!dump_embeds_path.empty()) {
@@ -1380,6 +1572,7 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "[serve] warning: failed to init vision encoder from '%s'; continuing text-only\n",
                                  mmproj_path.c_str());
                 } else {
+                    vision.set_keep_scratch(vision_keep_scratch);
                     vision_ptr = &vision;
                 }
             } else {

@@ -100,10 +100,34 @@ public:
         std::vector<float> * out_host_embeds = nullptr);
 
     const VisionHParams & hparams() const { return hp_; }
+    // Resident VRAM right now: weights + live transient workspace (0 after an encode
+    // unless keep_scratch) + the small persistent embeddings output buffer.
     size_t vram_bytes() const { return total_vram_bytes_; }
+    size_t weight_vram_bytes() const { return weight_vram_bytes_; }
+    size_t workspace_bytes() const { return arena_bytes_; }            // live transient arena (0 when released)
+    size_t output_bytes() const { return proj_out_bytes_; }            // persistent d_embeds buffer
+    size_t last_workspace_bytes() const { return last_arena_bytes_; }  // arena size used by the last encode
+    size_t peak_workspace_bytes() const { return peak_arena_bytes_; }  // largest arena ever allocated
+
+    // Transient-workspace policy.  Default (false): the single aliased ViT arena is
+    // hipFree'd right after each encode (the [n_tokens, 2304] embeddings stay valid
+    // in their own small buffer until the next encode).  true: keep the arena
+    // resident between encodes (no allocator churn; used by --bench-vision and
+    // --vision-keep-scratch).  Switching to false releases the arena immediately.
+    void set_keep_scratch(bool keep);
+    bool keep_scratch() const { return keep_scratch_; }
+    void release_workspace();
+
+    // Bytes of the transient arena + persistent output buffer for an image of
+    // `n_merged` merged tokens (n_pos = 4 * n_merged + 1 patches).  Host-only maths;
+    // valid before init() (uses the default hparams).
+    size_t estimate_encode_bytes(int n_merged) const;
+    // Worst case over every accepted image size (hp_.max_tokens merged tokens).
+    size_t estimate_max_encode_bytes() const { return estimate_encode_bytes(hp_.max_tokens); }
 
 private:
     bool ensure_scratch(int n_patches, int n_merged, int w_pad, int h_pad);
+    bool ensure_output(int n_merged);
 
     VisionHParams                   hp_;
     hipStream_t                     stream_ = nullptr;
@@ -120,9 +144,22 @@ private:
     std::vector<void *> weight_allocs_;
     size_t weight_vram_bytes_ = 0;
 
-    // Reusable dynamic scratch buffers (grow-only up to max image size seen)
+    // Transient ViT workspace: ONE 256-byte-aligned arena, phase-aliased:
+    //   [ d_hidden_ | d_norm_ | shared pool ]
+    //   pool (size = max over disjoint phases):
+    //     patch     : d_img_f32_
+    //     attention : d_qkv_ (== d_attn_out_, qkv is dead once split) | d_q_h_ | d_k_h_ | d_v_h_
+    //     ffn       : d_ffn_mid_
+    //     projector : d_merged_ | d_proj_mid_
+    // Released after every encode unless keep_scratch_ (see set_keep_scratch()).
+    bool    keep_scratch_       = false;
+    void *  d_arena_            = nullptr;
+    size_t  arena_bytes_        = 0;
+    size_t  last_arena_bytes_   = 0;
+    size_t  peak_arena_bytes_   = 0;
     int32_t scratch_max_pos_    = 0;
     int32_t scratch_max_pixels_ = 0;
+    int32_t scratch_max_merged_ = 0;
     float * d_img_f32_          = nullptr; // [H_pad * W_pad * 3]
     float * d_hidden_           = nullptr; // [n_pos * 1024]
     float * d_norm_             = nullptr; // [n_pos * 1024]
@@ -130,13 +167,18 @@ private:
     __half * d_q_h_             = nullptr; // [16 * n_pos * 64]
     __half * d_k_h_             = nullptr; // [16 * n_pos * 64]
     __half * d_v_h_             = nullptr; // [16 * n_pos * 64]
-    float * d_attn_out_         = nullptr; // [n_pos * 1024]
+    float * d_attn_out_         = nullptr; // [n_pos * 1024] (aliases d_qkv_)
     float * d_ffn_mid_          = nullptr; // [n_pos * 4096]
     float * d_merged_           = nullptr; // [n_merged * 4096]
     float * d_proj_mid_         = nullptr; // [n_merged * 4096]
+
+    // Persistent output (out_res.d_embeds): its own small allocation, grow-only,
+    // valid until the next encode (server reads it across prefill chunks).
     float * d_proj_out_         = nullptr; // [n_merged * 2304]
-    std::vector<void *> scratch_allocs_;
-    size_t scratch_vram_bytes_  = 0;
+    size_t  proj_out_bytes_     = 0;
+    int32_t proj_out_cap_       = 0;
+
+    size_t scratch_vram_bytes_  = 0;       // arena_bytes_ + proj_out_bytes_
     size_t total_vram_bytes_    = 0;
 };
 

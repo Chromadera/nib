@@ -107,6 +107,13 @@ struct EngineConfig {
     int32_t fdot2_wo_shape = 0; // 0 = 6w LPR32 (384 blk), 1 = 8w LPR32, 2 = 4w LPR16, 3 = 4w LPR32
     int32_t fdot2_lm      = 1;  // 1 = lm_head fdot2 (8 warps LPR 8)
     int32_t fdot2_q8moe   = 0;  // 1 = fused Q8 MoE fdot2
+
+    // --cpu-embd: keep token_embd.weight (~469 MiB) in pinned GPU-mapped host RAM
+    // instead of VRAM.  Off by default (and never auto-enabled on >= 22 GiB GPUs).
+    bool    cpu_embd      = false;
+    // Host-side tight-VRAM profile was applied (main.cpp): only switches on the
+    // estimated-vs-actual state-bytes report at the end of init().
+    bool    report_state_estimate = false;
 };
 
 class InklingEngine {
@@ -155,6 +162,15 @@ public:
     const ModelWeights  & weights()   const { return weights_; }
     hipStream_t           stream()    const { return stream_; }
     size_t total_vram_bytes() const { return total_vram_bytes_; }
+    // --cpu-embd: bytes of token_embd held in pinned, GPU-mapped host RAM (not in total_vram_bytes()).
+    size_t host_pinned_bytes() const { return weights_.host_pinned_bytes; }
+    bool   cpu_embd() const { return weights_.tok_embd_on_host; }
+
+    // Host-only mirror of alloc_state_and_scratch() (+ alloc_batch_scratch() and
+    // enable_mtp_io() when with_mtp_io): VRAM bytes the engine allocates on top of
+    // the weights for `cfg`.  Used by the tight-VRAM auto profile to size -c
+    // before anything is loaded.
+    static size_t estimate_state_bytes(const EngineConfig & cfg, bool with_mtp_io);
 
     // ========================================================================
     // Multi-slot continuous batching (zero-regression on single-stream slot 0)

@@ -190,13 +190,14 @@ VisionEncoder::~VisionEncoder() {
 }
 
 void VisionEncoder::destroy() {
-    for (void * p : scratch_allocs_) {
-        if (p) (void)hipFree(p);
-    }
-    scratch_allocs_.clear();
+    release_workspace();
+    if (d_proj_out_) (void)hipFree(d_proj_out_);
+    d_proj_out_         = nullptr;
+    proj_out_bytes_     = 0;
+    proj_out_cap_       = 0;
     scratch_vram_bytes_ = 0;
-    scratch_max_pos_    = 0;
-    scratch_max_pixels_ = 0;
+    last_arena_bytes_   = 0;
+    peak_arena_bytes_   = 0;
 
     for (void * p : weight_allocs_) {
         if (p) (void)hipFree(p);
@@ -431,50 +432,163 @@ bool VisionEncoder::init(const std::string & mmproj_path, hipStream_t stream) {
     return true;
 }
 
+namespace {
+
+static inline size_t v_align256(size_t b) { return (b + 255) & ~(size_t)255; }
+
+// Byte layout of the single aliased ViT workspace arena (see vision_encoder.hpp).
+// Liveness (single in-order stream, every kernel writes its outputs for all
+// n_pos rows before any reader runs; no kernel assumes zero-init):
+//   hidden, norm : live for the whole encode          -> dedicated regions
+//   img          : patch_embed only                   -> pool phase A
+//   qkv/q/k/v    : qkv GEMM -> split -> FA            -> pool phase B
+//   attn_out     : FA -> attn_out GEMM; qkv is dead after the split and FA only
+//                  reads q/k/v, so attn_out aliases qkv
+//   ffn_mid      : ffn_up -> gelu -> ffn_down          -> pool phase C
+//   merged/mid   : patch_merge -> mm1 -> gelu -> mm2   -> pool phase D
+struct VisionArenaLayout {
+    size_t off_hidden = 0, off_norm = 0, off_pool = 0;
+    size_t off_q = 0, off_k = 0, off_v = 0, off_proj_mid = 0;
+    size_t total = 0;
+};
+
+static VisionArenaLayout vision_arena_layout(size_t n_pos, size_t pixels, size_t n_merged,
+                                             size_t D, size_t FF, size_t MD) {
+    VisionArenaLayout L;
+    const size_t act  = v_align256(n_pos * D * sizeof(float));
+    L.off_hidden = 0;
+    L.off_norm   = act;
+    L.off_pool   = 2 * act;
+
+    const size_t img_b  = v_align256(pixels * 3 * sizeof(float));
+    const size_t qkv_b  = v_align256(n_pos * 3 * D * sizeof(float));
+    const size_t head_b = v_align256(n_pos * D * sizeof(__half));
+    const size_t attn_b = qkv_b + 3 * head_b;                 // attn_out lives inside qkv_b
+    const size_t ffn_b  = v_align256(n_pos * FF * sizeof(float));
+    const size_t mrg_b  = v_align256(n_merged * MD * sizeof(float));
+    const size_t proj_b = 2 * mrg_b;                          // merged | proj_mid
+
+    L.off_q        = qkv_b;
+    L.off_k        = qkv_b + head_b;
+    L.off_v        = qkv_b + 2 * head_b;
+    L.off_proj_mid = mrg_b;
+
+    const size_t pool = std::max(std::max(img_b, attn_b), std::max(ffn_b, proj_b));
+    L.total = L.off_pool + pool;
+    return L;
+}
+
+} // namespace
+
+size_t VisionEncoder::estimate_encode_bytes(int n_merged) const {
+    const size_t nm     = (size_t)std::max(1, n_merged);
+    const size_t n_pos  = nm * hp_.n_merge * hp_.n_merge + 1;
+    const size_t pixels = (n_pos - 1) * hp_.patch_size * hp_.patch_size;
+    const size_t MD     = (size_t)hp_.n_merge * hp_.n_merge * hp_.n_embd;
+    const VisionArenaLayout L = vision_arena_layout(n_pos, pixels, nm, hp_.n_embd, hp_.n_ff, MD);
+    return L.total + v_align256(nm * hp_.proj_dim * sizeof(float));
+}
+
+void VisionEncoder::release_workspace() {
+    if (d_arena_) (void)hipFree(d_arena_);   // hipFree synchronises the device first
+    d_arena_            = nullptr;
+    arena_bytes_        = 0;
+    scratch_max_pos_    = 0;
+    scratch_max_pixels_ = 0;
+    scratch_max_merged_ = 0;
+    d_img_f32_ = d_hidden_ = d_norm_ = d_qkv_ = d_attn_out_ = d_ffn_mid_ = d_merged_ = d_proj_mid_ = nullptr;
+    d_q_h_ = d_k_h_ = d_v_h_ = nullptr;
+    scratch_vram_bytes_ = proj_out_bytes_;
+    total_vram_bytes_   = weight_vram_bytes_ + scratch_vram_bytes_;
+}
+
+void VisionEncoder::set_keep_scratch(bool keep) {
+    keep_scratch_ = keep;
+    if (!keep) release_workspace();
+}
+
+bool VisionEncoder::ensure_output(int n_merged) {
+    if (n_merged <= proj_out_cap_ && d_proj_out_ != nullptr) return true;
+    if (d_proj_out_) (void)hipFree(d_proj_out_);
+    d_proj_out_     = nullptr;
+    proj_out_bytes_ = 0;
+    proj_out_cap_   = 0;
+    const size_t bytes = v_align256((size_t)n_merged * hp_.proj_dim * sizeof(float));
+    void * p = nullptr;
+    if (hipMalloc(&p, bytes) != hipSuccess) {
+        (void)hipGetLastError();
+        std::fprintf(stderr, "[vision] hipMalloc(embeds output, %.1f MiB) failed\n",
+                     (double)bytes / (1024.0 * 1024.0));
+        scratch_vram_bytes_ = arena_bytes_;
+        total_vram_bytes_   = weight_vram_bytes_ + scratch_vram_bytes_;
+        return false;
+    }
+    V_HIP_CHECK(hipMemsetAsync(p, 0, bytes, stream_));   // never read uninitialised VRAM (issue #1)
+    d_proj_out_     = static_cast<float *>(p);
+    proj_out_bytes_ = bytes;
+    proj_out_cap_   = n_merged;
+    scratch_vram_bytes_ = arena_bytes_ + proj_out_bytes_;
+    total_vram_bytes_   = weight_vram_bytes_ + scratch_vram_bytes_;
+    return true;
+}
+
 bool VisionEncoder::ensure_scratch(int n_patches, int n_merged, int w_pad, int h_pad) {
     const int n_pos  = n_patches + 1;
     const int pixels = w_pad * h_pad;
-    if (n_pos <= scratch_max_pos_ && pixels <= scratch_max_pixels_) {
+    if (!ensure_output(n_merged)) return false;
+    if (d_arena_ != nullptr && n_pos <= scratch_max_pos_ && pixels <= scratch_max_pixels_ &&
+        n_merged <= scratch_max_merged_) {
+        last_arena_bytes_ = arena_bytes_;
         return true;
     }
 
-    for (void * p : scratch_allocs_) {
-        if (p) (void)hipFree(p);
-    }
-    scratch_allocs_.clear();
-    scratch_vram_bytes_ = 0;
-
+    // Grow (keep mode) or size exactly for this image (release mode: caps are 0 here).
+    if (d_arena_) (void)hipFree(d_arena_);
+    d_arena_     = nullptr;
+    arena_bytes_ = 0;
     scratch_max_pos_    = std::max(scratch_max_pos_, n_pos);
     scratch_max_pixels_ = std::max(scratch_max_pixels_, pixels);
-    const int mp        = scratch_max_pos_;
-    const int mm        = std::max(n_merged, (mp - 1) / (hp_.n_merge * hp_.n_merge) + 1);
-    const int D         = hp_.n_embd;
-    const int FF        = hp_.n_ff;
-    const int MD        = hp_.n_merge * hp_.n_merge * D;
+    scratch_max_merged_ = std::max(scratch_max_merged_, n_merged);
 
-    auto alloc_s = [&](size_t bytes) -> void * {
-        void * p = nullptr;
-        V_HIP_CHECK(hipMalloc(&p, bytes));
-        V_HIP_CHECK(hipMemsetAsync(p, 0, bytes, stream_));   // never read uninitialised VRAM (issue #1)
-        scratch_allocs_.push_back(p);
-        scratch_vram_bytes_ += bytes;
-        return p;
-    };
+    const size_t MD = (size_t)hp_.n_merge * hp_.n_merge * hp_.n_embd;
+    const VisionArenaLayout L = vision_arena_layout(
+        (size_t)scratch_max_pos_, (size_t)scratch_max_pixels_, (size_t)scratch_max_merged_,
+        (size_t)hp_.n_embd, (size_t)hp_.n_ff, MD);
 
-    d_img_f32_  = static_cast<float *>(alloc_s((size_t)scratch_max_pixels_ * 3 * sizeof(float)));
-    d_hidden_   = static_cast<float *>(alloc_s((size_t)mp * D * sizeof(float)));
-    d_norm_     = static_cast<float *>(alloc_s((size_t)mp * D * sizeof(float)));
-    d_qkv_      = static_cast<float *>(alloc_s((size_t)mp * 3 * D * sizeof(float)));
-    d_q_h_      = static_cast<__half *>(alloc_s((size_t)mp * D * sizeof(__half)));
-    d_k_h_      = static_cast<__half *>(alloc_s((size_t)mp * D * sizeof(__half)));
-    d_v_h_      = static_cast<__half *>(alloc_s((size_t)mp * D * sizeof(__half)));
-    d_attn_out_ = static_cast<float *>(alloc_s((size_t)mp * D * sizeof(float)));
-    d_ffn_mid_  = static_cast<float *>(alloc_s((size_t)mp * FF * sizeof(float)));
-    d_merged_   = static_cast<float *>(alloc_s((size_t)mm * MD * sizeof(float)));
-    d_proj_mid_ = static_cast<float *>(alloc_s((size_t)mm * MD * sizeof(float)));
-    d_proj_out_ = static_cast<float *>(alloc_s((size_t)mm * hp_.proj_dim * sizeof(float)));
+    void * p = nullptr;
+    if (hipMalloc(&p, L.total) != hipSuccess) {
+        (void)hipGetLastError();
+        size_t fr = 0, tot = 0;
+        (void)hipMemGetInfo(&fr, &tot);
+        std::fprintf(stderr, "[vision] hipMalloc(ViT workspace, %.1f MiB) failed (%.1f MiB free)\n",
+                     (double)L.total / (1024.0 * 1024.0), (double)fr / (1024.0 * 1024.0));
+        scratch_max_pos_ = scratch_max_pixels_ = scratch_max_merged_ = 0;
+        scratch_vram_bytes_ = proj_out_bytes_;
+        total_vram_bytes_   = weight_vram_bytes_ + scratch_vram_bytes_;
+        return false;
+    }
+    V_HIP_CHECK(hipMemsetAsync(p, 0, L.total, stream_));   // never read uninitialised VRAM (issue #1)
+    d_arena_     = p;
+    arena_bytes_ = L.total;
 
-    total_vram_bytes_ = weight_vram_bytes_ + scratch_vram_bytes_;
+    char * base = static_cast<char *>(p);
+    char * pool = base + L.off_pool;
+    d_hidden_   = reinterpret_cast<float *>(base + L.off_hidden);
+    d_norm_     = reinterpret_cast<float *>(base + L.off_norm);
+    d_img_f32_  = reinterpret_cast<float *>(pool);
+    d_qkv_      = reinterpret_cast<float *>(pool);
+    d_attn_out_ = reinterpret_cast<float *>(pool);             // aliases d_qkv_ (dead after split)
+    d_q_h_      = reinterpret_cast<__half *>(pool + L.off_q);
+    d_k_h_      = reinterpret_cast<__half *>(pool + L.off_k);
+    d_v_h_      = reinterpret_cast<__half *>(pool + L.off_v);
+    d_ffn_mid_  = reinterpret_cast<float *>(pool);
+    d_merged_   = reinterpret_cast<float *>(pool);
+    d_proj_mid_ = reinterpret_cast<float *>(pool + L.off_proj_mid);
+
+    last_arena_bytes_   = arena_bytes_;
+    peak_arena_bytes_   = std::max(peak_arena_bytes_, arena_bytes_);
+    scratch_vram_bytes_ = arena_bytes_ + proj_out_bytes_;
+    total_vram_bytes_   = weight_vram_bytes_ + scratch_vram_bytes_;
     return true;
 }
 
@@ -653,7 +767,9 @@ bool VisionEncoder::encode_rgb_u8(
         }
     }
 
-    ensure_scratch(n_patches, n_merged, w_pad, h_pad);
+    if (!ensure_scratch(n_patches, n_merged, w_pad, h_pad)) {
+        return false;
+    }
 
     const double pre_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_pre0).count();
@@ -714,6 +830,12 @@ bool VisionEncoder::encode_rgb_u8(
     V_HIP_CHECK(hipEventElapsedTime(&gpu_ms, ev0, ev1));
     V_HIP_CHECK(hipEventDestroy(ev0));
     V_HIP_CHECK(hipEventDestroy(ev1));
+
+    // The transient arena is dead now (ev1 covers every kernel that touches it);
+    // only d_proj_out_ (separate allocation) is read after this point.
+    if (!keep_scratch_) {
+        release_workspace();
+    }
 
     if (out_host_embeds != nullptr) {
         out_host_embeds->resize((size_t)n_merged * hp_.proj_dim);

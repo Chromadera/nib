@@ -3170,7 +3170,8 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
       ? `${maxSlots}×${Math.round(slotCtx / 1024)}k ${elasticMode ? "elastic" : "strict"} (max ${Math.round(reqMaxCtx / 1024)}k)`
       : `${fmtNum(reqMaxCtx)} ctx`;
     $("modelsEngineSummary").textContent = `RX 7900 XTX · ${slotInfo} · ${h.kv_type} sparse-${h.sparse_pages} · ${h.mtp ? "DSpark MTP (" + Math.round(h.draft_ctx / 1024) + "k ring)" : "MTP off"} · ${h.vision ? "Vision" : "Text-only"}`;
-    $("modelRowSub").textContent = `${h.model} · VRAM ${h.vram_gib.toFixed(2)} GiB (LLM ${h.llm_vram_gib.toFixed(2)} GiB, Vision ${h.vision_vram_gib.toFixed(2)} GiB)`;
+    const mtpVram = h.mtp_vram_gib || 0;
+    $("modelRowSub").textContent = `${h.model} · VRAM ${h.vram_gib.toFixed(2)} GiB (LLM ${h.llm_vram_gib.toFixed(2)}, MTP ${mtpVram.toFixed(2)}, Vision ${h.vision_vram_gib.toFixed(2)} GiB)`;
 
     // In-flight table (live concurrent slots)
     $("inflightCount").textContent = queuedReqs > 0
@@ -3201,7 +3202,7 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
 
     // Performance KPIs
     $("perfVram").textContent = `${h.vram_gib.toFixed(2)} GiB`;
-    $("perfVramSub").textContent = `LLM ${h.llm_vram_gib.toFixed(2)} + Vision ${h.vision_vram_gib.toFixed(2)} GiB`;
+    $("perfVramSub").textContent = `LLM ${h.llm_vram_gib.toFixed(2)} + MTP ${mtpVram.toFixed(2)} + Vision ${h.vision_vram_gib.toFixed(2)} GiB`;
     $("perfKvPos").textContent = fmtNum(h.cur_pos);
     $("perfKvSub").textContent = `of ${fmtNum(h.max_ctx)} (${pct.toFixed(1)}%)`;
 

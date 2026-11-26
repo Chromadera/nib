@@ -263,6 +263,13 @@ struct ModelWeights {
     std::vector<void *> gpu_allocs;
     size_t total_vram_bytes = 0;
 
+    // --cpu-embd: pinned, GPU-mapped host allocations (hipHostMalloc(Mapped)).
+    // Stored as HOST pointers (freed with hipHostFree); the matrices hold the
+    // hipHostGetDevicePointer() aliases.  Not counted in total_vram_bytes.
+    std::vector<void *> host_allocs;
+    size_t host_pinned_bytes = 0;
+    bool   tok_embd_on_host  = false;
+
     void destroy();
 };
 
@@ -285,11 +292,16 @@ struct TokenizerData {
 // ============================================================================
 // Loader API (src/gguf_loader.cpp + src/repack_soa.hip)
 // ============================================================================
+// tok_embd_host = true (--cpu-embd): token_embd.weight (~469 MiB SoA Q8_0) lives in
+// pinned, GPU-mapped host RAM instead of VRAM.  It is only ever gathered one row
+// per token (embed + DSpark embed block), so the PCIe cost is ~2.4 KiB/token.
+// lm_head (output.weight) always stays in VRAM.
 bool load_inkling_gguf(
     const std::string & path,
     ModelWeights & out_weights,
     TokenizerData & out_tok,
-    bool verify_repack_self_test = false);
+    bool verify_repack_self_test = false,
+    bool tok_embd_host = false);
 
 // ============================================================================
 // Core Wave32 Kernels API (src/kernels_core.hip)

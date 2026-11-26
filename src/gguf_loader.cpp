@@ -70,6 +70,14 @@ void ModelWeights::destroy()
     }
     gpu_allocs.clear();
     total_vram_bytes = 0;
+    for (void * h : host_allocs) {
+        if (h != nullptr) {
+            (void)hipHostFree(h);
+        }
+    }
+    host_allocs.clear();
+    host_pinned_bytes = 0;
+    tok_embd_on_host  = false;
 }
 
 // ============================================================================
@@ -318,6 +326,52 @@ void * alloc_tracked(ModelWeights & w, size_t bytes)
     return p;
 }
 
+// --cpu-embd: pinned host RAM mapped into the GPU address space.  Returns the
+// device-side alias; the host pointer is tracked in w.host_allocs (hipHostFree).
+void * alloc_host_mapped(ModelWeights & w, size_t bytes)
+{
+    if (bytes == 0) {
+        return nullptr;
+    }
+    void * h = nullptr;
+    hipError_t err = hipHostMalloc(&h, bytes, hipHostMallocMapped);
+    if (err != hipSuccess || h == nullptr) {
+        throw std::runtime_error(std::string("hipHostMalloc(Mapped) failed: ") + hipGetErrorString(err) +
+                                 " (" + std::to_string(bytes) + " bytes)");
+    }
+    void * d = nullptr;
+    err = hipHostGetDevicePointer(&d, h, 0);
+    if (err != hipSuccess || d == nullptr) {
+        (void)hipHostFree(h);
+        throw std::runtime_error(std::string("hipHostGetDevicePointer failed: ") + hipGetErrorString(err));
+    }
+    w.host_allocs.push_back(h);
+    w.host_pinned_bytes += bytes;
+    // Same stream-ordered zero fill as alloc_tracked (issue #1), through the
+    // device alias; fall back to a host memset if the runtime refuses it.
+    err = (g_alloc_zero_stream != nullptr) ? hipMemsetAsync(d, 0, bytes, g_alloc_zero_stream)
+                                           : hipErrorInvalidValue;
+    if (err != hipSuccess) {
+        (void)hipGetLastError();
+        if (g_alloc_zero_stream != nullptr) {
+            (void)hipStreamSynchronize(g_alloc_zero_stream);
+        }
+        std::memset(h, 0, bytes);
+    }
+    return d;
+}
+
+SoaQ8Matrix make_q8_matrix_host(ModelWeights & w, int rows, int K)
+{
+    SoaQ8Matrix m;
+    m.rows = rows;
+    m.K    = K;
+    m.qs   = static_cast<int8_t *>(alloc_host_mapped(w, static_cast<size_t>(rows) * K));
+    m.d    = static_cast<__half *>(
+        alloc_host_mapped(w, static_cast<size_t>(rows) * (K / 32) * sizeof(__half)));
+    return m;
+}
+
 SoaQ8Matrix make_q8_matrix(ModelWeights & w, int rows, int K)
 {
     SoaQ8Matrix m;
@@ -459,7 +513,8 @@ bool load_inkling_gguf(
     const std::string & path,
     ModelWeights & out_weights,
     TokenizerData & out_tok,
-    bool verify_repack_self_test)
+    bool verify_repack_self_test,
+    bool tok_embd_host)
 {
     const auto t_start = std::chrono::steady_clock::now();
 
@@ -668,7 +723,10 @@ bool load_inkling_gguf(
             if (K_of(te) != N_EMBD || rows_of(te) != VOCAB_PADDED) {
                 throw std::runtime_error("token_embd.weight unexpected shape");
             }
-            out_weights.tok_embd = make_q8_matrix(out_weights, VOCAB_PADDED, N_EMBD);
+            out_weights.tok_embd = tok_embd_host
+                ? make_q8_matrix_host(out_weights, VOCAB_PADDED, N_EMBD)
+                : make_q8_matrix(out_weights, VOCAB_PADDED, N_EMBD);
+            out_weights.tok_embd_on_host = tok_embd_host;
             stage_and_repack_q8(stream, staging, max_quant_bytes, te,
                                 VOCAB_PADDED, N_EMBD,
                                 out_weights.tok_embd.qs, out_weights.tok_embd.d, 0);
@@ -1012,6 +1070,10 @@ bool load_inkling_gguf(
         std::printf("[gguf] total VRAM: %zu bytes (%.1f MiB)\n",
                     out_weights.total_vram_bytes,
                     static_cast<double>(out_weights.total_vram_bytes) / (1024.0 * 1024.0));
+        if (out_weights.tok_embd_on_host) {
+            std::printf("[gguf] tok_embd=CPU pinned (%.1f MiB saved; GPU-mapped host RAM, lm_head stays in VRAM)\n",
+                        static_cast<double>(out_weights.host_pinned_bytes) / (1024.0 * 1024.0));
+        }
 
     } catch (...) {
         if (staging != nullptr) {

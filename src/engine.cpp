@@ -194,7 +194,7 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
         }
     }
 
-    if (!load_inkling_gguf(model_path, weights_, tok_, verify_repack)) {
+    if (!load_inkling_gguf(model_path, weights_, tok_, verify_repack, cfg_.cpu_embd)) {
         std::fprintf(stderr, "InklingEngine: failed to load GGUF '%s'\n", model_path.c_str());
         return false;
     }
@@ -223,6 +223,17 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
                 (double)total_vram_bytes_ / (1024.0 * 1024.0 * 1024.0),
                 (double)weights_.total_vram_bytes / (1024.0 * 1024.0 * 1024.0),
                 (double)(total_vram_bytes_ - weights_.total_vram_bytes) / (1024.0 * 1024.0 * 1024.0));
+    if (weights_.tok_embd_on_host) {
+        std::printf("[InklingEngine] tok_embd=CPU pinned (%.1f MiB saved) | lm_head in VRAM\n",
+                    (double)weights_.host_pinned_bytes / (1024.0 * 1024.0));
+    }
+    if (cfg_.report_state_estimate) {
+        const size_t est = estimate_state_bytes(cfg_, false);
+        const size_t act = total_vram_bytes_ - weights_.total_vram_bytes;
+        std::printf("[InklingEngine] kv+scratch estimate %.1f MiB vs actual %.1f MiB (diff %+.1f MiB)\n",
+                    (double)est / 1048576.0, (double)act / 1048576.0,
+                    ((double)act - (double)est) / 1048576.0);
+    }
     std::fflush(stdout);
     // Step 7K: the fa_*_v4 defaults reorder the split-K combine by <= 1 ulp and
     // this model amplifies that into a MoE top-8 near-tie, so the 258k needle
@@ -237,6 +248,102 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
             cfg_.sparse_pages);
     }
     return true;
+}
+
+size_t InklingEngine::estimate_state_bytes(const EngineConfig & cfg_in, bool with_mtp_io) {
+    // Keep in lock-step with alloc_state_and_scratch(), alloc_batch_scratch() and
+    // enable_mtp_io(): every alloc_gpu() rounds up to 256 bytes.
+    const int n_slots = std::max(1, std::min(cfg_in.n_slots, (int)MAX_CONCURRENT_SLOTS));
+    const size_t max_ctx = (size_t)std::max(0, cfg_in.max_ctx);
+    const size_t swa_cap = (size_t)std::max(0, cfg_in.swa_cap);
+    auto A = [](size_t bytes) { return (bytes + 255) & ~(size_t)255; };
+    const size_t qs_bytes_per_head = (cfg_in.kv_type == KV_Q8_0) ? (size_t)HEAD_DIM : (size_t)(HEAD_DIM / 2);
+    const size_t d_halves_per_head = (cfg_in.kv_type == KV_Q4_1) ? (size_t)(HEAD_DIM / 16) : (size_t)(HEAD_DIM / 32);
+    auto kv_bytes = [&](size_t cap) {
+        return 2 * A(cap * N_HEAD_KV * qs_bytes_per_head)
+             + 2 * A(cap * N_HEAD_KV * d_halves_per_head * sizeof(__half))
+             + A(cap * sizeof(int32_t));
+    };
+    const size_t sconv = A((size_t)N_SCONV_CHANNELS * N_CONV_HIST * sizeof(float));
+
+    size_t t = 0;
+    // 1 / 1b. KV + short-conv state
+    for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+        t += kv_bytes(is_swa_slot(s) ? swa_cap : max_ctx) + sconv;
+    }
+    for (int c = 1; c < n_slots; ++c) {
+        for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+            if (is_swa_slot(s)) t += kv_bytes(swa_cap);
+            t += sconv;
+        }
+    }
+    // 2. meta / ids
+    t += A(sizeof(StepMeta)) + A(sizeof(int32_t)) + A((size_t)MAX_UBATCH * sizeof(int32_t));
+    // 3. residual buffers (5 + 2*3 + 2 + 1 = 14 x embd_buf)
+    const size_t embd = A((size_t)MAX_UBATCH * N_EMBD * sizeof(float));
+    t += 14 * embd;
+    // 4. layer workspace
+    t += 2 * A(4 * (size_t)MAX_UBATCH * N_EMBD * sizeof(float));        // mixed, messages
+    t += 6 * embd;                                                       // ctrl[3], norm[3]
+    t += A(3 * (size_t)MAX_UBATCH * LOOP_GATE_RANK * sizeof(float));
+    t += A((size_t)MAX_UBATCH * 8600 * sizeof(float));
+    t += 2 * A((size_t)MAX_UBATCH * 1056 * sizeof(float));
+    t += A((size_t)MAX_UBATCH * N_Q * sizeof(float));                    // q_prep
+    t += A((size_t)MAX_UBATCH * N_HEAD * N_REL_EXTENT * sizeof(float));  // rel_table
+    t += A((size_t)MAX_UBATCH * N_Q * sizeof(float));                    // fa_out
+    t += 2 * embd;                                                       // wo_out, x_norm
+    t += A((size_t)MAX_UBATCH * TOP_K * sizeof(int32_t)) + A((size_t)MAX_UBATCH * TOP_K * sizeof(float));
+    t += A((size_t)MAX_VERIFY_TOKENS * 512 * sizeof(float));
+    t += A(16384 * sizeof(float));
+    t += A((size_t)TOP_K * N_FF_EXP * sizeof(float));
+    t += embd;                                                           // moe_out
+    const size_t fa_tmp_rows = (size_t)std::max(64, 8 * MAX_UBATCH);
+    t += A(fa_tmp_rows * N_HEAD * HEAD_DIM * sizeof(float)) + A(fa_tmp_rows * N_HEAD * sizeof(float2));
+    t += A(128 * sizeof(int32_t));
+    const int logits_rows = cfg_in.need_all_logits_buf ? MAX_UBATCH : MAX_VERIFY_TOKENS;
+    t += A((size_t)logits_rows * VOCAB_UNPADDED * sizeof(float));
+    // 5. grouped MoE prefill scratch
+    const size_t max_slots = (size_t)MAX_UBATCH * TOP_K;
+    t += 2 * A((size_t)N_EXPERT * sizeof(int32_t)) + A(((size_t)N_EXPERT + 1) * sizeof(int32_t)); // counts, cursors, offsets
+    t += A(max_slots * sizeof(int32_t)) + A(max_slots * sizeof(float));
+    t += A(max_slots * N_EMBD * sizeof(float)) + A(max_slots * N_FF_EXP * sizeof(float)) + A(max_slots * N_EMBD * sizeof(float));
+    t += 2 * A((max_slots + N_EXPERT) * sizeof(int32_t)) + A(sizeof(int32_t));
+    // 6. token history + tau table
+    t += A((max_ctx + 2048) * sizeof(int32_t)) + A((max_ctx + 2048) * sizeof(float));
+    // 7. Quest page metadata + selection scratch
+    if (cfg_in.sparse_pages > 0) {
+        const int32_t max_pages = std::min<int32_t>(
+            (int32_t)((max_ctx + SPARSE_PAGE_SIZE - 1) / SPARSE_PAGE_SIZE), SPARSE_MAX_PAGES);
+        for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+            if (!is_swa_slot(s)) t += sparse_global_page_meta_bytes(max_pages, cfg_in.sparse_meta);
+        }
+        t += sparse_global_scratch_bytes();
+    }
+    // 8b. sampler scratch
+    t += A((size_t)MTP_SAMPLE_SCRATCH_WORDS * sizeof(float)) + A((size_t)MAX_VERIFY_TOKENS * sizeof(int32_t))
+       + A((size_t)MAX_VERIFY_TOKENS * 4 * sizeof(float));
+    // 9. batched decode / verify scratch
+    if (n_slots > 1 || with_mtp_io) {
+        t += A((size_t)MAX_VERIFY_TOKENS * sizeof(StepMeta)) + A((size_t)MAX_VERIFY_TOKENS * sizeof(int32_t));
+        t += 3 * A(64 * sizeof(int32_t));                                // unique, mask, cnt
+        t += 3 * A((size_t)64 * TOP_K * sizeof(int32_t));                // slot, w, list
+        t += A(sizeof(int32_t));
+        t += A((size_t)MAX_VERIFY_TOKENS * TOP_K * N_EMBD * sizeof(float));
+        t += A((size_t)MAX_VERIFY_TOKENS * TOP_K * N_FF_EXP * sizeof(float));
+        t += A((size_t)MAX_VERIFY_TOKENS * 3 * N_EMBD * sizeof(float));
+        t += A((size_t)MAX_VERIFY_TOKENS * 4 * N_EMBD * sizeof(float));
+        t += A((size_t)MAX_VERIFY_TOKENS * 3 * LOOP_GATE_RANK * sizeof(float));
+    }
+    if (with_mtp_io) {
+        t += A((size_t)MAX_UBATCH * 4 * N_EMBD * sizeof(uint16_t));
+        t += A((size_t)N_LAYER_SLOTS * MAX_VERIFY_TOKENS * N_SCONV_CHANNELS * sizeof(float));
+        t += A((size_t)N_LAYER_SLOTS * N_SCONV_CHANNELS * N_CONV_HIST * sizeof(float));
+        t += A((size_t)N_LAYER_SLOTS * sizeof(float *));
+        t += A((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK * sizeof(float))
+           + A((size_t)MAX_VERIFY_TOKENS * MTP_VERIFY_TOPK * sizeof(int32_t))
+           + A((size_t)MAX_VERIFY_TOKENS * 2 * sizeof(float));
+    }
+    return t;
 }
 
 void InklingEngine::alloc_state_and_scratch() {

@@ -1493,8 +1493,13 @@ public:
         }
         if (req.method == "GET" && req.path == "/health") {
             const double llm_vram = (double)eng_.total_vram_bytes() / (1024.0 * 1024.0 * 1024.0);
+            const double mtp_vram = drafter_ ? ((double)drafter_->vram_bytes() / (1024.0 * 1024.0 * 1024.0)) : 0.0;
             const double vis_vram = vision_ ? ((double)vision_->vram_bytes() / (1024.0 * 1024.0 * 1024.0)) : 0.0;
-            const double vram = llm_vram + vis_vram;
+            const double vram = llm_vram + mtp_vram + vis_vram;
+            size_t dev_free_b = 0, dev_total_b = 0;
+            const bool has_dev_mem = (hipMemGetInfo(&dev_free_b, &dev_total_b) == hipSuccess && dev_total_b > 0);
+            const double dev_free_gib  = has_dev_mem ? ((double)dev_free_b  / (1024.0 * 1024.0 * 1024.0)) : 0.0;
+            const double dev_total_gib = has_dev_mem ? ((double)dev_total_b / (1024.0 * 1024.0 * 1024.0)) : 0.0;
             const int pos = eng_.slot_pos(0);
             const double uptime = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start_time_).count();
@@ -1558,7 +1563,14 @@ public:
                 << ",\"vision\":" << (vision_ ? "true" : "false")
                 << ",\"vram_gib\":" << vram
                 << ",\"llm_vram_gib\":" << llm_vram
+                << ",\"mtp_vram_gib\":" << mtp_vram
                 << ",\"vision_vram_gib\":" << vis_vram
+                << ",\"device_free_vram_gib\":" << dev_free_gib
+                << ",\"device_total_vram_gib\":" << dev_total_gib
+                << ",\"cpu_embd\":" << (eng_.cpu_embd() ? "true" : "false")
+                << ",\"cpu_embd_host_mib\":" << ((double)eng_.host_pinned_bytes() / (1024.0 * 1024.0))
+                << ",\"vision_workspace_mib\":" << (vision_ ? (double)vision_->workspace_bytes() / (1024.0 * 1024.0) : 0.0)
+                << ",\"vision_workspace_peak_mib\":" << (vision_ ? (double)vision_->peak_workspace_bytes() / (1024.0 * 1024.0) : 0.0)
                 << ",\"uptime_s\":" << (long)uptime
                 << ",\"busy\":" << ((n_active > 0 || n_queued > 0) ? "true" : "false")
                 << ",\"active_requests\":" << n_active
@@ -1949,7 +1961,8 @@ private:
 
     double total_vram_gib() const {
         size_t bytes = eng_.total_vram_bytes();
-        if (vision_) bytes += vision_->vram_bytes();
+        if (drafter_) bytes += drafter_->vram_bytes();
+        if (vision_)  bytes += vision_->vram_bytes();
         return (double)bytes / (1024.0 * 1024.0 * 1024.0);
     }
 
@@ -4140,7 +4153,10 @@ int run_http_server(
     }
     g_listen_fd.store(lfd);
 
-    const double vram = (double)(eng.total_vram_bytes() + (vision ? vision->vram_bytes() : 0)) / (1024.0 * 1024.0 * 1024.0);
+    const double llm_vram_gib = (double)eng.total_vram_bytes() / (1024.0 * 1024.0 * 1024.0);
+    const double mtp_vram_gib = drafter ? ((double)drafter->vram_bytes() / (1024.0 * 1024.0 * 1024.0)) : 0.0;
+    const double vis_vram_gib = vision  ? ((double)vision->vram_bytes()  / (1024.0 * 1024.0 * 1024.0)) : 0.0;
+    const double vram = llm_vram_gib + mtp_vram_gib + vis_vram_gib;
     int32_t req_max = eng.max_ctx();
     if (cfg.strict_slot_ctx && eng.num_slots() > 1) req_max = std::min(req_max, eng.slot_ctx());
     if (cfg.max_slot_ctx > 0) req_max = std::min(req_max, cfg.max_slot_ctx);
@@ -4155,6 +4171,31 @@ int run_http_server(
                 eng.max_ctx(), eng.num_slots(), eng.slot_ctx(), req_max, ctx_mode,
                 cfg.kv_type_name.c_str(), cfg.sparse_pages, cfg.default_temperature,
                 drafter ? "ON" : "OFF", vision ? "ON" : "OFF", vram);
+    size_t dev_free_b = 0, dev_total_b = 0;
+    if (hipMemGetInfo(&dev_free_b, &dev_total_b) == hipSuccess && dev_total_b > 0) {
+        const double free_gib  = (double)dev_free_b  / (1024.0 * 1024.0 * 1024.0);
+        const double total_gib = (double)dev_total_b / (1024.0 * 1024.0 * 1024.0);
+        const double used_gib  = total_gib - free_gib;
+        std::printf("[nib] Device VRAM: %.2f / %.2f GiB used (%.2f GiB free; app=%.2f GiB: llm=%.2f + mtp=%.2f + vision=%.2f)\n",
+                    used_gib, total_gib, free_gib, vram, llm_vram_gib, mtp_vram_gib, vis_vram_gib);
+        if (dev_free_b < (size_t)512 * 1024 * 1024) {
+            std::printf("[nib] WARNING: Only %.0f MiB free GPU VRAM remaining! On Linux (amdgpu TTM) or Windows/WSL2 (WDDM), "
+                        "running this close to physical VRAM can silently spill buffers to PCIe GTT (severe decode slowdown) or OOM.\n"
+                        "[nib]          Reduce -c or --slots, use --kv-type q4_1/q4_0, or pass --no-vision to regain headroom.\n",
+                        (double)dev_free_b / (1024.0 * 1024.0));
+        } else if (vision != nullptr && dev_free_b < (size_t)1024 * 1024 * 1024) {
+            std::printf("[nib] NOTE: %.0f MiB free GPU VRAM with Vision enabled — each image transiently allocates its ViT workspace "
+                        "(~%.0f MiB at 1080p, up to %.0f MiB at max resolution)%s.\n",
+                        (double)dev_free_b / (1024.0 * 1024.0),
+                        (double)vision->estimate_encode_bytes(1296) / (1024.0 * 1024.0),
+                        (double)vision->estimate_max_encode_bytes() / (1024.0 * 1024.0),
+                        vision->keep_scratch() ? " and keeps it resident (--vision-keep-scratch)" : ", freed right after the encode");
+        }
+        if (eng.cpu_embd()) {
+            std::printf("[nib] tok_embd=CPU pinned (%.1f MiB of VRAM saved; GPU-mapped host RAM)\n",
+                        (double)eng.host_pinned_bytes() / (1024.0 * 1024.0));
+        }
+    }
     std::fflush(stdout);
 
     while (!g_stop_server.load()) {
