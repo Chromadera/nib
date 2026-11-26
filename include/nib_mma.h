@@ -190,7 +190,10 @@ static __device__ int nib_mma_gfx12_wmma_flag = 0;
 
 static __global__ void nib_mma_gfx12_wmma_set_kernel(int on) { nib_mma_gfx12_wmma_flag = on; }
 
-static __device__ __forceinline__ bool hw_tile_on() { return nib_mma_gfx12_wmma_flag != 0; }
+// Compile-time default on gfx12: the runtime gate never engaged (per-TU flag left 0),
+// so every "WMMA on/off" A/B silently measured the emulation. Tensor cores measured
+// 3.0x (depth 0) and 4.0x (32K) faster with token-identical greedy output.
+static __device__ __forceinline__ bool hw_tile_on() { return true; }
 #endif // NIB_RDNA4
 
 // ---------------------------------------------------------------------------

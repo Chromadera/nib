@@ -231,3 +231,23 @@ Sanity signals to watch:
   `kernels_step7h_fused.hip`'s v3 kernels are cooperative and sized for 96 CU;
   they are off by default (`fdot2_moe = 0`, `b_v3 = 0`, `c_v3 = 0`) and would
   need the same gate before they are safe on 64 CU.
+
+
+## Measured on gfx1201 (Radeon AI PRO R9700, 32 GB, ROCm 7.2 WSL2)
+
+The port is validated end-to-end with the tensor-core tile as the compile-time default
+(the earlier per-TU runtime gate silently left the emulation active, which made it look
+neutral; a forced build showed 3.0-4.0x):
+
+| prompt tokens | served prefill tok/s | gate |
+|---:|---:|---|
+| 16,404 | 3,998.9 | - |
+| 32,782 | 3,759.1 | - |
+| 65,556 | 3,340.3 | needles 3/3 |
+| 133,460 | 3,406.1 | needles 3/3 |
+| 230,060 | 3,400.8 | needles 3/3 |
+
+`pp2560` bench: 3828.4 at depth 0, 3319.2 at 32K. Decode 93.3 tok/s. Vision 5/5 markers.
+Numerics vs the `v_dot2` fallback: greedy 32/32 tokens identical, WikiText-2 PPL
+6.5295 vs 6.5071. Configuration: `-c 262144 --kv-type q4_0 --sparse-pages 224`,
+`MAX_UBATCH` 2560, MoE tile BN=64 (16 KB LDS -> 4 CTAs/CU).
