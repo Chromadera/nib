@@ -77,7 +77,7 @@ static double compute_nll_from_logits(
 }
 
 #ifndef NIB_VERSION
-#define NIB_VERSION "0.1.0"
+#define NIB_VERSION "0.1.1"
 #endif
 #ifndef NIB_GIT_SHA
 #define NIB_GIT_SHA "unknown"
