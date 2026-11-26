@@ -220,6 +220,36 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
     step7i_prime_occupancy();
     step7j_prime_occupancy();
 
+    // RDNA4 (gfx1200/gfx1201, 64 CU): the opt-in Step 7H/7J fused variants are single
+    // launches sized for a 96-CU gfx1100 whose blocks synchronise through device
+    // counters, so they would deadlock instead of slowing down. Disable them here
+    // (they are all off by default) and say so; the shipped non-fused paths are used.
+    {
+        hipDeviceProp_t dp{};
+        int dev = 0;
+        if (hipGetDevice(&dev) == hipSuccess && hipGetDeviceProperties(&dp, dev) == hipSuccess) {
+            const std::string arch = dp.gcnArchName;
+            if (arch.rfind("gfx12", 0) == 0) {
+                auto off = [&](int32_t & v, const char * name) {
+                    if (v != 0) {
+                        std::fprintf(stderr, "[InklingEngine] %s disabled on %s: "
+                                     "96-CU grid-barrier kernel, not co-resident on %d CU\n",
+                                     name, arch.c_str(), dp.multiProcessorCount);
+                        v = 0;
+                    }
+                };
+                off(cfg_.fdot2_moe, "fdot2_moe");
+                off(cfg_.fdot2_qkv, "fdot2_qkv");
+                off(cfg_.fdot2_wo, "fdot2_wo");
+                off(cfg_.fdot2_q8moe, "fdot2_q8moe");
+                off(cfg_.b_v3, "b_v3");
+                off(cfg_.c_v3, "c_v3");
+                std::printf("[InklingEngine] device %s, %d multiprocessors (RDNA4 path)\n",
+                            arch.c_str(), dp.multiProcessorCount);
+            }
+        }
+    }
+
     const char * kv_name = (cfg_.kv_type == KV_Q4_1) ? "q4_1"
                          : (cfg_.kv_type == KV_Q4_0) ? "q4_0" : "q8_0";
     std::printf("[InklingEngine] Ready! max_ctx=%d slots=%d slot_ctx=%d swa_cap=%d kv=%s sparse_pages=%d total_vram=%.2f GiB (weights=%.2f GiB, kv+scratch=%.2f GiB)\n",

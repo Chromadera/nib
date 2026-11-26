@@ -2160,6 +2160,7 @@ int device_wgp_count_df() {
 int g_occ_mix_dual = -1;   // blocks/CU of mix_dual_ctrl_qkv3_norm_decode_kernel
 int g_occ_mix_ffn_v2 = -1; // blocks/CU of mix_ffn_norm_router_topk_fused_v2_kernel
 int g_occ_mix_ctrl_v2 = -1;// blocks/CU of mix_ctrl_ffn_norm_router_topk_fused_v2_kernel
+int g_occ_qkvr = -1;       // blocks/CU of qkv_qkvr_prep_fused_decode_kernel<...,192>
 
 inline bool df_coresident(int occ, int grid) {
     if (occ <= 0) {
@@ -2549,6 +2550,14 @@ void launch_qkv_qkvr_prep_fused_decode_g(
     if (grid == 384 && wgp < 48) grid = 288;
     if (grid == 288 && wgp < 42) grid = 192;
     if (grid == 192 && wgp < 28) grid = 0;
+#if !NIB_RDNA3
+    // gfx12: the WGPs thresholds above are RDNA3 arithmetic; also require the chosen grid
+    // to be co-resident at its measured blocks/CU (see df_coresident), else step down, then
+    // fall back to the unfused GEMV + qkvr_prep path.
+    while (grid != 0 && !df_coresident(g_occ_qkvr, grid)) {
+        grid = (grid == 384) ? 288 : (grid == 288) ? 192 : 0;
+    }
+#endif
 
     if (W0.K != N_EMBD || (W1.rows > 0 && W1.K != N_EMBD) || (W2.rows > 0 && W2.K != N_EMBD) ||
         W0.rows > 12288 || W1.rows > 12288 || W2.rows > 12288 || scratch == nullptr ||
@@ -2690,6 +2699,10 @@ void decode_fused_prime_occupancy() {
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
             &n, (const void *)mix_ctrl_ffn_norm_router_topk_fused_v2_kernel<5, false>, 288, 0) == hipSuccess) {
         g_occ_mix_ctrl_v2 = n;
+    }
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, (const void *)qkv_qkvr_prep_fused_decode_kernel<4, 8, N_EMBD / 32, 3, 192>, 128, 0) == hipSuccess) {
+        g_occ_qkvr = n;
     }
     if (std::getenv("NIB_DUMP_OCC") != nullptr) {
         std::fprintf(stderr, "[decode_fused] cu=%d occ/blk: mix_dual=%d mix_ffn_v2=%d mix_ctrl_v2=%d (grid 96 needs occ>=2 on 64 cu)\n",

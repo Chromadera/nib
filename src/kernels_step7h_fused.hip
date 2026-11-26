@@ -34,6 +34,7 @@
 // ============================================================================
 
 #include "kernels_step7h_fused.h"
+#include "nib_target.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -1670,8 +1671,24 @@ __global__ void mix_ctrl_ffn_norm_router_topk_v3_kernel(
 // ============================================================================
 // Public API
 // ============================================================================
+
+// Co-residency gate for the grid-barrier MoE kernels below (see nib_target.h).
+// hipOccupancyMaxActiveBlocksPerMultiprocessor() reports blocks/CU; multiplying by
+// the device's MultiprocessorCount attribute (CUs, or WGPs on drivers that report
+// half) is a lower bound either way, so a pass can never over-commit the GPU.
+// gfx11 keeps its shipped wgp-count thresholds untouched.
 namespace {
+int g_occ_ship288 = -1, g_occ_ship192 = -1, g_occ_q8ship192 = -1;
 int g_wgp_7h = 48;
+inline bool h7h_coresident(int occ, int grid) {
+#if NIB_RDNA3
+    (void)occ; (void)grid;
+    return true;
+#else
+    if (occ <= 0) return false;
+    return (long long)occ * (long long)g_wgp_7h >= (long long)grid;
+#endif
+}
 } // namespace
 
 void launch_moe_nvfp4_ship_fused192(
@@ -1692,7 +1709,7 @@ void launch_moe_nvfp4_ship_fused(
         std::fprintf(stderr, "[kernels_step7h] nvfp4 MoE shape mismatch\n");
         std::abort();
     }
-    if (g_wgp_7h < 48) {
+    if (g_wgp_7h < 48 || !h7h_coresident(g_occ_ship288, 288)) {
         launch_moe_nvfp4_ship_fused192(gate_up, down, x_norm, topk_ids, topk_w,
                                        tmp_act, out, stream, post_conv_w, post_sconv_h,
                                        post_res_add, scratch, raw_out);
@@ -1725,7 +1742,8 @@ void launch_moe_nvfp4_ship_fused192(
     float * scratch, float * raw_out) {
     // 192-block 256-thread MoE kernel (121 VGPRs, 20.6 KB LDS) fits <=5 blocks/WGP:
     // requires >=40 WGPs (7900 GRE/XT/XTX/W7900); W7800 (35 WGPs) falls back cleanly.
-    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40) {
+    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40 ||
+        !h7h_coresident(g_occ_ship192, 192)) {
         extern void launch_moe_nvfp4_decode(const SoaNVFP4Experts &, const SoaNVFP4Experts &,
                                             const float *, const int32_t *, const float *,
                                             float *, float *, hipStream_t,
@@ -1755,7 +1773,8 @@ void launch_moe_q8_ship_fused(
         std::fprintf(stderr, "[kernels_step7h] q8 MoE shape mismatch\n");
         std::abort();
     }
-    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40) {
+    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40 ||
+        !h7h_coresident(g_occ_q8ship192, 192)) {
         launch_moe_q8_decode(gate_up, down, x_norm, topk_ids, topk_w,
                              tmp_act, out, stream, post_conv_w, post_sconv_h, post_res_add);
         return;
@@ -1888,6 +1907,16 @@ void step7h_prime_occupancy() {
         g_wgp_7h = wgp;
     } else {
         g_wgp_7h = 48;
+    }
+    // RDNA4: the wgp thresholds above assume an RDNA3 part; also require the grid to
+    // actually be co-resident (blocks/CU x device attribute >= grid).
+    int n = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)moe_nvfp4_ship_fused288_kernel, 256, 0) == hipSuccess) g_occ_ship288 = n;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)moe_nvfp4_ship_fused192_kernel, 256, 0) == hipSuccess) g_occ_ship192 = n;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)moe_q8_ship_fused_kernel, 256, 0) == hipSuccess) g_occ_q8ship192 = n;
+    if (std::getenv("NIB_DUMP_OCC") != nullptr) {
+        std::fprintf(stderr, "[step7h] occ/blk: ship288=%d ship192=%d q8ship192=%d (attr=%d)\n",
+                     g_occ_ship288, g_occ_ship192, g_occ_q8ship192, g_wgp_7h);
     }
 }
 
