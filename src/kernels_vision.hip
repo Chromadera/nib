@@ -18,6 +18,7 @@
 // launch_soa_q8_gemm_wmma() (85 TFLOPS FP16 WMMA) from kernels_wmma_prefill.hip.
 // ============================================================================
 
+#include "nib_arch.h"
 #include "vision_encoder.hpp"
 
 #include <cmath>
@@ -28,8 +29,8 @@
 namespace inkling {
 namespace {
 
-typedef _Float16 fp16x16 __attribute__((ext_vector_type(16)));
-typedef float    f32x8   __attribute__((ext_vector_type(8)));
+typedef nib_wmma_hfrag_t wmma_hfrag_t;
+typedef nib_float8_t     f32x8;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
@@ -49,7 +50,7 @@ __device__ __forceinline__ float fast_exp2f(float x) {
 // Grid: (1 + ceil(n_patches / 16), 16)
 //   blockIdx.x == 0: writes CLS token (64 channels per blockIdx.y)
 //   blockIdx.x >= 1: tiles 16 patches x 64 output channels with 4 warps (16 ch/warp)
-//   using RDNA3 FP16 WMMA (16x16x16), 512 B LDS for s_p[16][16], 16x weight reuse!
+//   using RDNA3/RDNA4 FP16 WMMA (16x16x16), 512 B LDS for s_p[16][16], 16x weight reuse!
 __global__ void __launch_bounds__(128)
 vision_patch_embed_pos_cls_kernel(
     const float * __restrict__ img_rgb,   // [H_pad, W_pad, 3]
@@ -113,8 +114,18 @@ vision_patch_embed_pos_cls_kernel(
         }
         __syncthreads();
 
-        // Load A = W[oc_row, k0..k0+15] (4 x float4 -> fp16x16)
-        fp16x16 w_frag;
+        // Load A = W[oc_row, k0..k0+15] (RDNA3: 4x float4 -> 16 halves; RDNA4: 2x float4 at k0+lhalf*8 -> 8 halves)
+        wmma_hfrag_t w_frag;
+#if NIB_ARCH_RDNA4
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const float4 fw = *reinterpret_cast<const float4 *>(wrow + k0 + lhalf * 8 + q * 4);
+            w_frag[q * 4 + 0] = (_Float16)fw.x;
+            w_frag[q * 4 + 1] = (_Float16)fw.y;
+            w_frag[q * 4 + 2] = (_Float16)fw.z;
+            w_frag[q * 4 + 3] = (_Float16)fw.w;
+        }
+#else
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
             const float4 fw = *reinterpret_cast<const float4 *>(wrow + k0 + q * 4);
@@ -123,24 +134,16 @@ vision_patch_embed_pos_cls_kernel(
             w_frag[q * 4 + 2] = (_Float16)fw.z;
             w_frag[q * 4 + 3] = (_Float16)fw.w;
         }
+#endif
 
         // Load B = P[p0 + l16, k0..k0+15] from LDS
-        fp16x16 p_frag;
-        const uint4 lo = *reinterpret_cast<const uint4 *>(&s_p[l16][0]);
-        const uint4 hi = *reinterpret_cast<const uint4 *>(&s_p[l16][8]);
-        const _Float16 * hp0 = reinterpret_cast<const _Float16 *>(&lo);
-        const _Float16 * hp1 = reinterpret_cast<const _Float16 *>(&hi);
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            p_frag[i]     = hp0[i];
-            p_frag[i + 8] = hp1[i];
-        }
+        const wmma_hfrag_t p_frag = nib_lds_wmma_frag(&s_p[l16][0], lhalf);
 
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(w_frag, p_frag, acc);
+        acc = nib_wmma_f32_16x16x16_f16(w_frag, p_frag, acc);
         __syncthreads();
     }
 
-    // Output: lane (lhalf, l16) owns patch p_idx = p0 + l16, channels oc = oc_base + warp*16 + 2*i + lhalf
+    // Output: lane (lhalf, l16) owns patch p_idx = p0 + l16, channels oc = oc_base + warp*16 + nib_wmma_c_row(lhalf, i)
     const int p_idx = p0 + l16;
     if (p_idx < n_patches) {
         const int py = p_idx / grid_w;
@@ -177,7 +180,7 @@ vision_patch_embed_pos_cls_kernel(
 
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int oc = oc_base + warp * 16 + 2 * i + lhalf;
+            const int oc = oc_base + warp * 16 + nib_wmma_c_row(lhalf, i);
             const float pos_val = pa_row[oc] * wa + pb_row[oc] * wb + pc_row[oc] * wc + pd_row[oc] * wd;
             out_row[oc] = acc[i] + pos_val;
         }
@@ -373,14 +376,22 @@ vision_fa_wmma_d64_kernel(
     const __half * k_head = k_h + (size_t)h * n_pos * D;
     const __half * v_head = v_h + (size_t)h * n_pos * D;
 
-    // Load this warp's 16x64 Q tile permanently into registers (4 x fp16x16, pre-scaled by scale * LOG2E)
+    // Load this warp's 16x64 Q tile permanently into registers (4 x wmma_hfrag_t, pre-scaled by scale * LOG2E)
     constexpr float LOG2E = 1.44269504088896340736f;
-    fp16x16 q_frag[4];
+    wmma_hfrag_t q_frag[4];
     {
         const __half * qp = q_head + (size_t)(q_valid ? q_row : 0) * D;
         const float sc = q_valid ? (scale * LOG2E) : 0.0f;
 #pragma unroll
         for (int dk = 0; dk < 4; ++dk) {
+#if NIB_ARCH_RDNA4
+            const uint4 raw = reinterpret_cast<const uint4 *>(qp)[dk * 2 + lhalf];
+            const __half * h0 = reinterpret_cast<const __half *>(&raw);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                q_frag[dk][i] = (_Float16)(__half2float(h0[i]) * sc);
+            }
+#else
             const uint4 raw = reinterpret_cast<const uint4 *>(qp)[dk * 2];
             const uint4 raw2 = reinterpret_cast<const uint4 *>(qp)[dk * 2 + 1];
             const __half * h0 = reinterpret_cast<const __half *>(&raw);
@@ -390,13 +401,14 @@ vision_fa_wmma_d64_kernel(
                 q_frag[dk][i]     = (_Float16)(__half2float(h0[i]) * sc);
                 q_frag[dk][i + 8] = (_Float16)(__half2float(h1[i]) * sc);
             }
+#endif
         }
     }
 
     __shared__ __align__(16) __half s_k[BC][K_STRIDE];
     __shared__ __align__(16) __half s_vt[D][BC]; // XOR-swizzled on 8-half chunks: k_swiz = k ^ ((d >> 3) << 3)
 
-    // Accumulator O^T[64, 16]: 4 tiles of 16x16 -> lane holds O[q_row, dt*16 + 2*i + lhalf]
+    // Accumulator O^T[64, 16]: 4 tiles of 16x16 -> lane holds O[q_row, dt*16 + nib_wmma_c_row(lhalf, i)]
     f32x8 o_acc[4];
 #pragma unroll
     for (int dt = 0; dt < 4; ++dt) {
@@ -404,8 +416,6 @@ vision_fa_wmma_d64_kernel(
     }
     float row_m = -INFINITY;
     float row_l = 0.0f;
-    const uint32_t perm0 = (lhalf == 0) ? 0x05040100u : 0x01000504u;
-    const uint32_t perm1 = (lhalf == 0) ? 0x07060302u : 0x03020706u;
 
     // Loop over K/V blocks of BC=64
     for (int kv0 = 0; kv0 < n_pos; kv0 += BC) {
@@ -444,17 +454,9 @@ vision_fa_wmma_d64_kernel(
             const int k_row = kt * 16 + l16;
 #pragma unroll
             for (int dk = 0; dk < 4; ++dk) {
-                fp16x16 k_frag;
-                const uint4 lo = *reinterpret_cast<const uint4 *>(&s_k[k_row][dk * 16]);
-                const uint4 hi = *reinterpret_cast<const uint4 *>(&s_k[k_row][dk * 16 + 8]);
-                const _Float16 * p0 = reinterpret_cast<const _Float16 *>(&lo);
-                const _Float16 * p1 = reinterpret_cast<const _Float16 *>(&hi);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    k_frag[i]     = p0[i];
-                    k_frag[i + 8] = p1[i];
-                }
-                s_tile[kt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k_frag, q_frag[dk], s_tile[kt]);
+                const wmma_hfrag_t k_frag = nib_lds_wmma_frag(
+                    reinterpret_cast<const _Float16 *>(&s_k[k_row][dk * 16]), lhalf);
+                s_tile[kt] = nib_wmma_f32_16x16x16_f16(k_frag, q_frag[dk], s_tile[kt]);
             }
         }
 
@@ -465,7 +467,7 @@ vision_fa_wmma_d64_kernel(
         for (int kt = 0; kt < 4; ++kt) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                if (is_tail && (kv0 + kt * 16 + 2 * i + lhalf) >= n_pos) {
+                if (is_tail && (kv0 + kt * 16 + nib_wmma_c_row(lhalf, i)) >= n_pos) {
                     s_tile[kt][i] = -INFINITY;
                 }
                 tile_m = fmaxf(tile_m, s_tile[kt][i]);
@@ -489,26 +491,19 @@ vision_fa_wmma_d64_kernel(
             row_m = new_m;
         }
 
-        // Exponentiate S -> P using 1-cycle fast_exp2f and pack via v_perm_b32
+        // Exponentiate S -> P using 1-cycle fast_exp2f and pack P fragment (zero shuffles on RDNA4)
         float tile_l = 0.0f;
-        fp16x16 p_frag[4];
+        wmma_hfrag_t p_frag[4];
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
-            union {
-                fp16x16  h16;
-                uint32_t u[8];
-            } pk;
+            f32x8 p_exp;
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float e0 = fast_exp2f(s_tile[kt][2 * j]     - row_m);
-                const float e1 = fast_exp2f(s_tile[kt][2 * j + 1] - row_m);
-                tile_l += e0 + e1;
-                const uint32_t mu = __builtin_bit_cast(uint32_t, __floats2half2_rn(e0, e1));
-                const uint32_t ou = __shfl_xor(mu, 16, 32);
-                pk.u[2 * j + 0] = __builtin_amdgcn_perm(ou, mu, perm0);
-                pk.u[2 * j + 1] = __builtin_amdgcn_perm(ou, mu, perm1);
+            for (int i = 0; i < 8; ++i) {
+                const float e = fast_exp2f(s_tile[kt][i] - row_m);
+                p_exp[i] = e;
+                tile_l += e;
             }
-            p_frag[kt] = pk.h16;
+            p_frag[kt] = nib_pack_p_frag(p_exp, lhalf);
         }
         tile_l += __shfl_xor(tile_l, 16, 32);
         row_l  += tile_l;
@@ -520,19 +515,21 @@ vision_fa_wmma_d64_kernel(
             const int swiz_hi = (d_row >> 3) << 3; // matches write swizzle
 #pragma unroll
             for (int kt = 0; kt < 4; ++kt) {
-                fp16x16 v_frag;
+#if NIB_ARCH_RDNA4
+                const int k_off = (kt * 16 + (lhalf << 3)) ^ swiz_hi;
+                const uint4 lo = *reinterpret_cast<const uint4 *>(&s_vt[d_row][k_off]);
+                wmma_hfrag_t v_frag;
+                __builtin_memcpy(&v_frag, &lo, 16);
+#else
                 const int k0 = (kt * 16 + 0) ^ swiz_hi;
                 const int k1 = (kt * 16 + 8) ^ swiz_hi;
                 const uint4 lo = *reinterpret_cast<const uint4 *>(&s_vt[d_row][k0]);
                 const uint4 hi = *reinterpret_cast<const uint4 *>(&s_vt[d_row][k1]);
-                const _Float16 * p0 = reinterpret_cast<const _Float16 *>(&lo);
-                const _Float16 * p1 = reinterpret_cast<const _Float16 *>(&hi);
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    v_frag[i]     = p0[i];
-                    v_frag[i + 8] = p1[i];
-                }
-                o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(v_frag, p_frag[kt], o_acc[dt]);
+                wmma_hfrag_t v_frag;
+                __builtin_memcpy(&v_frag, &lo, 16);
+                __builtin_memcpy(reinterpret_cast<char *>(&v_frag) + 16, &hi, 16);
+#endif
+                o_acc[dt] = nib_wmma_f32_16x16x16_f16(v_frag, p_frag[kt], o_acc[dt]);
             }
         }
         __syncthreads();
@@ -546,7 +543,7 @@ vision_fa_wmma_d64_kernel(
         for (int dt = 0; dt < 4; ++dt) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                out_row[dt * 16 + 2 * i + lhalf] = o_acc[dt][i] * inv_l;
+                out_row[dt * 16 + nib_wmma_c_row(lhalf, i)] = o_acc[dt][i] * inv_l;
             }
         }
     }

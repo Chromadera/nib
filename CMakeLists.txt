@@ -6,7 +6,30 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
 set(HIP_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH "HIP compiler")
-set(GPU_TARGET "gfx1100" CACHE STRING "AMD RDNA3 GPU target (e.g. gfx1100)")
+set(GPU_TARGET "gfx1100" CACHE STRING "AMD RDNA3/RDNA4 GPU target(s), semicolon-separated (gfx1100-gfx1103, gfx1200, gfx1201)")
+
+set(_NIB_SUPPORTED_TARGETS gfx1100 gfx1101 gfx1102 gfx1103 gfx1200 gfx1201)
+set(_NIB_OFFLOAD_FLAGS "")
+set(_NIB_GPU_TARGETS_CLEAN "")
+foreach(_tgt IN LISTS GPU_TARGET)
+    string(STRIP "${_tgt}" _tgt)
+    if(_tgt STREQUAL "")
+        continue()
+    endif()
+    list(FIND _NIB_SUPPORTED_TARGETS "${_tgt}" _idx)
+    if(_idx EQUAL -1)
+        message(FATAL_ERROR
+            "Unsupported GPU_TARGET '${_tgt}'. Supported AMD RDNA3/RDNA4 targets: "
+            "gfx1100, gfx1101, gfx1102, gfx1103, gfx1200, gfx1201.")
+    endif()
+    list(APPEND _NIB_OFFLOAD_FLAGS "--offload-arch=${_tgt}")
+    list(APPEND _NIB_GPU_TARGETS_CLEAN "${_tgt}")
+endforeach()
+if(NOT _NIB_OFFLOAD_FLAGS)
+    message(FATAL_ERROR "GPU_TARGET must specify at least one supported RDNA3/RDNA4 target.")
+endif()
+string(JOIN "," NIB_GPU_TARGET_STR ${_NIB_GPU_TARGETS_CLEAN})
+message(STATUS "Nib GPU target(s): ${NIB_GPU_TARGET_STR}")
 
 set(NIB_GIT_SHA "unknown")
 find_package(Git QUIET)
@@ -30,7 +53,7 @@ function(add_hip_object target_name hip_src)
         COMMAND "${HIP_COMPILER}"
             -O3
             -fPIC
-            --offload-arch=${GPU_TARGET}
+            ${_NIB_OFFLOAD_FLAGS}
             -std=c++17
             -Wall -Wextra -Wno-unused-parameter -Wno-unused-function
             -D__HIP_PLATFORM_AMD__
@@ -40,10 +63,11 @@ function(add_hip_object target_name hip_src)
             -o "${obj_file}"
         DEPENDS
             "${CMAKE_CURRENT_SOURCE_DIR}/${hip_src}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/include/nib_arch.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/inkling_engine.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/sparse_global.h"
             ${ARGN}
-        COMMENT "Compiling RDNA3 HIP kernel ${hip_src} (${GPU_TARGET})"
+        COMMENT "Compiling RDNA HIP kernel ${hip_src} (${NIB_GPU_TARGET_STR})"
     )
     set(${target_name}_OBJ "${obj_file}" PARENT_SCOPE)
 endfunction()
@@ -79,13 +103,7 @@ add_hip_object(kernels_dspark_mtp    "src/kernels_dspark_mtp.hip"
 add_hip_object(kernels_verify_batch  "src/kernels_verify_batch.hip"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_verify_batch.h")
 
-add_executable(nib
-    src/gguf_loader.cpp
-    src/engine.cpp
-    src/dspark_mtp.cpp
-    src/vision_encoder.cpp
-    src/server.cpp
-    src/main.cpp
+set(NIB_HIP_OBJECTS
     ${repack_soa_OBJ}
     ${kernels_core_OBJ}
     ${kernels_fa_OBJ}
@@ -106,6 +124,19 @@ add_executable(nib
     ${kernels_verify_batch_OBJ}
 )
 
+add_custom_target(nib_hip_objs DEPENDS ${NIB_HIP_OBJECTS})
+
+add_executable(nib
+    src/gguf_loader.cpp
+    src/engine.cpp
+    src/dspark_mtp.cpp
+    src/vision_encoder.cpp
+    src/server.cpp
+    src/main.cpp
+    ${NIB_HIP_OBJECTS}
+)
+add_dependencies(nib nib_hip_objs)
+
 target_include_directories(nib PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -116,7 +147,7 @@ target_compile_definitions(nib PRIVATE
     __HIP_PLATFORM_AMD__
     NIB_VERSION="${PROJECT_VERSION}"
     NIB_GIT_SHA="${NIB_GIT_SHA}"
-    NIB_GPU_TARGET="${GPU_TARGET}"
+    NIB_GPU_TARGET="${NIB_GPU_TARGET_STR}"
 )
 target_compile_options(nib PRIVATE -O3 -march=native -Wall -Wextra -Wno-unused-parameter)
 
@@ -127,3 +158,19 @@ set_target_properties(nib PROPERTIES
     BUILD_RPATH "${ROCM_PATH}/lib"
     INSTALL_RPATH "${ROCM_PATH}/lib"
 )
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rdna_kernels.hip")
+    add_hip_object(test_rdna_kernels "tests/test_rdna_kernels.hip")
+    add_executable(nib_kernel_test
+        ${test_rdna_kernels_OBJ}
+        ${NIB_HIP_OBJECTS}
+    )
+    add_dependencies(nib_kernel_test nib_hip_objs)
+    set_target_properties(nib_kernel_test PROPERTIES LINKER_LANGUAGE CXX)
+    target_link_directories(nib_kernel_test PRIVATE "${ROCM_PATH}/lib")
+    target_link_libraries(nib_kernel_test PRIVATE amdhip64 pthread dl)
+    set_target_properties(nib_kernel_test PROPERTIES
+        BUILD_RPATH "${ROCM_PATH}/lib"
+        INSTALL_RPATH "${ROCM_PATH}/lib"
+    )
+endif()

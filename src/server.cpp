@@ -1536,10 +1536,15 @@ public:
 #ifndef NIB_VERSION
 #define NIB_VERSION "0.1.2"
 #endif
+            const NibDeviceInfo & dev_info = nib_device_info(0);
             const auto now = std::chrono::steady_clock::now();
             std::ostringstream oss;
             oss << "{\"status\":\"ok\""
                 << ",\"version\":" << json_str(NIB_VERSION)
+                << ",\"gpu_name\":" << json_str(dev_info.name)
+                << ",\"gpu_arch\":" << json_str(dev_info.gcn_arch)
+                << ",\"gpu_family\":" << json_str(dev_info.arch_family)
+                << ",\"gpu_mps\":" << dev_info.mp_count
                 << ",\"model\":" << json_str(cfg_.model_name)
                 << ",\"max_ctx\":" << eng_.max_ctx()
                 << ",\"request_max_ctx\":" << request_max_ctx()
@@ -1607,17 +1612,20 @@ public:
             return;
         }
         if (req.method == "GET" && req.path == "/v1/models") {
+            const NibDeviceInfo & dev_info = nib_device_info(0);
             const int32_t req_ctx = request_max_ctx();
             char name_buf[192];
             if (eng_.num_slots() > 1) {
                 std::snprintf(name_buf, sizeof(name_buf),
-                              "Inkling 2 Mini NVFP4-Mixed (RDNA3 HIP, %dk pool, %dx%dk %s%s%s)",
+                              "Inkling 2 Mini NVFP4-Mixed (%s HIP, %dk pool, %dx%dk %s%s%s)",
+                              dev_info.arch_family,
                               eng_.max_ctx() / 1024, eng_.num_slots(), eng_.slot_ctx() / 1024,
                               cfg_.strict_slot_ctx ? "strict" : "elastic",
                               drafter_ ? ", MTP" : "", vision_ ? ", Vision" : "");
             } else {
                 std::snprintf(name_buf, sizeof(name_buf),
-                              "Inkling 2 Mini NVFP4-Mixed (RDNA3 HIP, %dk%s%s)",
+                              "Inkling 2 Mini NVFP4-Mixed (%s HIP, %dk%s%s)",
+                              dev_info.arch_family,
                               eng_.max_ctx() / 1024,
                               drafter_ ? ", MTP" : "", vision_ ? ", Vision" : "");
             }

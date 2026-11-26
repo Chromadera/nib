@@ -1930,7 +1930,7 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
             <button class="btn btn-outline btn-sm" id="modelsResetKvBtn">Reset KV Cache</button>
           </div>
           <div class="models-header-sub">
-            <span id="modelsEngineSummary">RX 7900 XTX · 262,848 ctx · Q8_0 sparse-112 · DSpark MTP · Vision</span>
+            <span id="modelsEngineSummary">AMD Radeon GPU · 262,848 ctx · Q8_0 sparse-112 · DSpark MTP · Vision</span>
             <div class="kv-bar-wrap">
               <span class="mono" style="font-size:12px;" id="modelsKvLabel">KV 0 / 262,848</span>
               <div class="progress-track"><div class="progress-fill" id="modelsKvBar" style="width:0%"></div></div>
@@ -1943,8 +1943,8 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
             <div class="model-row-left">
               <span class="status-dot" id="modelRowDot"></span>
               <div>
-                <div class="model-row-name" id="modelRowTitle">Inkling 2 Mini NVFP4-Mixed (RDNA3 HIP, 262k, MTP, Vision)</div>
-                <div class="model-row-sub mono" id="modelRowSub">inkling-2-mini · VRAM 21.50 GiB (LLM 21.18 GiB, Vision 0.32 GiB) · Draft Ring 8,192</div>
+                <div class="model-row-name" id="modelRowTitle">Inkling 2 Mini NVFP4-Mixed (RDNA HIP, 262k, MTP, Vision)</div>
+                <div class="model-row-sub mono" id="modelRowSub">inkling-2-mini · VRAM -- GiB</div>
               </div>
             </div>
             <div class="model-row-right">
@@ -2012,7 +2012,7 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
           <div class="card perf-stat">
             <div class="perf-stat-label">VRAM Allocated</div>
             <div class="perf-stat-val" id="perfVram">--</div>
-            <div class="perf-stat-sub" id="perfVramSub">RX 7900 XTX 24 GiB</div>
+            <div class="perf-stat-sub" id="perfVramSub">AMD Radeon GPU</div>
           </div>
           <div class="card perf-stat">
             <div class="perf-stat-label">KV Cache Position</div>
@@ -3169,7 +3169,10 @@ table.swap-table tbody tr:hover td { background: color-mix(in srgb, var(--muted)
     const slotInfo = maxSlots > 1
       ? `${maxSlots}×${Math.round(slotCtx / 1024)}k ${elasticMode ? "elastic" : "strict"} (max ${Math.round(reqMaxCtx / 1024)}k)`
       : `${fmtNum(reqMaxCtx)} ctx`;
-    $("modelsEngineSummary").textContent = `RX 7900 XTX · ${slotInfo} · ${h.kv_type} sparse-${h.sparse_pages} · ${h.mtp ? "DSpark MTP (" + Math.round(h.draft_ctx / 1024) + "k ring)" : "MTP off"} · ${h.vision ? "Vision" : "Text-only"}`;
+    const gpuLabel = h.gpu_name
+      ? (h.gpu_arch && h.gpu_arch !== "unknown" ? `${h.gpu_name} (${h.gpu_arch})` : h.gpu_name)
+      : "AMD Radeon GPU";
+    $("modelsEngineSummary").textContent = `${gpuLabel} · ${slotInfo} · ${h.kv_type} sparse-${h.sparse_pages} · ${h.mtp ? "DSpark MTP (" + Math.round(h.draft_ctx / 1024) + "k ring)" : "MTP off"} · ${h.vision ? "Vision" : "Text-only"}`;
     const mtpVram = h.mtp_vram_gib || 0;
     $("modelRowSub").textContent = `${h.model} · VRAM ${h.vram_gib.toFixed(2)} GiB (LLM ${h.llm_vram_gib.toFixed(2)}, MTP ${mtpVram.toFixed(2)}, Vision ${h.vision_vram_gib.toFixed(2)} GiB)`;
 

@@ -245,17 +245,11 @@ __device__ __forceinline__ float sconv_post_res_one(const SconvEpi & e, int r, f
 // kernels_decode_fused.hip, where they are battle-tested by kernels A/B/C/E).
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 __device__ __forceinline__ void rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 __device__ __forceinline__ int scratch_add(float * scratch, int slot) {
@@ -1200,7 +1194,7 @@ struct WoRing {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 template <int NWARPS, int PD, bool FROM_LDS, int MINB, bool NTC = true>
-__global__ void __launch_bounds__(NWARPS * 32, MINB) __attribute__((amdgpu_num_vgpr(80)))
+__global__ void __launch_bounds__(NWARPS * 32, MINB) NIB_RDNA3_VGPR_CAP(80)
 soa_q8_gemv_wo_v3_kernel(const int8_t * __restrict__ qs, const __half * __restrict__ d,
                          const float * __restrict__ x, float * __restrict__ y,
                          int rows, const SconvEpi epi) {

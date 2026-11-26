@@ -36,17 +36,11 @@ typedef int v4i __attribute__((ext_vector_type(4)));
 // gfx1100 memory-ordering helpers (identical to kernels_core.hip / Step 4)
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ void rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 static __device__ __forceinline__ void rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 // ---------------------------------------------------------------------------
@@ -2143,7 +2137,8 @@ void launch_mix_dual_ctrl_qkv3_norm_decode(
     const float * msg_base = out0; // LOOP_CTRL_Q == 0
 
     if (n_tokens != 1 || n_states0 > 5 || n_states1 > 5 || n_q0 > 4 || n_q1 > 4 ||
-        scratch == nullptr) {
+        scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_dual_ctrl_qkv3_norm_decode_kernel<false>, 288, 96, 4)) {
         launch_inkling_mix_dual(query0, n_q0, states0, n_states0, out0,
                                 query1, n_q1, states1, n_states1, out1, n_tokens, stream);
         launch_inkling_ctrl_qkv_norm(cur, msg_base, w_down, w_gain, w_forget, w_norm,
@@ -2193,6 +2188,26 @@ void launch_mix_dual_ctrl_qkv3_norm_decode_mrows(
                                               tmp_gate, out_norm, 1, eps, stream, scratch);
         return;
     }
+    if (n_states0 > 5 || n_states1 > 5 || n_q0 > 4 || n_q1 > 4 || scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_dual_ctrl_qkv3_norm_decode_kernel<true>, 288, 96 * nrows, 4)) {
+        for (int r = 0; r < nrows; ++r) {
+            const float * st0[MAX_RES_BLOCKS];
+            const float * st1[MAX_RES_BLOCKS];
+            for (int i = 0; i < n_states0; ++i) st0[i] = states0[i] + (size_t)r * N_EMBD;
+            for (int i = 0; i < n_states1; ++i) st1[i] = states1[i] + (size_t)r * N_EMBD;
+            float * on_r[3];
+            for (int j = 0; j < 3; ++j) {
+                on_r[j] = (out_norm[j] != nullptr) ? (out_norm[j] + (size_t)r * N_EMBD) : nullptr;
+            }
+            launch_mix_dual_ctrl_qkv3_norm_decode(
+                query0, n_q0, st0, n_states0, out0 + (size_t)r * 4 * N_EMBD,
+                query1, n_q1, st1, n_states1, out1 + (size_t)r * 3 * N_EMBD,
+                w_down, w_gain, w_forget, w_norm,
+                tmp_gate + (size_t)r * 3 * LOOP_GATE_RANK,
+                on_r, 1, eps, stream, scratch);
+        }
+        return;
+    }
     const float * cur[3] = {
         out1,
         out1 + (size_t)(n_q1 >= 3 ? 1 : 0) * N_EMBD,
@@ -2239,6 +2254,20 @@ void launch_mix_ffn_norm_router_topk_decode_v2_mrows(
                                                   topk_ids_out, topk_w_out, router_scratch, stream);
         return;
     }
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ffn_norm_router_topk_fused_v2_kernel<true>, 192, 33 * nrows, 6)) {
+        for (int r = 0; r < nrows; ++r) {
+            const float * st[MAX_RES_BLOCKS];
+            for (int i = 0; i < n_states; ++i) st[i] = states[i] + (size_t)r * N_EMBD;
+            launch_mix_ffn_norm_router_topk_decode_v2(
+                res_query, st, n_states, ffn_norm_w, router_w, exp_probs_b,
+                x_norm_out + (size_t)r * N_EMBD,
+                topk_ids_out + (size_t)r * TOP_K,
+                topk_w_out + (size_t)r * TOP_K,
+                router_scratch, stream);
+        }
+        return;
+    }
     DecStatePtrs s;
     extract_states(states, n_states, s);
     mix_ffn_norm_router_topk_fused_v2_kernel<true><<<dim3(33, nrows), 192, 0, stream>>>(
@@ -2274,7 +2303,8 @@ void launch_mix_ctrl_ffn_norm_router_topk_decode_v2_mrows(
     }
     DecStatePtrs s;
     extract_states(states, n_states, s);
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ctrl_ffn_norm_router_topk_fused_v2_kernel<5, true>, 288, 32 * nrows, 4)) {
         for (int r = 0; r < nrows; ++r) {
             const float * st[MAX_RES_BLOCKS];
             for (int i = 0; i < n_states; ++i) st[i] = states[i] + (size_t)r * N_EMBD;
@@ -2308,7 +2338,8 @@ void launch_mix_ffn_norm_router_topk_decode_v2(
     if (n_states <= 0) {
         return;
     }
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ffn_norm_router_topk_fused_v2_kernel<false>, 192, 33, 6)) {
         launch_mix_ffn_norm_router_topk_decode(res_query, states, n_states, ffn_norm_w,
                                                router_w, exp_probs_b, x_norm_out,
                                                topk_ids_out, topk_w_out, router_scratch, stream);
@@ -2341,7 +2372,8 @@ void launch_mix_ctrl_ffn_norm_router_topk_decode_v2(
     if (n_states <= 0) {
         return;
     }
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ctrl_ffn_norm_router_topk_fused_v2_kernel<5, false>, 288, 32, 4)) {
         launch_mix_ctrl_down_decode(res_query, states, n_states, msg, w_down,
                                     out_mixed, out_gate, stream);
         launch_ctrl_apply_ffn_norm_router_topk_decode(out_mixed, msg, out_gate,
@@ -2404,22 +2436,6 @@ void launch_soa_q8_gemv_qkv3_v2(
 }
 
 namespace {
-int device_wgp_count_df() {
-    static int cache[64] = {};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
-        return 48;
-    }
-    if (cache[dev] == 0) {
-        int n = 0;
-        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || n <= 0) {
-            n = 48;
-        }
-        cache[dev] = n;
-    }
-    return cache[dev];
-}
-
 void qkv_unfused_fallback_df(
         const SoaQ8Matrix & W0, const float * x0, float * y0,
         const SoaQ8Matrix & W1, const float * x1, float * y1,
@@ -2462,12 +2478,23 @@ void launch_qkv_qkvr_prep_fused_decode_g(
         float * scratch,
         hipStream_t stream,
         int grid) {
-    const int wgp = device_wgp_count_df();
-    // Auto-downgrade grid to stay strictly co-resident on smaller gfx1100/RDNA3 GPUs
-    // (128-thread kernel holds up to 7 blocks/WGP: 384 needs 48 WGPs, 288 needs 42, 192 needs 28).
-    if (grid == 384 && wgp < 48) grid = 288;
-    if (grid == 288 && wgp < 42) grid = 192;
-    if (grid == 192 && wgp < 28) grid = 0;
+    constexpr int NWARPS = 4, LPR = 8, NB = N_EMBD / 32, PD = 3;
+    constexpr int RPB = NWARPS * (32 / LPR);
+    const int wgp = nib_device_mp_count();
+    // Auto-downgrade grid to stay strictly co-resident on smaller RDNA3/RDNA4 GPUs
+    // (128-thread kernel holds up to 7-8 blocks/WGP: 384 needs >=48 WGPs, 288 needs >=42, 192 needs >=28).
+    if (grid == 384 && (wgp < 48 || !nib_grid_coresident(
+            (const void *)qkv_qkvr_prep_fused_decode_kernel<NWARPS, LPR, NB, PD, 384>, NWARPS * 32, 384, 8))) {
+        grid = 288;
+    }
+    if (grid == 288 && (wgp < 42 || !nib_grid_coresident(
+            (const void *)qkv_qkvr_prep_fused_decode_kernel<NWARPS, LPR, NB, PD, 288>, NWARPS * 32, 288, 7))) {
+        grid = 192;
+    }
+    if (grid == 192 && (wgp < 28 || !nib_grid_coresident(
+            (const void *)qkv_qkvr_prep_fused_decode_kernel<NWARPS, LPR, NB, PD, 192>, NWARPS * 32, 192, 7))) {
+        grid = 0;
+    }
 
     if (W0.K != N_EMBD || (W1.rows > 0 && W1.K != N_EMBD) || (W2.rows > 0 && W2.K != N_EMBD) ||
         W0.rows > 12288 || W1.rows > 12288 || W2.rows > 12288 || scratch == nullptr ||
@@ -2487,8 +2514,6 @@ void launch_qkv_qkvr_prep_fused_decode_g(
     if (nseg == 0) {
         return;
     }
-    constexpr int NWARPS = 4, LPR = 8, NB = N_EMBD / 32, PD = 3;
-    constexpr int RPB = NWARPS * (32 / LPR);
     if (grid == 384) {
         (void) partition_segments<RPB>(s, nseg, 384);
         qkv_qkvr_prep_fused_decode_kernel<NWARPS, LPR, NB, PD, 384><<<384, NWARPS * 32, 0, stream>>>(

@@ -21,17 +21,11 @@ static __device__ __forceinline__ __half2 h2_of(uint32_t u) {
 }
 
 static __device__ __forceinline__ void rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 static __device__ __forceinline__ void rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 static __device__ __forceinline__ float dot_h8_f8(uint4 w, float4 x0, float4 x1, float acc) {
@@ -50,20 +44,8 @@ static __device__ __forceinline__ float dot_h8_f8(uint4 w, float4 x0, float4 x1,
     return acc;
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-typedef int      v4i      __attribute__((ext_vector_type(4)));
-typedef _Float16 half16_t __attribute__((ext_vector_type(16)));
-typedef float    float8_t __attribute__((ext_vector_type(8)));
-
-static __device__ __forceinline__ half16_t lds_frag(const _Float16 * p) {
-    const v4i a = *reinterpret_cast<const v4i *>(p);
-    const v4i b = *reinterpret_cast<const v4i *>(p + 8);
-    half16_t r;
-    __builtin_memcpy(&r, &a, 16);
-    __builtin_memcpy(reinterpret_cast<char *>(&r) + 16, &b, 16);
-    return r;
-}
-#endif
+typedef nib_wmma_hfrag_t wmma_hfrag_t;
+typedef nib_float8_t     float8_t;
 
 template <int width = WARP_SIZE>
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
@@ -969,7 +951,6 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         HalfPtr3      w_down,
         float       * __restrict__ gate,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     constexpr int BM     = 16;
     constexpr int BN     = 16;
     constexpr int BK     = 64;
@@ -1064,9 +1045,9 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         __syncthreads();
 
         {
-            const half16_t af = lds_frag(&smem.gemm.a[l16 * LDK + warp * 16]);
-            const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc);
+            const wmma_hfrag_t af = nib_lds_wmma_frag(&smem.gemm.a[l16 * LDK + warp * 16], half_w);
+            const wmma_hfrag_t bf = nib_lds_wmma_frag(&smem.gemm.b[l16 * LDK + warp * 16], half_w);
+            acc = nib_wmma_f32_16x16x16_f16(af, bf, acc);
         }
         __syncthreads();
 
@@ -1095,9 +1076,9 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         __syncthreads();
 
         {
-            const half16_t af = lds_frag(&smem.gemm.a[l16 * LDK + warp * 16]);
-            const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc);
+            const wmma_hfrag_t af = nib_lds_wmma_frag(&smem.gemm.a[l16 * LDK + warp * 16], half_w);
+            const wmma_hfrag_t bf = nib_lds_wmma_frag(&smem.gemm.b[l16 * LDK + warp * 16], half_w);
+            acc = nib_wmma_f32_16x16x16_f16(af, bf, acc);
         }
         __syncthreads();
     }
@@ -1105,7 +1086,7 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
     // Deterministic 4-warp reduction in LDS + coalesced 64B global store
     #pragma unroll
     for (int idx = 0; idx < 8; ++idx) {
-        const int t_loc = 2 * idx + half_w;
+        const int t_loc = nib_wmma_c_row(half_w, idx);
         smem.red[warp][t_loc][l16] = acc[idx];
     }
     __syncthreads();
@@ -1122,9 +1103,6 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
             gate_j[(size_t)t * LOOP_GATE_RANK + r0 + r_loc] = s01 + s23;
         }
     }
-#else
-    (void)cur; (void)msg_base; (void)w_down; (void)gate; (void)n_tokens;
-#endif
 }
 
 // Decode ctrl_apply (n_tokens <= 8): 8 lanes per output row (uint4 = 8 halves), 32 rows/block (256 threads)
@@ -1348,7 +1326,6 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
         HalfPtr3      w_forget,
         MutPtr3       out,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     constexpr int BM  = 64;
     constexpr int BN  = 64;
     constexpr int K   = LOOP_GATE_RANK; // 64
@@ -1418,11 +1395,11 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
     };
     #pragma unroll
     for (int kc = 0; kc < 4; ++kc) {
-        const half16_t af = lds_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16]);
+        const wmma_hfrag_t af = nib_lds_wmma_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16], half_w);
         #pragma unroll
         for (int f = 0; f < 2; ++f) {
-            const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
-            acc_g[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc_g[f]);
+            const wmma_hfrag_t bf = nib_lds_wmma_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16], half_w);
+            acc_g[f] = nib_wmma_f32_16x16x16_f16(af, bf, acc_g[f]);
         }
     }
     __syncthreads();
@@ -1444,11 +1421,11 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
     };
     #pragma unroll
     for (int kc = 0; kc < 4; ++kc) {
-        const half16_t af = lds_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16]);
+        const wmma_hfrag_t af = nib_lds_wmma_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16], half_w);
         #pragma unroll
         for (int f = 0; f < 2; ++f) {
-            const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
-            acc_f[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc_f[f]);
+            const wmma_hfrag_t bf = nib_lds_wmma_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16], half_w);
+            acc_f[f] = nib_wmma_f32_16x16x16_f16(af, bf, acc_f[f]);
         }
     }
 
@@ -1459,7 +1436,7 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
         if (c < N_EMBD) {
             #pragma unroll
             for (int idx = 0; idx < 8; ++idx) {
-                const int t = t0 + wm * 16 + 2 * idx + half_w;
+                const int t = t0 + wm * 16 + nib_wmma_c_row(half_w, idx);
                 if (t < n_tokens) {
                     const float gain   = tanhf(acc_g[f][idx]);
                     const float forget = tanhf(acc_f[f][idx]);
@@ -1471,9 +1448,6 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
             }
         }
     }
-#else
-    (void)cur; (void)msg_base; (void)gate; (void)w_gain; (void)w_forget; (void)out; (void)n_tokens;
-#endif
 }
 
 // Batched 3-way RMSNorm (in-place safe) for prefill QKV loop controllers
@@ -3067,7 +3041,6 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
         int32_t      * __restrict__ topk_ids_out,
         float        * __restrict__ topk_w_out,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     static_assert(BM == 16 || BM == 32, "BM must be 16 or 32");
     constexpr int BK     = 32;
     constexpr int LDK    = BK + 8; // 40 halves (80 B -> 16B aligned)
@@ -3131,11 +3104,11 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
 
         #pragma unroll
         for (int kc = 0; kc < 2; ++kc) {
-            const half16_t af  = lds_frag(&smem.gemm.a[(wm * 16 + l16) * LDK + kc * 16]);
-            const half16_t bf0 = lds_frag(&smem.gemm.b[(wn * 32 +      l16) * LDK + kc * 16]);
-            acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf0, acc0);
-            const half16_t bf1 = lds_frag(&smem.gemm.b[(wn * 32 + 16 + l16) * LDK + kc * 16]);
-            acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf1, acc1);
+            const wmma_hfrag_t af  = nib_lds_wmma_frag(&smem.gemm.a[(wm * 16 + l16) * LDK + kc * 16], half_w);
+            const wmma_hfrag_t bf0 = nib_lds_wmma_frag(&smem.gemm.b[(wn * 32 +      l16) * LDK + kc * 16], half_w);
+            acc0 = nib_wmma_f32_16x16x16_f16(af, bf0, acc0);
+            const wmma_hfrag_t bf1 = nib_lds_wmma_frag(&smem.gemm.b[(wn * 32 + 16 + l16) * LDK + kc * 16], half_w);
+            acc1 = nib_wmma_f32_16x16x16_f16(af, bf1, acc1);
         }
         __syncthreads();
     }
@@ -3144,7 +3117,7 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
     const int e1 = e0 + 16;
     #pragma unroll
     for (int idx = 0; idx < 8; ++idx) {
-        const int t_loc = wm * 16 + 2 * idx + half_w;
+        const int t_loc = wm * 16 + nib_wmma_c_row(half_w, idx);
         smem.topk.p[t_loc][e0] = 1.0f / (1.0f + expf(-acc0[idx]));
         smem.topk.p[t_loc][e1] = 1.0f / (1.0f + expf(-acc1[idx]));
     }
@@ -3159,9 +3132,6 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
                                   lane);
         }
     }
-#else
-    (void)x_norm; (void)router_w; (void)exp_probs_b; (void)topk_ids_out; (void)topk_w_out; (void)n_tokens;
-#endif
 }
 
 // ============================================================================

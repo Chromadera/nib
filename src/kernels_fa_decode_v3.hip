@@ -112,17 +112,11 @@ static __device__ __forceinline__ void v3_fwht128_4(
 }
 
 static __device__ __forceinline__ void v3_gl_fence_release() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 static __device__ __forceinline__ void v3_gl_invalidate() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 // ============================================================================
@@ -1282,17 +1276,11 @@ struct V3QkvSeg {
 };
 
 static __device__ __forceinline__ void v3_rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 static __device__ __forceinline__ void v3_rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 static __device__ __forceinline__ int v3_scratch_add(float * scratch, int slot) {

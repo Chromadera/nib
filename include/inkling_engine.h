@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "nib_arch.h"
+
 namespace inkling {
 
 // ============================================================================

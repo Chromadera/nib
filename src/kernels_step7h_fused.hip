@@ -236,17 +236,11 @@ __device__ __forceinline__ float sconv_post_res_one(const SconvEpi & e, int r, f
 // gfx1100 memory ordering + self-resetting cooperative counters
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ void rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 __device__ __forceinline__ void rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 __device__ __forceinline__ int scratch_add(float * scratch, int slot) {
@@ -1778,7 +1772,8 @@ void launch_mix_ffn_norm_router_topk_decode_v3(
     if (n_states <= 0) {
         return;
     }
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ffn_norm_router_topk_v3_kernel, 192, 128, 6)) {
         launch_mix_ffn_norm_router_topk_decode(res_query, states, n_states, ffn_norm_w,
                                                router_w, exp_probs_b, x_norm_out,
                                                topk_ids_out, topk_w_out, router_scratch, stream);
@@ -1813,7 +1808,8 @@ void launch_mix_ctrl_ffn_norm_router_topk_decode_v3(
     if (n_states <= 0) {
         return;
     }
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !nib_grid_coresident((const void *)mix_ctrl_ffn_norm_router_topk_v3_kernel, 288, CV3_GRID, 4)) {
         launch_mix_ctrl_down_decode(res_query, states, n_states, msg, w_down,
                                     out_mixed, out_gate, stream);
         launch_ctrl_apply_ffn_norm_router_topk_decode(out_mixed, msg, out_gate,

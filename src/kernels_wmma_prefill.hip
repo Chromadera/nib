@@ -50,8 +50,8 @@ namespace inkling {
 namespace {
 
 typedef int      v4i      __attribute__((ext_vector_type(4)));
-typedef _Float16 half16_t __attribute__((ext_vector_type(16)));
-typedef float    float8_t __attribute__((ext_vector_type(8)));
+typedef nib_wmma_hfrag_t wmma_hfrag_t;
+typedef nib_float8_t     float8_t;
 
 constexpr int BK      = 64;      // K per mainloop step (2 Q8 blocks / 1 NVFP4 block)
 constexpr int LDK_XOR = BK;      // Grouped MoE & dense GEMM XOR-swizzled LDS row stride in halves (128 B, 0 pad)
@@ -68,14 +68,23 @@ __device__ __forceinline__ float situ_scalar(float gate, float up, float beta, f
 // Bank-conflict-free XOR-swizzled LDS fragment load (LDK_XOR = 64 halves = 8 v4i per row).
 // For any kc in 0..3, lanes l16 in 0..15 access subchunk (2*kc + sub) ^ (l16 & 7) across rows,
 // hitting all 32 LDS banks without conflicts while using zero padding bytes.
-__device__ __forceinline__ half16_t lds_frag_xor(const _Float16 * row_ptr, int rlow, int kc) {
+// On RDNA4 (gfx12xx), each half-wave loads only its 8-half K slice (sub = half_w).
+__device__ __forceinline__ wmma_hfrag_t lds_frag_xor(const _Float16 * row_ptr, int rlow, int kc, int half_w) {
     const v4i * d4 = reinterpret_cast<const v4i *>(row_ptr);
+#if NIB_ARCH_RDNA4
+    const v4i a = d4[(2 * kc + half_w) ^ rlow];
+    wmma_hfrag_t r;
+    __builtin_memcpy(&r, &a, 16);
+    return r;
+#else
+    (void)half_w;
     const v4i a = d4[(2 * kc + 0) ^ rlow];
     const v4i b = d4[(2 * kc + 1) ^ rlow];
-    half16_t r;
+    wmma_hfrag_t r;
     __builtin_memcpy(&r, &a, 16);
     __builtin_memcpy(reinterpret_cast<char *>(&r) + 16, &b, 16);
     return r;
+#endif
 }
 
 __device__ __forceinline__ uint32_t bits_of(__half2 h) { return __builtin_bit_cast(uint32_t, h); }
@@ -347,11 +356,12 @@ struct TileGemm {
     }
 
     __device__ __forceinline__ void run(Smem & sm, int K, float8_t (&acc)[FM][FN]) {
-        const int warp = threadIdx.x >> 5;
-        const int lane = threadIdx.x & 31;
-        const int wm   = warp / WARPS_N;
-        const int wn   = warp % WARPS_N;
-        const int l16  = lane & 15;
+        const int warp   = threadIdx.x >> 5;
+        const int lane   = threadIdx.x & 31;
+        const int wm     = warp / WARPS_N;
+        const int wn     = warp % WARPS_N;
+        const int l16    = lane & 15;
+        const int half_w = lane >> 4;
 
 #pragma unroll
         for (int i = 0; i < FM; ++i) {
@@ -369,28 +379,28 @@ struct TileGemm {
             if (kt + 1 < nk) {
                 load((kt + 1) * BK, K); // in flight during the WMMAs below
             }
-            compute(sm, acc, wm, wn, l16);
+            compute(sm, acc, wm, wn, l16, half_w);
             __syncthreads();
         }
     }
 
-    __device__ __forceinline__ void compute(Smem & sm, float8_t (&acc)[FM][FN], int wm, int wn, int l16) {
+    __device__ __forceinline__ void compute(Smem & sm, float8_t (&acc)[FM][FN], int wm, int wn, int l16, int half_w) {
         const int rlow = l16 & 7;
 #pragma unroll
         for (int kc = 0; kc < BK / 16; ++kc) {
             __builtin_amdgcn_sched_barrier(0);
-            half16_t af[FM];
+            wmma_hfrag_t af[FM];
 #pragma unroll
             for (int i = 0; i < FM; ++i) {
-                af[i] = lds_frag_xor(&sm.a[(wm * WTM + i * 16 + l16) * LDK_XOR], rlow, kc);
+                af[i] = lds_frag_xor(&sm.a[(wm * WTM + i * 16 + l16) * LDK_XOR], rlow, kc, half_w);
             }
 #pragma unroll
             for (int j = 0; j < FN; ++j) {
                 __builtin_amdgcn_sched_barrier(0);
-                const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], rlow, kc);
+                const wmma_hfrag_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], rlow, kc, half_w);
 #pragma unroll
                 for (int i = 0; i < FM; ++i) {
-                    acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf, acc[i][j]);
+                    acc[i][j] = nib_wmma_f32_16x16x16_f16(af[i], bf, acc[i][j]);
                 }
             }
         }
@@ -399,7 +409,7 @@ struct TileGemm {
     __device__ __forceinline__ static int out_row(int i, int v) {
         const int warp = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
-        return (warp / WARPS_N) * WTM + i * 16 + 2 * v + (lane >> 4);
+        return (warp / WARPS_N) * WTM + i * 16 + nib_wmma_c_row(lane >> 4, v);
     }
     __device__ __forceinline__ static int out_col(int j) {
         const int warp = threadIdx.x >> 5;
@@ -479,7 +489,7 @@ struct TileGemmMoe {
         return wn * WTN + f * 16;
     }
 
-    __device__ __forceinline__ void compute(Smem & sm, float8_t (&acc)[FM][FN], int wm, int wn, int l16, int m_valid) {
+    __device__ __forceinline__ void compute(Smem & sm, float8_t (&acc)[FM][FN], int wm, int wn, int l16, int half_w, int m_valid) {
         bool live[FM];
         bool any = false;
 #pragma unroll
@@ -494,19 +504,19 @@ struct TileGemmMoe {
 #pragma unroll
         for (int kc = 0; kc < BK / 16; ++kc) {
             __builtin_amdgcn_sched_barrier(0);
-            half16_t af[FM];
+            wmma_hfrag_t af[FM];
 #pragma unroll
             for (int i = 0; i < FM; ++i) {
-                af[i] = lds_frag_xor(&sm.a[(wm * WTM + i * 16 + l16) * LDK_XOR], rlow, kc);
+                af[i] = lds_frag_xor(&sm.a[(wm * WTM + i * 16 + l16) * LDK_XOR], rlow, kc, half_w);
             }
 #pragma unroll
             for (int j = 0; j < FN; ++j) {
                 __builtin_amdgcn_sched_barrier(0);
-                const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], rlow, kc);
+                const wmma_hfrag_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], rlow, kc, half_w);
 #pragma unroll
                 for (int i = 0; i < FM; ++i) {
                     if (FM == 1 || live[i]) {
-                        acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[i], bf, acc[i][j]);
+                        acc[i][j] = nib_wmma_f32_16x16x16_f16(af[i], bf, acc[i][j]);
                     }
                 }
             }
@@ -514,13 +524,14 @@ struct TileGemmMoe {
     }
 
     __device__ __forceinline__ void run_super(Smem & sm, int K, float8_t (&acc)[FM][FN], int m_valid) {
-        const int warp = threadIdx.x >> 5;
-        const int lane = threadIdx.x & 31;
-        const int wm   = warp / WARPS_N;
-        const int wn   = warp % WARPS_N;
-        const int l16  = lane & 15;
-        const int brow = threadIdx.x >> 1;
-        const int bchk = threadIdx.x & 1;
+        const int warp   = threadIdx.x >> 5;
+        const int lane   = threadIdx.x & 31;
+        const int wm     = warp / WARPS_N;
+        const int wn     = warp % WARPS_N;
+        const int l16    = lane & 15;
+        const int half_w = lane >> 4;
+        const int brow   = threadIdx.x >> 1;
+        const int bchk   = threadIdx.x & 1;
 #pragma unroll
         for (int i = 0; i < FM; ++i) {
 #pragma unroll
@@ -553,7 +564,7 @@ struct TileGemmMoe {
                         sr = Fmt::template sload_2l<SU>(s_rowq, s_rows, bchk, (sp + 1) * SU * BK, K);
                     }
                 }
-                compute(sm, acc, wm, wn, l16, m_valid);
+                compute(sm, acc, wm, wn, l16, half_w, m_valid);
                 __syncthreads();
             }
         }
@@ -562,7 +573,7 @@ struct TileGemmMoe {
     __device__ __forceinline__ static int out_row(int i, int v) {
         const int warp = threadIdx.x >> 5;
         const int lane = threadIdx.x & 31;
-        return (warp / WARPS_N) * WTM + i * 16 + 2 * v + (lane >> 4);
+        return (warp / WARPS_N) * WTM + i * 16 + nib_wmma_c_row(lane >> 4, v);
     }
     __device__ __forceinline__ static int out_col(int j) {
         const int warp = threadIdx.x >> 5;

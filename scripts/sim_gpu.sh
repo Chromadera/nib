@@ -26,7 +26,7 @@ SHIM_SO="${ROOT_DIR}/build/libsim_gpu.so"
 
 print_list() {
     cat <<'EOF'
-Supported AMD RDNA3 GPU profiles (all Navi 31 = gfx1100 unless noted):
+Supported AMD RDNA3 / RDNA4 GPU profiles:
 
   Profile     GPU Name                  Arch     CUs  WGPs   VRAM    BW       Recommended Nib Config (Inkling-2-Mini NVFP4, 16.34 GiB weights)
   ----------  ------------------------  -------  ---  ----  ------  --------  -------------------------------------------------------------------
@@ -37,11 +37,16 @@ Supported AMD RDNA3 GPU profiles (all Navi 31 = gfx1100 unless noted):
   7900xt      Radeon RX 7900 XT         gfx1100   84    42  20 GiB  800 GB/s  -c 262848 --kv-type q4_1 --sparse-pages 224 (~18.8 GiB) OR -c 131072 --kv-type q8_0 --sparse-pages 224 --mtp (~19.4 GiB)
   7900gre     Radeon RX 7900 GRE        gfx1100   80    40  16 GiB  576 GB/s  Weights (16.34 GiB) exceed 16 GiB VRAM — needs smaller quant or host offload
   7800xt      Radeon RX 7800 XT (ref)   gfx1101   60    30  16 GiB  624 GB/s  CU/VRAM stress test only (requires gfx1101 build + smaller quant)
+  r9700       Radeon AI PRO R9700       gfx1201   64    32  32 GiB  640 GB/s  -c 262848 --slots 4 --kv-type q8_0 --sparse-pages 224 --mtp --mmproj (build with -DGPU_TARGET=gfx1201 for native RDNA4)
+  9070xt      Radeon RX 9070 XT         gfx1201   64    32  16 GiB  640 GB/s  Weights (16.34 GiB) exceed 16 GiB VRAM — native gfx1201 kernel tests / smaller quant
+  9070        Radeon RX 9070            gfx1201   56    28  16 GiB  640 GB/s  Weights (16.34 GiB) exceed 16 GiB VRAM — native gfx1201 kernel tests / smaller quant
+  9060xt      Radeon RX 9060 XT 16GB    gfx1200   32    16  16 GiB  320 GB/s  CU/WGP co-residency stress test (build with -DGPU_TARGET=gfx1200 for native RDNA4)
 
 Notes:
-  * Host XTX has 24 GiB physical VRAM: profiles >24 GiB (w7900, w7800, w7800-48) accurately simulate
+  * Host XTX has 24 GiB physical VRAM: profiles >24 GiB (w7900, w7800, w7800-48, r9700) accurately simulate
     CU masking, WGP count, and bandwidth scaling, while physical allocations still cannot exceed 24 GiB.
-  * Profiles <=24 GiB (7900xt, 7900gre, 7800xt) enforce a real hipMalloc OOM cap (default reserve: 350 MiB).
+  * Profiles <=24 GiB (7900xt, 7900gre, 7800xt, 9070xt, 9070, 9060xt) enforce a real hipMalloc OOM cap (default reserve: 350 MiB).
+  * RDNA4 profiles simulate WGP count, VRAM, and bandwidth on host RDNA3 hardware; for real RDNA4 ISA execution, build with -DGPU_TARGET=gfx1201 (or gfx1200).
   * Override desktop reserve with --reserve <MiB> (use 0 for headless server simulation).
 EOF
 }
@@ -125,6 +130,22 @@ else
         7800xt)
             GPU_NAME="AMD Radeon RX 7800 XT (sim)"
             CUS=60; VRAM_GIB=16; BW_GBS=624
+            ;;
+        r9700|pro-r9700)
+            GPU_NAME="AMD Radeon AI PRO R9700 (sim)"
+            CUS=64; VRAM_GIB=32; BW_GBS=640
+            ;;
+        9070xt)
+            GPU_NAME="AMD Radeon RX 9070 XT (sim)"
+            CUS=64; VRAM_GIB=16; BW_GBS=640
+            ;;
+        9070)
+            GPU_NAME="AMD Radeon RX 9070 (sim)"
+            CUS=56; VRAM_GIB=16; BW_GBS=640
+            ;;
+        9060xt)
+            GPU_NAME="AMD Radeon RX 9060 XT (sim)"
+            CUS=32; VRAM_GIB=16; BW_GBS=320
             ;;
         *)
             echo "Unknown GPU profile: '$PROFILE'. Run '$0 --list' to see available profiles." >&2

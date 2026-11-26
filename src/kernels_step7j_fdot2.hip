@@ -24,9 +24,9 @@
 // reproduced here exactly.
 // ============================================================================
 #include "kernels_step7j_fdot2.h"
+#include "kernels_decode_fused.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstdlib>
 
 namespace inkling {
@@ -183,17 +183,11 @@ __device__ __forceinline__ void lds_fill_h2(__half2 * dst, const float4 * __rest
 
 // ---- gfx1100 memory ordering + self-resetting cooperative barrier ----------
 __device__ __forceinline__ void rdna3_flush_stores() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 __device__ __forceinline__ void rdna3_inv_l0_l1() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 __device__ __forceinline__ int scratch_add(float * scratch, int slot) {
@@ -505,8 +499,8 @@ __device__ __forceinline__ void moe_nvfp4_fdot2_body(
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-// GRID = 288: 3 blocks/CU pinned to 72 VGPR (6 waves/SIMD), LDS 6.3 KB.
-__global__ void __launch_bounds__(256) __attribute__((amdgpu_num_vgpr(72)))
+// GRID = 288: 3 blocks/CU pinned to 72 VGPR (6 waves/SIMD) on RDNA3, LDS 6.3 KB.
+__global__ void __launch_bounds__(256) NIB_RDNA3_VGPR_CAP(72)
 moe_nvfp4_fdot2_fused288_kernel(
     const uint8_t * __restrict__ gu_qs, const uint8_t * __restrict__ gu_sc,
     const float * __restrict__ gu_s2, const int32_t * __restrict__ topk_ids,
@@ -1521,6 +1515,12 @@ void launch_moe_nvfp4_fdot2_fused(
     const float * post_conv_w, float * post_sconv_h, const float * post_res_add,
     float * scratch) {
     check_moe_nvfp4_j(gate_up, down);
+    if (scratch == nullptr ||
+        !nib_grid_coresident((const void *)moe_nvfp4_fdot2_fused192_kernel, 256, 192, 5)) {
+        launch_moe_nvfp4_fdot2_split(gate_up, down, x_norm, topk_ids, topk_w,
+                                     tmp_act, out, stream, post_conv_w, post_sconv_h, post_res_add);
+        return;
+    }
     moe_nvfp4_fdot2_fused192_kernel<<<192, 256, 0, stream>>>(
         gate_up.qs, gate_up.scales, gate_up.scale2, topk_ids, topk_w, x_norm,
         down.qs, down.scales, down.scale2, tmp_act, out,
@@ -1534,6 +1534,12 @@ void launch_moe_nvfp4_fdot2_fused288(
     const float * post_conv_w, float * post_sconv_h, const float * post_res_add,
     float * scratch) {
     check_moe_nvfp4_j(gate_up, down);
+    if (scratch == nullptr ||
+        !nib_grid_coresident((const void *)moe_nvfp4_fdot2_fused288_kernel, 256, 288, 6)) {
+        launch_moe_nvfp4_fdot2_fused(gate_up, down, x_norm, topk_ids, topk_w,
+                                     tmp_act, out, stream, post_conv_w, post_sconv_h, post_res_add, scratch);
+        return;
+    }
     moe_nvfp4_fdot2_fused288_kernel<<<288, 256, 0, stream>>>(
         gate_up.qs, gate_up.scales, gate_up.scale2, topk_ids, topk_w, x_norm,
         down.qs, down.scales, down.scale2, tmp_act, out,
@@ -1560,6 +1566,12 @@ void launch_moe_q8_fdot2_fused(
     const float * post_conv_w, float * post_sconv_h, const float * post_res_add,
     float * scratch) {
     check_moe_q8_j(gate_up, down);
+    if (scratch == nullptr ||
+        !nib_grid_coresident((const void *)moe_q8_fdot2_fused_kernel, 256, 192, 5)) {
+        launch_moe_q8_decode(gate_up, down, x_norm, topk_ids, topk_w,
+                             tmp_act, out, stream, post_conv_w, post_sconv_h, post_res_add);
+        return;
+    }
     moe_q8_fdot2_fused_kernel<<<192, 256, 0, stream>>>(
         gate_up.qs, gate_up.d, x_norm, topk_ids, topk_w,
         down.qs, down.d, tmp_act, out,
@@ -1602,24 +1614,33 @@ void launch_qkv_qkvr_prep_fdot2(
         s[i].rows = 0;
         s[i].blk_end = 0x7FFFFFFF;
     }
-    if (variant == 1) {
+    if (variant == 1 &&
+        nib_grid_coresident((const void *)qkv_qkvr_prep_fdot2_kernel<8, 288>, 256, 288, 6)) {
         (void) partition_segments_j<32>(s, nseg, 288, 288);
         qkv_qkvr_prep_fdot2_kernel<8, 288><<<288, 256, 0, stream>>>(
             s[0], s[1], s[2], q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
             k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
             sconv_hist_kv, kv_slot, q_out, rel_table_out, apply_tau, d_meta, scratch);
-    } else if (variant == 2 && g_occ_qkv4 >= 4) {
+    } else if (variant == 2 && g_occ_qkv4 >= 4 &&
+               nib_grid_coresident((const void *)qkv_qkvr_prep_fdot2_kernel<8, 384>, 256, 384, 8)) {
         (void) partition_segments_j<32>(s, nseg, 384, 384);
         qkv_qkvr_prep_fdot2_kernel<8, 384><<<384, 256, 0, stream>>>(
             s[0], s[1], s[2], q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
             k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
             sconv_hist_kv, kv_slot, q_out, rel_table_out, apply_tau, d_meta, scratch);
-    } else {
+    } else if (nib_grid_coresident((const void *)qkv_qkvr_prep_fdot2_kernel<4, 288>, 128, 288, 7)) {
         (void) partition_segments_j<16>(s, nseg, 288, 288);
         qkv_qkvr_prep_fdot2_kernel<4, 288><<<288, 128, 0, stream>>>(
             s[0], s[1], s[2], q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
             k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
             sconv_hist_kv, kv_slot, q_out, rel_table_out, apply_tau, d_meta, scratch);
+    } else {
+        launch_qkv_qkvr_prep_fused_decode_g(
+            W0, x0, y0, W1, x1, y1, W2, x2, y2,
+            q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
+            k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
+            sconv_hist_kv, kv_slot, q_out, rel_table_out,
+            apply_tau, d_meta, scratch, stream, 192);
     }
 }
 

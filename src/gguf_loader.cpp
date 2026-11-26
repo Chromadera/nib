@@ -758,9 +758,10 @@ bool load_inkling_gguf(
         for (int i = 0; i < N_LAYER_PHYS; ++i) {
             PhysLayerWeights & L = out_weights.layers[i];
             L.is_swa    = is_swa_phys(i);
-            L.is_nvfp4  = (i <= NVFP4_MAX_LAYER);
 
             const std::string p = "blk." + std::to_string(i) + ".";
+            const TensorInfo & tgu_probe = require(tensors, p + "ffn_gate_up_exps.weight");
+            L.is_nvfp4  = (tgu_probe.type == GGML_T_NVFP4);
 
             // ---- attention projections ------------------------------------
             const TensorInfo & tq    = require(tensors, p + "attn_q.weight");

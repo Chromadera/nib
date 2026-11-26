@@ -33,7 +33,7 @@ static __device__ __forceinline__ __half2 v2_h2_of(uint32_t u) {
 
 // int8 x4 -> two packed __half2 through v_perm_b32 + v_pk_sub_f16 (no cvt).
 static __device__ __forceinline__ void v2_i8x4_to_h2x2(uint32_t w, __half2 & h01, __half2 & h23) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_ARCH_RDNA
     const uint32_t u = w ^ 0x80808080u;
     h01 = __hsub2(v2_h2_of(__builtin_amdgcn_perm(0x64646464u, u, 0x04010400u)), v2_h2_of(0x64806480u));
     h23 = __hsub2(v2_h2_of(__builtin_amdgcn_perm(0x64646464u, u, 0x04030402u)), v2_h2_of(0x64806480u));
@@ -48,7 +48,7 @@ static __device__ __forceinline__ void v2_i8x4_to_h2x2(uint32_t w, __half2 & h01
 // 4 unsigned nibbles -> two packed __half2 (q4_0 additionally subtracts 8).
 template <bool SIGNED_Q4_0>
 static __device__ __forceinline__ void v2_u4x4_to_h2x2(uint32_t nibs, __half2 & h01, __half2 & h23) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_ARCH_RDNA
     constexpr uint32_t BIAS_H2 = SIGNED_Q4_0 ? 0x64086408u : 0x64006400u;
     h01 = __hsub2(v2_h2_of(__builtin_amdgcn_perm(0x64646464u, nibs, 0x04010400u)), v2_h2_of(BIAS_H2));
     h23 = __hsub2(v2_h2_of(__builtin_amdgcn_perm(0x64646464u, nibs, 0x04030402u)), v2_h2_of(BIAS_H2));
@@ -81,20 +81,14 @@ static __device__ __forceinline__ void v2_fwht128_4(
     v0 = r[0]; v1 = r[1]; v2 = r[2]; v3 = r[3];
 }
 
-// RDNA3 GL1 coherence hardening for the self-resetting arrival counters
+// RDNA3/RDNA4 cache coherence hardening for the self-resetting arrival counters
 // (identical sequence to every other cooperative barrier in this engine).
 static __device__ __forceinline__ void v2_gl_fence_release() {
-    __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+    nib_flush_stores();
 }
 
 static __device__ __forceinline__ void v2_gl_invalidate() {
-    __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+    nib_inv_l0_l1();
 }
 
 // ============================================================================

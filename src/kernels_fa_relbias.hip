@@ -20,7 +20,7 @@ typedef uint32_t v4u __attribute__((ext_vector_type(4)));
 }
 
 static __device__ __forceinline__ void i8x4_to_h2x2(uint32_t w, __half2 & h01, __half2 & h23) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_ARCH_RDNA
     const uint32_t u = w ^ 0x80808080u;
     h01 = __hsub2(h2_of(__builtin_amdgcn_perm(0x64646464u, u, 0x04010400u)), h2_of(0x64806480u));
     h23 = __hsub2(h2_of(__builtin_amdgcn_perm(0x64646464u, u, 0x04030402u)), h2_of(0x64806480u));
@@ -36,7 +36,7 @@ static __device__ __forceinline__ void i8x4_to_h2x2(uint32_t w, __half2 & h01, _
 
 template <bool SIGNED_Q4_0>
 static __device__ __forceinline__ void u4x4_to_h2x2(uint32_t nibs, __half2 & h01, __half2 & h23) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_ARCH_RDNA
     constexpr uint32_t BIAS_H2 = SIGNED_Q4_0 ? 0x64086408u : 0x64006400u;
     h01 = __hsub2(h2_of(__builtin_amdgcn_perm(0x64646464u, nibs, 0x04010400u)), h2_of(BIAS_H2));
     h23 = __hsub2(h2_of(__builtin_amdgcn_perm(0x64646464u, nibs, 0x04030402u)), h2_of(BIAS_H2));
@@ -666,16 +666,10 @@ static __global__ void inkling_fa_decode_kernel(
 
     // In-kernel self-resetting atomic combine (when fa_done != nullptr && n_splits > 1 && n_tokens == 1)
     if (fa_done != nullptr && n_splits > 1 && n_tokens == 1) {
-        __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-        asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+        nib_flush_stores();
         __syncthreads();
         if (warp == 0 && lane == 0) {
-            __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
+            nib_flush_stores();
             const int prev = __hip_atomic_fetch_add(
                 &fa_done[grp_id], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
             s_is_last = (prev == n_splits - 1) ? 1 : 0;
@@ -683,10 +677,7 @@ static __global__ void inkling_fa_decode_kernel(
         __syncthreads();
 
         if (s_is_last) {
-            __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
-#endif
+            nib_inv_l0_l1();
             if (warp == 0 && lane == 0) {
                 __hip_atomic_store(&fa_done[grp_id], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
             }
@@ -1025,9 +1016,8 @@ static __global__ void inkling_fa_decode_combine_kernel(
 //   - Global interior causal fast-path (skips k_pos, min/max, valid_bits & far RelBias!)
 //   - Pure log2-domain online softmax (fast_exp2f -> 1-cycle v_exp_f32) + conditional O rescale
 // ============================================================================
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-using halfx16_t = __attribute__((ext_vector_type(16))) _Float16;
-using floatx8_t = __attribute__((ext_vector_type(8)))  float;
+using wmma_hfrag_t = nib_wmma_hfrag_t;
+using floatx8_t    = nib_float8_t;
 
 // Materialize WMMA accumulators in VGPRs at this program point (zero instructions emitted).
 // The K*Q^T WMMAs are pure arithmetic, so nothing ties them to the inline-asm s_barrier that
@@ -1054,33 +1044,6 @@ template <int MASK>
 static __device__ __forceinline__ int shfl_xor_swz(int v) {
     static_assert(MASK > 0 && MASK < 32, "ds_swizzle BitMode xor_mask is 5 bits");
     return __builtin_amdgcn_ds_swizzle(v, (MASK << 10) | 0x1F);
-}
-
-static __device__ __forceinline__ halfx16_t load_halfx16_b128(const _Float16 * ptr) {
-    const uint4 v0 = *(const uint4 *)(ptr + 0);
-    const uint4 v1 = *(const uint4 *)(ptr + 8);
-    halfx16_t res;
-    memcpy(&res, &v0, 16);
-    memcpy(((char *)&res) + 16, &v1, 16);
-    return res;
-}
-
-static __device__ __forceinline__ halfx16_t pack_p_frag_rdna3(const floatx8_t & p, const int half_w) {
-    const uint32_t perm0 = (half_w == 0) ? 0x05040100u : 0x01000504u;
-    const uint32_t perm1 = (half_w == 0) ? 0x07060302u : 0x03020706u;
-    union {
-        halfx16_t h16;
-        uint32_t  u[8];
-    } res;
-    #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-        const half2 m = __floats2half2_rn(p[2 * t], p[2 * t + 1]);
-        const uint32_t mu = __builtin_bit_cast(uint32_t, m);
-        const uint32_t ou = __shfl_xor(mu, 16, 32);
-        res.u[2 * t + 0] = __builtin_amdgcn_perm(ou, mu, perm0);
-        res.u[2 * t + 1] = __builtin_amdgcn_perm(ou, mu, perm1);
-    }
-    return res.h16;
 }
 
 static __device__ __forceinline__ uint32_t bits_of(__half2 h) {
@@ -1203,12 +1166,12 @@ static __device__ __forceinline__ void warp_transpose_4keys_write_v(
 }
 
 template <int STRIDE_V, bool SWIZ_V>
-static __device__ __forceinline__ halfx16_t load_vt_halfx16(
-        const _Float16 tile_V_T[][STRIDE_V], int c_blk, int nk, int l_qlocal) {
+static __device__ __forceinline__ wmma_hfrag_t load_vt_wmma_frag(
+        const _Float16 tile_V_T[][STRIDE_V], int c_blk, int nk, int l_qlocal, int l_halfw) {
     const int d_row = c_blk * 16 + l_qlocal;
     if constexpr (SWIZ_V) {
         const int col = (nk ^ ((d_row >> 1) & 1)) * 16;
-        return load_halfx16_b128(&tile_V_T[d_row][col]);
+        return nib_lds_wmma_frag(&tile_V_T[d_row][col], l_halfw);
     } else {
         const int half_hi = (l_qlocal >> 3) & 1;
         const int c0_0 = ((2 * nk + 2 * c_blk + 0) % 7) * 8;
@@ -1217,15 +1180,22 @@ static __device__ __forceinline__ halfx16_t load_vt_halfx16(
         const int c1_1 = ((2 * nk + 1 + 2 * c_blk + 1) % 7) * 8;
         const int col0 = half_hi ? c0_1 : c0_0;
         const int col1 = half_hi ? c1_1 : c1_0;
+#if NIB_ARCH_RDNA4
+        const int col = l_halfw ? col1 : col0;
+        const uint4 v = *(const uint4 *)(&tile_V_T[d_row][col]);
+        wmma_hfrag_t res;
+        __builtin_memcpy(&res, &v, 16);
+        return res;
+#else
         const uint4 v0 = *(const uint4 *)(&tile_V_T[d_row][col0]);
         const uint4 v1 = *(const uint4 *)(&tile_V_T[d_row][col1]);
-        halfx16_t res;
-        memcpy(&res, &v0, 16);
-        memcpy(((char *)&res) + 16, &v1, 16);
+        wmma_hfrag_t res;
+        __builtin_memcpy(&res, &v0, 16);
+        __builtin_memcpy(((char *)&res) + 16, &v1, 16);
         return res;
+#endif
     }
 }
-#endif // gfx1100..gfx1103
 
 template <int NWARPS, int BC, bool IS_SWA, int KV_FMT>
 __launch_bounds__(NWARPS * 32) __attribute__((amdgpu_waves_per_eu((NWARPS == 6) ? 9 : 7, 12)))
@@ -1244,7 +1214,6 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         int                        pos_start,
         int                        n_kv,
         int                        split_k) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     static_assert(NWARPS % GQA_RATIO == 0, "NWARPS must be a multiple of GQA_RATIO=3");
     static_assert(BC == 32 || BC == 48 || BC == 64, "BC must be 32, 48, or 64");
 
@@ -1278,8 +1247,8 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
 
     // Hybrid Q storage + shared K/V_T union:
     // Chunks c=0..1 (dims 0..31) stored in LDS (smem.Q_lo[warp][16][32]).
-    // Chunks c=2..4 held in Q_reg[0..2] on half_w==0 (lanes 0..15).
-    // Chunks c=5..7 held in Q_reg[0..2] on half_w==1 (lanes 16..31).
+    // RDNA3: Q_reg[3] (24 VGPRs): c=2..4 on half_w==0, c=5..7 on half_w==1 (broadcast via __shfl).
+    // RDNA4: Q_reg[6] (24 VGPRs): each lane directly holds its half (8 halves) of c=2..7 (ZERO __shfl!).
     struct KVShared {
         alignas(16) _Float16 Q_lo[NWARPS][16][32];
         union {
@@ -1293,7 +1262,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
     __shared__ int32_t tile_max_kp;
     __shared__ int32_t tile_skip;
 
-    halfx16_t Q_reg[3];
+#if NIB_ARCH_RDNA4
+    wmma_hfrag_t Q_reg[6];
+#else
+    wmma_hfrag_t Q_reg[3];
+#endif
     if (q_val) {
         const int qi_init = qp_val - pos_start;
         const int h_init  = h_kv * GQA_RATIO + g;
@@ -1315,6 +1288,20 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             *reinterpret_cast<uint4 *>(&smem.Q_lo[warp][q_local][col_swiz + 8]) =
                 make_uint4(qh2[4], qh2[5], qh2[6], qh2[7]);
         }
+#if NIB_ARCH_RDNA4
+        const float * q_hi = q_ptr + 32 + half_w * 8;
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            #pragma unroll
+            for (int k = 0; k < 2; ++k) {
+                const float4 fv = *(const float4 *)(q_hi + c * 16 + k * 4);
+                Q_reg[c][k * 4 + 0] = (_Float16)(fv.x * Q_SCALE_LOG2);
+                Q_reg[c][k * 4 + 1] = (_Float16)(fv.y * Q_SCALE_LOG2);
+                Q_reg[c][k * 4 + 2] = (_Float16)(fv.z * Q_SCALE_LOG2);
+                Q_reg[c][k * 4 + 3] = (_Float16)(fv.w * Q_SCALE_LOG2);
+            }
+        }
+#else
         const float * q_hi = q_ptr + (2 + half_w * 3) * 16;
         #pragma unroll
         for (int c = 0; c < 3; ++c) {
@@ -1327,10 +1314,20 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 Q_reg[c][k * 4 + 3] = (_Float16)(fv.w * Q_SCALE_LOG2);
             }
         }
+#endif
     } else {
         const int col_swiz = (half_w ^ ((q_local >> 1) & 1)) * 16;
         *reinterpret_cast<uint4 *>(&smem.Q_lo[warp][q_local][col_swiz + 0]) = make_uint4(0, 0, 0, 0);
         *reinterpret_cast<uint4 *>(&smem.Q_lo[warp][q_local][col_swiz + 8]) = make_uint4(0, 0, 0, 0);
+#if NIB_ARCH_RDNA4
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                Q_reg[c][k] = (_Float16)0.0f;
+            }
+        }
+#else
         #pragma unroll
         for (int c = 0; c < 3; ++c) {
             #pragma unroll
@@ -1338,6 +1335,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 Q_reg[c][k] = (_Float16)0.0f;
             }
         }
+#endif
     }
 
     floatx8_t O_acc[8];
@@ -1416,11 +1414,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                     tile_skip = skip ? 1 : 0;
                 }
             }
-            asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+            nib_wait_lds_barrier();
             const int32_t do_skip = tile_skip;
             if (do_skip != 0) {
                 // Ensure all warps finish reading tile_skip before warp 0 overwrites it on t+1!
-                asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+                nib_wait_lds_barrier();
                 continue;
             }
         }
@@ -1514,7 +1512,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_wait_lds_barrier();
 
         // Hardware WMMA: S[nk] = K[nk*16 .. nk*16+15] * Q^T with 2-stage K double-buffering
         floatx8_t S[NK16];
@@ -1523,21 +1521,24 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             S[nk] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         }
 
-        halfx16_t kv_buf[2];
-        kv_buf[0] = load_halfx16_b128(&smem.K[l_qlocal][0]);
+        wmma_hfrag_t kv_buf[2];
+        kv_buf[0] = nib_lds_wmma_frag(&smem.K[l_qlocal][0], l_halfw);
 
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const int d_off = c * 16;
-            halfx16_t Qc;
+            wmma_hfrag_t Qc;
             if (c < 2) {
-                Qc = load_halfx16_b128(&smem.Q_lo[warp][l_qlocal][(c ^ ((l_qlocal >> 1) & 1)) * 16]);
+                Qc = nib_lds_wmma_frag(&smem.Q_lo[warp][l_qlocal][(c ^ ((l_qlocal >> 1) & 1)) * 16], l_halfw);
             } else {
+#if NIB_ARCH_RDNA4
+                Qc = Q_reg[c - 2];
+#else
                 const int src_lane = (c < 5) ? l_qlocal : (l_qlocal + 16);
                 const int reg_idx  = (c < 5) ? (c - 2) : (c - 5);
                 union {
-                    halfx16_t h16;
-                    uint32_t  u[8];
+                    wmma_hfrag_t h16;
+                    uint32_t     u[8];
                 } q_src, q_bcast;
                 q_src.h16 = Q_reg[reg_idx];
                 #pragma unroll
@@ -1545,22 +1546,23 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                     q_bcast.u[w] = __shfl(q_src.u[w], src_lane, 32);
                 }
                 Qc = q_bcast.h16;
+#endif
             }
             #pragma unroll
             for (int nk = 0; nk < NK16; ++nk) {
                 const int cur_b = (c * NK16 + nk) & 1;
                 const int nxt_b = cur_b ^ 1;
                 if (nk + 1 < NK16) {
-                    kv_buf[nxt_b] = load_halfx16_b128(&smem.K[(nk + 1) * 16 + l_qlocal][d_off]);
+                    kv_buf[nxt_b] = nib_lds_wmma_frag(&smem.K[(nk + 1) * 16 + l_qlocal][d_off], l_halfw);
                 } else if (c + 1 < 8) {
-                    kv_buf[nxt_b] = load_halfx16_b128(&smem.K[l_qlocal][(c + 1) * 16]);
+                    kv_buf[nxt_b] = nib_lds_wmma_frag(&smem.K[l_qlocal][(c + 1) * 16], l_halfw);
                 }
-                S[nk] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kv_buf[cur_b], Qc, S[nk]);
+                S[nk] = nib_wmma_f32_16x16x16_f16(kv_buf[cur_b], Qc, S[nk]);
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
         pin_wmma_acc(S);
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_wait_lds_barrier();
 
         // Cooperatively dequantize & transpose V_T into LDS
         {
@@ -1604,7 +1606,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_wait_lds_barrier();
 
         float m_tile = m_q;
         const bool q_in = (qp_val < q_pos_lim);
@@ -1622,7 +1624,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                     for (int nk = 0; nk < NK16; ++nk) {
                         #pragma unroll
                         for (int idx = 0; idx < 8; ++idx) {
-                            const int32_t dist = qp_val - (kp_base + nk * 16 + 2 * idx + l_halfw);
+                            const int32_t dist = qp_val - (kp_base + nk * 16 + nib_wmma_c_row(l_halfw, idx));
                             if (dist < N_REL_EXTENT) {
                                 S[nk][idx] += rel_row[dist] * LOG2E;
                             }
@@ -1650,7 +1652,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 for (int nk = 0; nk < NK16; ++nk) {
                     #pragma unroll
                     for (int idx = 0; idx < 8; ++idx) {
-                        const int32_t kp = tile_kpos[nk * 16 + 2 * idx + l_halfw];
+                        const int32_t kp = tile_kpos[nk * 16 + nib_wmma_c_row(l_halfw, idx)];
                         if (kp >= 0 && kp <= qp_val && (!IS_SWA || (qp_val - kp) < SWA_WINDOW)) {
                             valid_bits[nk] |= (1u << idx);
                         }
@@ -1671,7 +1673,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                     #pragma unroll
                     for (int idx = 0; idx < 8; ++idx) {
                         if ((valid_bits[nk] >> idx) & 1u) {
-                            const int32_t kp = tile_kpos[nk * 16 + 2 * idx + l_halfw];
+                            const int32_t kp = tile_kpos[nk * 16 + nib_wmma_c_row(l_halfw, idx)];
                             const int32_t dist = qp_val - kp;
                             if (dist >= 0 && dist < N_REL_EXTENT) {
                                 S[nk][idx] += rel_row[dist] * LOG2E;
@@ -1738,25 +1740,25 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         l_q += l_add;
 
         // P * V_T with 2-stage V_T LDS double-buffering (overlaps ds_load_b128 under 32-cycle WMMA!)
-        kv_buf[0] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal);
+        kv_buf[0] = load_vt_wmma_frag<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal, l_halfw);
         #pragma unroll
         for (int nk = 0; nk < NK16; ++nk) {
-            const halfx16_t Pnk = pack_p_frag_rdna3(S[nk], l_halfw);
+            const wmma_hfrag_t Pnk = nib_pack_p_frag(S[nk], l_halfw);
             #pragma unroll
             for (int c = 0; c < 8; ++c) {
                 const int cur_b = (nk * 8 + c) & 1;
                 const int nxt_b = cur_b ^ 1;
                 if (c + 1 < 8) {
-                    kv_buf[nxt_b] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, c + 1, nk, l_qlocal);
+                    kv_buf[nxt_b] = load_vt_wmma_frag<STRIDE_V, SWIZ_V>(smem.V_T, c + 1, nk, l_qlocal, l_halfw);
                 } else if (nk + 1 < NK16) {
-                    kv_buf[nxt_b] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, nk + 1, l_qlocal);
+                    kv_buf[nxt_b] = load_vt_wmma_frag<STRIDE_V, SWIZ_V>(smem.V_T, 0, nk + 1, l_qlocal, l_halfw);
                 }
-                O_acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kv_buf[cur_b], Pnk, O_acc[c]);
+                O_acc[c] = nib_wmma_f32_16x16x16_f16(kv_buf[cur_b], Pnk, O_acc[c]);
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
 
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_wait_lds_barrier();
     }
 
     if (qp_val >= q_pos_lim) {
@@ -1781,7 +1783,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             for (int c = 0; c < 8; ++c) {
                 #pragma unroll
                 for (int idx = 0; idx < 8; ++idx) {
-                    dst[c * 16 + 2 * idx + half_w_e] = O_acc[c][idx];
+                    dst[c * 16 + nib_wmma_c_row(half_w_e, idx)] = O_acc[c][idx];
                 }
             }
         }
@@ -1804,7 +1806,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
     }
 
     // 7-stage in-register FWHT-128 directly in O_acc[8]:
-    // Stage 0 (h = 1, bit 0 = half_w)
+    // The 7 stages apply H_2 across the 7 disjoint bit axes of dim d in [0, 128).
+    // On RDNA3 (d = 16*c + 2*idx + half_w), Stage 0 is bit 0 and Stages 1..3 are bits 1..3.
+    // On RDNA4 (d = 16*c + 8*half_w + idx), Stage 0 is bit 3 and Stages 1..3 are bits 0..2.
+    // Because tensor-product Hadamard stages commute across disjoint bits, the exact same
+    // 7 stages compute FWHT-128 in-place on both architectures!
     #pragma unroll
     for (int c = 0; c < 8; ++c) {
         #pragma unroll
@@ -1814,7 +1820,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             O_acc[c][idx] = (half_w_e == 0) ? (cur + other) : (other - cur);
         }
     }
-    // Stage 1 (h = 2, bit 1 = idx & 1)
+    // Stage 1 (idx & 1)
     #pragma unroll
     for (int c = 0; c < 8; ++c) {
         #pragma unroll
@@ -1823,7 +1829,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             O_acc[c][i] = a + b; O_acc[c][i + 1] = a - b;
         }
     }
-    // Stage 2 (h = 4, bit 2 = (idx >> 1) & 1)
+    // Stage 2 ((idx >> 1) & 1)
     #pragma unroll
     for (int c = 0; c < 8; ++c) {
         #pragma unroll
@@ -1835,7 +1841,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             }
         }
     }
-    // Stage 3 (h = 8, bit 3 = (idx >> 2) & 1)
+    // Stage 3 ((idx >> 2) & 1)
     #pragma unroll
     for (int c = 0; c < 8; ++c) {
         #pragma unroll
@@ -1844,7 +1850,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             O_acc[c][k] = a + b; O_acc[c][k + 4] = a - b;
         }
     }
-    // Stage 4 (h = 16, bit 4 = c & 1)
+    // Stage 4 (bit 4 = c & 1)
     #pragma unroll
     for (int c = 0; c < 8; c += 2) {
         #pragma unroll
@@ -1853,7 +1859,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             O_acc[c][idx] = a + b; O_acc[c + 1][idx] = a - b;
         }
     }
-    // Stage 5 (h = 32, bit 5 = (c >> 1) & 1)
+    // Stage 5 (bit 5 = (c >> 1) & 1)
     #pragma unroll
     for (int c = 0; c < 8; c += 4) {
         #pragma unroll
@@ -1865,7 +1871,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             }
         }
     }
-    // Stage 6 (h = 64, bit 6 = (c >> 2) & 1)
+    // Stage 6 (bit 6 = (c >> 2) & 1)
     #pragma unroll
     for (int k = 0; k < 4; ++k) {
         #pragma unroll
@@ -1882,7 +1888,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         for (int c = 0; c < 8; ++c) {
             #pragma unroll
             for (int idx = 0; idx < 8; ++idx) {
-                const int d = c * 16 + 2 * idx + half_w_e;
+                const int d = c * 16 + nib_wmma_c_row(half_w_e, idx);
                 const float g_val = gate_ptr[d];
                 dst_ptr[d] = O_acc[c][idx] * (1.0f / (1.0f + fast_exp2f(-g_val * LOG2E)));
             }
@@ -1892,16 +1898,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         for (int c = 0; c < 8; ++c) {
             #pragma unroll
             for (int idx = 0; idx < 8; ++idx) {
-                dst_ptr[c * 16 + 2 * idx + half_w_e] = O_acc[c][idx];
+                dst_ptr[c * 16 + nib_wmma_c_row(half_w_e, idx)] = O_acc[c][idx];
             }
         }
     }
     (void)NK16;
-#else
-    (void)q; (void)kv_slot; (void)sinks_in; (void)sinks_stride; (void)rel_table;
-    (void)qgate_in; (void)qgate_stride; (void)out; (void)tmp_o; (void)tmp_meta;
-    (void)n_tokens; (void)pos_start; (void)n_kv; (void)split_k;
-#endif // gfx1100..gfx1103
 }
 
 } // anonymous namespace

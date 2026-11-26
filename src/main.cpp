@@ -113,7 +113,7 @@ static void print_usage(const char * argv0) {
 
 
 // ============================================================================
-// VRAM-aware defaults for tight (< 22 GiB) RDNA3 cards (e.g. 20 GB RX 7900 XT)
+// VRAM-aware defaults for tight (< 22 GiB) RDNA3/RDNA4 cards (e.g. 20 GB RX 7900 XT)
 // ============================================================================
 // On >= 22 GiB GPUs nothing changes except an explicit --cpu-embd.  Below that,
 // and only for flags the user did not pass explicitly:
@@ -161,7 +161,7 @@ static void apply_vram_profile(EngineConfig & cfg, const VramProfileIn & in) {
         return;
     }
     const size_t kTightBelow = (size_t)22 * 1024 * 1024 * 1024;
-    if (dev_total >= kTightBelow) return;   // 24 GB XTX & up: zero behavioural change
+    if (dev_total >= kTightBelow) return;   // 24 GB XTX / 32 GB R9700 & up: zero behavioural change
 
     std::printf("[vram] tight GPU: %.2f GiB total, %.2f GiB free -> VRAM-aware defaults for unset flags\n",
                 (double)dev_total / kGiB, (double)dev_free / kGiB);
@@ -179,6 +179,12 @@ static void apply_vram_profile(EngineConfig & cfg, const VramProfileIn & in) {
         return;
     }
     const size_t tok_embd_b = (size_t)VOCAB_PADDED * N_EMBD + (size_t)VOCAB_PADDED * (N_EMBD / 32) * sizeof(__half);
+    if (model_b > dev_total) {
+        std::printf("[vram]   WARNING: model weights (%.2f GiB) exceed total GPU VRAM (%.2f GiB) — "
+                    "a >=20 GiB GPU (e.g. Radeon AI PRO R9700 32 GB / RX 7900 XT 20 GB / XTX 24 GB) is required "
+                    "for full resident weights.\n",
+                    (double)model_b / kGiB, (double)dev_total / kGiB);
+    }
     const size_t mtp_b      = mtp_on ? file_size_or_zero(in.mtp_path) + (size_t)96 * 1024 * 1024 : 0;
     const size_t vis_w_b    = in.vision_on ? file_size_or_zero(in.mmproj_path) : 0;
     const size_t vis_ws_b   = in.vision_on ? VisionEncoder().estimate_max_encode_bytes() : 0;
@@ -870,16 +876,31 @@ int main(int argc, char ** argv) {
     }
     std::string mode = argv[1];
     if (mode == "--version" || mode == "-V" || mode == "-v" || mode == "version") {
+        const NibDeviceInfo & dev_info = nib_device_info(0);
+        const bool has_gpu = (dev_info.gcn_arch[0] != '\0' && std::strcmp(dev_info.gcn_arch, "unknown") != 0);
         if (std::strcmp(NIB_GIT_SHA, "unknown") != 0 && NIB_GIT_SHA[0] != '\0') {
-            std::printf("nib %s (%s, git %s)\n", NIB_VERSION, NIB_GPU_TARGET, NIB_GIT_SHA);
+            if (has_gpu) {
+                std::printf("nib %s (built: %s, runtime: %s [%s], git %s)\n",
+                            NIB_VERSION, NIB_GPU_TARGET, dev_info.gcn_arch, dev_info.name, NIB_GIT_SHA);
+            } else {
+                std::printf("nib %s (%s, git %s)\n", NIB_VERSION, NIB_GPU_TARGET, NIB_GIT_SHA);
+            }
         } else {
-            std::printf("nib %s (%s)\n", NIB_VERSION, NIB_GPU_TARGET);
+            if (has_gpu) {
+                std::printf("nib %s (built: %s, runtime: %s [%s])\n",
+                            NIB_VERSION, NIB_GPU_TARGET, dev_info.gcn_arch, dev_info.name);
+            } else {
+                std::printf("nib %s (%s)\n", NIB_VERSION, NIB_GPU_TARGET);
+            }
         }
         return 0;
     }
     if (mode == "--help" || mode == "-h" || mode == "help") {
         print_usage(argv[0]);
         return 0;
+    }
+    if (!nib_check_runtime_device(NIB_GPU_TARGET)) {
+        return 1;
     }
     const char * env_model  = std::getenv("NIB_MODEL");
     const char * env_mmproj = std::getenv("NIB_MMPROJ");
@@ -1330,7 +1351,8 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "Need >=2 token IDs in '%s'\n", tokens_path.c_str());
             return 1;
         }
-        if (cfg.max_ctx < (int)toks.size() + 64) cfg.max_ctx = (int)toks.size() + 64;
+        const int min_ctx = (mode == "ppl") ? (512 + 64) : ((int)toks.size() + 64);
+        if (cfg.max_ctx < min_ctx) cfg.max_ctx = min_ctx;
         InklingEngine eng;
         if (!eng.init(model_path, cfg, false)) return 1;
 
