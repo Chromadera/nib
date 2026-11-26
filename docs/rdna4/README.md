@@ -85,12 +85,26 @@ cd ~/nib
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGPU_TARGET=gfx1201
 cmake --build build -j 8
 
-# 1. does the loader + repack + one token work at all
+# 0. static checks, no GPU kernels involved (safe next to a busy GPU)
+./scripts/verify_rdna4.sh
+
+# 1. does the loader + repack + one decode step work at all
 ./build/nib selftest -m models/Inkling-2-Mini-NVFP4-Mixed.gguf
-# 2. prefill correctness (this is where the gfx12 tile math is exercised)
-./build/nib ppl -m models/Inkling-2-Mini-NVFP4-Mixed.gguf -t <token_ids.txt> -c 512
-# 3. short generation
-./build/nib gen -m models/Inkling-2-Mini-NVFP4-Mixed.gguf --prompt-file prompt.txt -n 32 -c 4096
+
+# 2. decode-only generation (exercises the GEMV/MoE/FA-decode path, ~50 tokens)
+./build/nib gen -m models/Inkling-2-Mini-NVFP4-Mixed.gguf \
+    --prompt-file tests/prompts/prose.txt -n 32 -c 4096
+
+# 3. PREFILL gate: a ~2k-token prompt pushes every token through the gfx12 tile
+#    math (dense GEMM, MoE grouped GEMM, prefill FA). If the tile emulation were
+#    wrong the continuation would be obvious garbage / repeated tokens.
+for i in $(seq 40); do cat tests/prompts/prose.txt; done > /tmp/long_prompt.txt
+./build/nib gen -m models/Inkling-2-Mini-NVFP4-Mixed.gguf \
+    --prompt-file /tmp/long_prompt.txt -n 32 -c 8192
+
+# 4. optional: MTP drafter path (verify-batch exercises the m-row fallbacks)
+./build/nib selftest -m models/Inkling-2-Mini-NVFP4-Mixed.gguf \
+    --mtp models/mtp.safetensors --bench-mtp
 ```
 
 There is no `--spill` flag in v0.1.2; spills are audited with
