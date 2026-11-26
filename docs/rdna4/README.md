@@ -281,6 +281,7 @@ low-variance one). Recorded so nobody re-runs them:
 | MoE tile TM=128 (FM=2, 8 accum chains) | 4098 (-6.4%) | per-expert rows average ~160, so a 128-row tile stages 256 rows for 160 of work |
 | MoE tile TM=192 (one CTA, B staged once) | 3599 (-6.2%) | 40 KB LDS drops it to 1 CTA/CU |
 | MoE tile BN=64 (16 KB, 4 CTAs/CU) | -7.7% | occupancy is not the limiter |
+| MoE tile BN=256 (16 warps, 1 CTA/CU) | -4.5% | halves A re-staging but loses occupancy |
 | NVFP4 super-step 8/6 (deeper prefetch) | 4313 (-1.5%) | +18 VGPRs |
 | A/B fragment hoist out of the MMA loop | 4341 (-1.0%) | LDS is no longer the limiter after the 8-half fix |
 | dense `<64,128,4,2>` preferred for M>512 | 4304 (-2.4%) | 128x128 amortises better at M=2560 |
