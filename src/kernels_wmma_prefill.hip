@@ -406,11 +406,20 @@ struct TileGemm {
         for (int kc = 0; kc < BK / 16; ++kc) {
 #pragma unroll
             for (int j = 0; j < FN; ++j) {
+#if NIB_RDNA4
+                const int brow = b_frag_row(wn, j) + l16;
+                const nib_mma::nib_f16x8 bf8 = nib_mma::load8_xor(&sm.b[brow * LDK_XOR], brow & 7, kc, lane);
+#pragma unroll
+                for (int i = 0; i < FM; ++i) {
+                    nib_mma::mma_xor64_hw8(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf8, acc[i][j], lane, kc);
+                }
+#else
                 const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], l16 & 7, kc);
 #pragma unroll
                 for (int i = 0; i < FM; ++i) {
                     nib_mma::mma_xor64(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf, acc[i][j], lane, kc);
                 }
+#endif
             }
         }
 #endif
@@ -539,6 +548,16 @@ struct TileGemmMoe {
         for (int kc = 0; kc < BK / 16; ++kc) {
 #pragma unroll
             for (int j = 0; j < FN; ++j) {
+#if NIB_RDNA4
+                const int brow = b_frag_row(wn, j) + l16;
+                const nib_mma::nib_f16x8 bf8 = nib_mma::load8_xor(&sm.b[brow * LDK_XOR], brow & 7, kc, lane);
+#pragma unroll
+                for (int i = 0; i < FM; ++i) {
+                    if (FM == 1 || live[i]) {
+                        nib_mma::mma_xor64_hw8(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf8, acc[i][j], lane, kc);
+                    }
+                }
+#else
                 const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], l16 & 7, kc);
 #pragma unroll
                 for (int i = 0; i < FM; ++i) {
@@ -546,6 +565,7 @@ struct TileGemmMoe {
                         nib_mma::mma_xor64(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf, acc[i][j], lane, kc);
                     }
                 }
+#endif
             }
         }
 #endif

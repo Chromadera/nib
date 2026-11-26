@@ -194,6 +194,34 @@ static __global__ void nib_mma_gfx12_wmma_set_kernel(int on) { nib_mma_gfx12_wmm
 // so every "WMMA on/off" A/B silently measured the emulation. Tensor cores measured
 // 3.0x (depth 0) and 4.0x (32K) faster with token-identical greedy output.
 static __device__ __forceinline__ bool hw_tile_on() { return true; }
+
+// --- 8-half (16 B) fragment loads -------------------------------------------------
+// V_WMMA_F32_16x16x16_F16 on gfx12 consumes only 8 halves per lane:
+//   a[i] = A[m][k = 8*laneGrp + i],  b[i] = B[k = 8*laneGrp + i][n].
+// A 16-half nib fragment splits exactly along that boundary, so each lane only needs
+// ITS 16 B block: block (2*kc + laneGrp) ^ (row & 7) of the XOR-swizzled row.
+// Loading all 16 halves and calling pick8() reads 32 B per fragment to use 16 B.
+static __device__ __forceinline__ nib_f16x8 load8_xor(
+        const _Float16 * row_ptr, int row_low3, int kc, int lane) {
+    typedef int v4i __attribute__((ext_vector_type(4)));
+    const v4i * d4 = reinterpret_cast<const v4i *>(row_ptr);
+    const v4i a = d4[(2 * kc + (lane >> 4)) ^ row_low3];
+    nib_f16x8 r;
+    __builtin_memcpy(&r, &a, 16);
+    return r;
+}
+
+// mma_xor64_hw with a pre-loaded 8-half B fragment (no pick8, no wasted half-load).
+static __device__ __forceinline__ void mma_xor64_hw8(
+        const _Float16 * a_row0, nib_f16x8 b8, nib_f32x8 & acc, int lane, int kc) {
+    typedef int v4i __attribute__((ext_vector_type(4)));
+    const int row = d_row_perm(lane & 15);
+    const v4i * d4 = reinterpret_cast<const v4i *>(a_row0 + row * NIB_MMA_XOR_ROW);
+    const v4i a = d4[(2 * kc + (lane >> 4)) ^ (row & 7)];
+    nib_f16x8 a8;
+    __builtin_memcpy(&a8, &a, 16);
+    wmma_tile(a8, b8, acc);
+}
 #endif // NIB_RDNA4
 
 // ---------------------------------------------------------------------------
