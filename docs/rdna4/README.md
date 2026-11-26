@@ -57,9 +57,105 @@ in-register FWHT-128, the coalesced stores) is unchanged.
 * `rocminfo` reports `gfx1201`, 64 compute units, `AMD Radeon AI PRO R9700`.
 * gfx12 WMMA exists and assembles: `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`
   emits `v_wmma_f32_16x16x16_f16 v[0:7], v[8:11], v[8:11], 0` (8-half fragments).
-  That is the fast path for a follow-up commit; it is deliberately **not** used
-  yet because its fragment/accumulator layout cannot be validated in this
-  session (no GPU runs allowed).
+  It is now wired up as an opt-in fast path (`NIB_GFX12_WMMA=1`, next section);
+  the v_dot2 emulation stays the default until `nib wmma-selftest` passes on
+  silicon.
+
+## The gfx12 WMMA fast path (`include/nib_mma.h`, opt-in)
+
+The emulation above is correct but slow (64 `v_dot2_f32_f16` + 8 `ds_load_b128` per
+16x16x16 tile per lane). `include/nib_mma.h` now also implements the same tile on
+the RDNA4 tensor core and dispatches to it at run time:
+
+```
+NIB_GFX12_WMMA=1 ./build/nib <mode>      # tensor core
+./build/nib <mode>                       # default: validated v_dot2 emulation
+```
+
+### The instruction and its fragment layout
+
+`nib_f16x8 __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(nib_f16x8 a,
+nib_f16x8 b, nib_f32x8 c)` → `v_wmma_f32_16x16x16_f16`; A/B are 8 halves (4 VGPRs)
+per lane, no RDNA3-style lane duplication, C/D are 8 f32. With `laneCol = lane % 16`
+and `laneGrp = lane / 16`:
+
+```
+A: a[i] = A[m = laneCol][k = 8*laneGrp + i]      (K-major, 8 contiguous K per lane)
+B: b[i] = B[k = 8*laneGrp + i][n = laneCol]      (K-major, 8 contiguous K per lane)
+D: d[i] = D[m = 8*laneGrp + i][n = laneCol]
+```
+
+Sources (all agree): the builtin declaration in
+`/opt/rocm/include/ck/utility/amd_wmma.hpp` + `ck_tile/ops/gemm/warp/` (ROCm 7.2.0),
+AMD GPUOpen *Using the Matrix Cores of AMD RDNA 4 architecture GPUs* (its sample
+kernel loads `a_frag`/`b_frag` and stores `c` with exactly those index formulas,
+verified against hipBLAS), the CK `wmma_gemm.hpp` wave32 lane diagram, and an
+independent R9700 measurement of the D map.
+
+Only D differs from the nib/RDNA3 layout, and it differs by a **row permutation
+inside the tile**, never by cross-lane traffic: hardware keeps D row `8*laneGrp + i`
+in `acc[i]`, nib wants row `2*i + laneGrp`. Feeding the A fragment of hw row `r`
+from nib row
+
+```
+perm(r) = 2*(r % 8) + r / 8     ->  0,2,4,6,8,10,12,14, 1,3,5,7,9,11,13,15
+```
+
+makes the hardware compute `D'[r] = D[perm(r)]`, i.e. `acc[i] = D'[8*laneGrp + i] =
+D[2*i + laneGrp]` — nib's accumulator layout exactly, so **no shuffles and no
+epilogue changes**. B needs no permutation either: a lane group just takes the low
+or the high 8 halves of the 16-half B fragment it already holds.
+
+Cost per tile per lane: `1 ds_load_b128 + 1 v_wmma` (+2 address ops) instead of
+`8 ds_load_b128 + 64 v_dot2 + 8 v_add_f32`.
+
+### Where it is wired in
+
+`nib_mma::mma_stride`, `mma_xor64` and `mma_rows` keep their signatures and their nib
+layout semantics; each is now `_emu` (unchanged emulation) + `_hw` (tensor core, or
+the native gfx11 builtin on RDNA3) + a dispatcher. All 16 tile call sites in
+`kernels_core`, `kernels_vision`, `kernels_fa_relbias`, `kernels_sparse_global` and
+`kernels_wmma_prefill` therefore get the fast path with no source change;
+`kernels_vision`'s patch-embed `dot16` (a single row·col, not a tile) stays on the
+emulation.
+
+The gate is one `__device__ int` flag **per translation unit** (nib links one code
+object per `.hip` file, no `-fgpu-rdc`, so a cross-TU device symbol cannot resolve).
+Each TU registers a setter callback from a static initializer, and
+`nib_mma::apply_gate_appliers()` (called from `InklingEngine::init` and from
+`nib wmma-selftest`) launches that TU's tiny setter kernel once the runtime is up.
+The setter kernel's store is load-bearing: a `static __device__` flag with no
+device-side writer is constant-folded to 0 at -O3 and the whole path disappears
+(measured). With it, the read compiles to one `s_load_b32`, hoisted into a VGPR and
+tested with one `v_cmp`+branch per tile. With `NIB_GFX12_WMMA` unset nothing is
+registered and no GPU call is made.
+
+### Validate it: `nib wmma-selftest`
+
+```bash
+NIB_GFX12_WMMA=1 ./build/nib wmma-selftest
+```
+
+No model needed. Fills 16 random 16x16x16 tiles whose values are *exact* in FP16
+(small integers, so FP32 accumulation is exact too), computes each tile with the
+emulation and with the tensor core from the same LDS staging and the same nib
+fragments (`mma_stride` on a plain tile and `mma_xor64` on the XOR-swizzled layout,
+4 K chunks), and compares them in the nib D layout. Pass looks like
+
+```
+[WMMA] tile selftest: gfx12 (RDNA4)  emulated tile=v_dot2_f32_f16  hardware tile=v_wmma_f32_16x16x16_f16 (gfx12 builtin)  tiles=16
+[WMMA] NIB_GFX12_WMMA gate: 1 (kernels use the tensor-core tile)
+[WMMA] mma_stride (plain 16-half stride)             max|diff|=0  cos=1.000000000  mismatches=0     -> PASS
+[WMMA] mma_xor64  (XOR-swizzled 64-half, 4 K chunks) max|diff|=0  cos=1.000000000  mismatches=0     -> PASS
+[WMMA] PASS (hardware tile == emulated tile)
+```
+
+exit code 0. On failure it also prints the cosine against the *transposed* hardware
+tile and a 4x4 corner of both results, which distinguishes "wrong row permutation"
+from "the D map is transposed" — the only thing that cannot be settled statically.
+
+Then the end-to-end gate is unchanged: `./build/nib selftest -m <gguf>` with the env
+var set must still print `cos_sim > 0.999`, and PPL must stay at the RDNA3 number.
 
 ## What is slow (expected)
 
@@ -126,7 +222,11 @@ Sanity signals to watch:
 * Nothing here has been executed on the GPU by the author of this port; all
   correctness claims are by construction (layout argument above) plus static
   verification. A `ppl`/`oracle` diff against a gfx1100 run is the real gate.
-* The gfx12 WMMA fast path is not implemented — only its existence is verified.
+* The gfx12 WMMA fast path is implemented and wired in, but its fragment layout
+  could not be executed here (no GPU runs allowed). It is derived from AMD's own
+  GPUOpen sample code and CK's gfx12 traits and is checked by `nib wmma-selftest`,
+  which must be run on silicon before `NIB_GFX12_WMMA=1` is made the default. See
+  the diagnostics that selftest prints if it fails.
 * `kernels_step7j_fdot2.hip`'s opt-in 192/384-block MoE fdot2 kernels and
   `kernels_step7h_fused.hip`'s v3 kernels are cooperative and sized for 96 CU;
   they are off by default (`fdot2_moe = 0`, `b_v3 = 0`, `c_v3 = 0`) and would

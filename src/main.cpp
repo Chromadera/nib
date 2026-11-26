@@ -101,6 +101,8 @@ static void print_usage(const char * argv0) {
         "  serve    -m <gguf> [--host 127.0.0.1] [--port 4444] [--model-name inkling-2-mini] [--slots 4] [-c 262848] [--strict-slot-ctx] [--max-slot-ctx N] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4]\n"
         "           [--default-temp 0.6] [--default-top-p 0.95] [--default-top-k 40] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
         "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp] [--cpu-embd]\n"
+        "  wmma-selftest  (no model) random 16x16x16 tiles: emulated (v_dot2) vs hardware (v_wmma) tile,\n"
+        "                 prints max|diff| + cosine similarity. Gate for NIB_GFX12_WMMA=1.\n"
         "  --version  Print Nib version and target GPU architecture\n"
         "VRAM options (bench / gen / vision / serve):\n"
         "  --cpu-embd | --no-cpu-embd   token_embd.weight (~469 MiB) in pinned GPU-mapped host RAM instead of VRAM\n"
@@ -1095,6 +1097,12 @@ int main(int argc, char ** argv) {
         vin.explicit_kv   = explicit_kv;
         vin.cpu_embd_flag = cpu_embd_flag;
         apply_vram_profile(cfg, vin);
+    }
+
+    if (mode == "wmma-selftest") {
+        // No model, no weights: random 16x16x16 tiles, emulated vs hardware tile.
+        // `NIB_GFX12_WMMA=1 nib wmma-selftest` also reports the gate state.
+        return inkling::run_wmma_tile_selftest(16);
     }
 
     if (mode == "selftest") {

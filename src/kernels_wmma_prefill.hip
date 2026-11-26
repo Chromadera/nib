@@ -44,8 +44,10 @@
 #include "inkling_engine.h"
 #include "nib_mma.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace inkling {
 namespace {
@@ -1377,5 +1379,206 @@ void launch_moe_q8_prefill_wmma(const SoaQ8Experts & gate_up, const SoaQ8Experts
                                    post_conv_w, post_sconv_h, chunk_res);
     }
 }
+
+
+// ============================================================================
+// NIB_GFX12_WMMA tile validation — `nib wmma-selftest` (no model, no weights)
+// ============================================================================
+// Fills random 16x16 (M x K) A and 16x16 (N x K) B tiles whose values are exact in
+// FP16 (small integers, so FP32 accumulation is exact too), runs the emulated tile
+// (v_dot2_f32_f16) and the hardware tile (v_wmma_f32_16x16x16_f16 on gfx12, the
+// native builtin on gfx11) from the SAME LDS staging and the SAME nib fragments,
+// and writes both results in the nib D layout (row = 2*i + lane/16,
+// column = lane%16). Because the inputs are exact, any difference is a fragment
+// mapping error and not rounding — this is the gate for NIB_GFX12_WMMA=1.
+namespace {
+
+constexpr int kChkTile = 256;   // 16 x 16 elements
+constexpr int kChkMode = 4;     // 0 stride/emu, 1 stride/hw, 2 xor64/emu, 3 xor64/hw
+
+// -8..8, exact in FP16 (integer products <= 64 and their 16-term sums <= 1024 are
+// exact in FP32 as well, so both paths should agree bit for bit).
+__device__ __forceinline__ int chk_rnd(int seed, int idx) {
+    unsigned h = (unsigned)seed * 2654435761u + (unsigned)idx * 2246822519u;
+    h ^= h >> 15; h *= 2654435761u; h ^= h >> 13;
+    return (int)(h % 17u) - 8;
+}
+
+__global__ void nib_wmma_tile_check_kernel(float * out, int * gate_observed, int n_tiles) {
+    const int t    = blockIdx.x;
+    const int lane = threadIdx.x & 31;
+    if (blockIdx.x == 0 && lane == 0) {
+#if NIB_RDNA4
+        *gate_observed = nib_mma::hw_tile_on() ? 1 : 0;   // this TU's flag, from the device
+#else
+        *gate_observed = 0;
+#endif
+    }
+    const int l16  = lane & 15;
+    const int grp  = lane >> 4;
+    alignas(16) __shared__ _Float16 s_a[16 * 16];               // A[m][k], 16-half stride
+    alignas(16) __shared__ _Float16 s_ax[16 * NIB_MMA_XOR_ROW]; // A[m][k], XOR-swizzled 64-half rows
+    alignas(16) __shared__ _Float16 s_b[16 * 16];               // B[n][k] (= W^T tile, row n of W)
+
+    for (int p = 0; p < 8; ++p) {
+        const int idx = lane * 8 + p;
+        const int m = idx >> 4, k = idx & 15;
+        s_a[idx] = (_Float16)chk_rnd(t, m * 16 + k);
+        s_b[idx] = (_Float16)chk_rnd(t + 777, m * 16 + k);
+    }
+    // Same write pattern as the grouped-MoE staging: 16-half chunk c of row r lives
+    // in the 16 B blocks (2c+0)^(r&7) and (2c+1)^(r&7); lane group picks the block.
+    for (int c = 0; c < 4; ++c) {
+        nib_mma::nib_f16x8 h8;
+        const int k0 = 16 * c + 8 * grp;
+        for (int j = 0; j < 8; ++j) h8[j] = (_Float16)chk_rnd(t, l16 * 16 + k0 + j);
+        int4 v;
+        __builtin_memcpy(&v, &h8, 16);
+        reinterpret_cast<int4 *>(&s_ax[l16 * NIB_MMA_XOR_ROW])[(2 * c + grp) ^ (l16 & 7)] = v;
+    }
+    __syncthreads();
+
+    float * o = out + (size_t)t * (kChkMode * kChkTile);
+    nib_mma::nib_f32x8 acc_s_emu = {0, 0, 0, 0, 0, 0, 0, 0};
+    nib_mma::nib_f32x8 acc_s_hw  = {0, 0, 0, 0, 0, 0, 0, 0};
+    nib_mma::nib_f32x8 acc_x_emu = {0, 0, 0, 0, 0, 0, 0, 0};
+    nib_mma::nib_f32x8 acc_x_hw  = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    // nib B fragment: this lane's B row n = l16 over all 16 K of the chunk.
+    nib_mma::nib_f16x16 bf;
+    __builtin_memcpy(&bf, &s_b[l16 * 16], 32);
+    nib_mma::mma_stride_emu(s_a, 16, bf, acc_s_emu, lane);
+    nib_mma::mma_stride_hw (s_a, 16, bf, acc_s_hw,  lane);
+
+    // 4 K chunks through the XOR-swizzled staging, like the real grouped-MoE loop.
+    for (int kc = 0; kc < 4; ++kc) {
+        nib_mma::nib_f16x16 bfull;
+        for (int j = 0; j < 8; ++j) {
+            bfull[j]     = (_Float16)chk_rnd(t + 777, l16 * 16 + 16 * kc + j);
+            bfull[j + 8] = (_Float16)chk_rnd(t + 777, l16 * 16 + 16 * kc + 8 + j);
+        }
+        nib_mma::mma_xor64_emu(s_ax, bfull, acc_x_emu, lane, kc);
+        nib_mma::mma_xor64_hw (s_ax, bfull, acc_x_hw,  lane, kc);
+    }
+
+    for (int i = 0; i < 8; ++i) {
+        const int off = (2 * i + grp) * 16 + l16;   // nib D layout
+        o[0 * kChkTile + off] = acc_s_emu[i];
+        o[1 * kChkTile + off] = acc_s_hw[i];
+        o[2 * kChkTile + off] = acc_x_emu[i];
+        o[3 * kChkTile + off] = acc_x_hw[i];
+    }
+}
+
+} // namespace
+
+int run_wmma_tile_selftest(int n_tiles) {
+    if (n_tiles <= 0) n_tiles = 16;
+    // Apply NIB_GFX12_WMMA once the runtime is up (no-op when it is not set), so the
+    // reported gate is the one the kernels really use.
+    nib_mma::apply_gate_appliers();
+    const size_t n = (size_t)n_tiles * kChkMode * kChkTile;
+    float * d = nullptr;
+    int * d_gate = nullptr;
+    if (hipMalloc(&d, n * sizeof(float)) != hipSuccess || hipMalloc(&d_gate, sizeof(int)) != hipSuccess) {
+        std::fprintf(stderr, "[WMMA] hipMalloc(%zu B) failed\n", n * sizeof(float));
+        return 1;
+    }
+    if (hipMemset(d, 0xff, n * sizeof(float)) != hipSuccess) {   // poison: a missing store shows up
+        std::fprintf(stderr, "[WMMA] hipMemset failed\n");
+        (void)hipFree(d);
+        return 1;
+    }
+    (void)hipMemset(d_gate, 0xff, sizeof(int));
+    nib_wmma_tile_check_kernel<<<n_tiles, 32>>>(d, d_gate, n_tiles);
+    const hipError_t lst = hipGetLastError();
+    const hipError_t sst = hipDeviceSynchronize();
+    std::vector<float> h(n, 0.0f);
+    int gate = -1;
+    if (lst == hipSuccess && sst == hipSuccess) {
+        (void)hipMemcpy(h.data(), d, n * sizeof(float), hipMemcpyDeviceToHost);
+        (void)hipMemcpy(&gate, d_gate, sizeof(int), hipMemcpyDeviceToHost);
+    }
+    (void)hipFree(d);
+    (void)hipFree(d_gate);
+    if (lst != hipSuccess || sst != hipSuccess) {
+        std::fprintf(stderr, "[WMMA] kernel launch/sync failed: %s %s\n",
+                     hipGetErrorString(lst), hipGetErrorString(sst));
+        return 1;
+    }
+
+#if NIB_RDNA4
+    const char * arch = "gfx12 (RDNA4)";
+    const char * hw   = "v_wmma_f32_16x16x16_f16 (gfx12 builtin)";
+#elif NIB_RDNA3
+    const char * arch = "gfx11 (RDNA3)";
+    const char * hw   = "v_wmma_f32_16x16x16_f16 (native gfx11 builtin)";
+#else
+    const char * arch = "other";
+    const char * hw   = "none (emulation only)";
+#endif
+    std::printf("[WMMA] tile selftest: %s  emulated tile=v_dot2_f32_f16  hardware tile=%s  tiles=%d\n",
+                arch, hw, n_tiles);
+#if NIB_RDNA4
+    std::printf("[WMMA] NIB_GFX12_WMMA gate: %d (%s)\n", gate,
+                gate == 1 ? "kernels use the tensor-core tile"
+                          : "kernels use the v_dot2 tile; set NIB_GFX12_WMMA=1 to switch");
+#else
+    std::printf("[WMMA] gfx11 kernels use the native builtin; this checks the v_dot2 emulation against it\n");
+#endif
+
+    static const char * kNames[kChkMode / 2] = {"mma_stride (plain 16-half stride)",
+                                                "mma_xor64  (XOR-swizzled 64-half, 4 K chunks)"};
+    int worst = 0;
+    for (int m = 0; m < kChkMode / 2; ++m) {
+        const float * ref = h.data() + (size_t)m * 2 * kChkTile;
+        double dot = 0.0, dot_t = 0.0, na = 0.0, nb = 0.0, max_ref = 0.0, max_abs = 0.0, max_abs_t = 0.0;
+        int nbad = 0;
+        for (int t = 0; t < n_tiles; ++t) {
+            const float * e = ref + (size_t)t * kChkMode * kChkTile;          // emulated (reference)
+            const float * w = e + kChkTile;                                  // hardware
+            for (int i = 0; i < kChkTile; ++i) {
+                const int r = i >> 4, c = i & 15;
+                const float a  = e[i];
+                const float b  = w[i];
+                const float bt = w[c * 16 + r];        // hardware tile transposed inside the 16x16
+                const double dif  = std::fabs((double)a - (double)b);
+                const double dift = std::fabs((double)a - (double)bt);
+                if (dif > max_abs) max_abs = dif;
+                if (dift > max_abs_t) max_abs_t = dift;
+                if (std::fabs((double)a) > max_ref) max_ref = std::fabs((double)a);
+                if (dif > 1e-6 * (1.0 + std::fabs((double)a))) ++nbad;
+                dot   += (double)a * (double)b;
+                dot_t += (double)a * (double)bt;
+                na    += (double)a * (double)a;
+                nb    += (double)b * (double)b;
+            }
+        }
+        const double cos   = dot   / (std::sqrt(na * nb) + 1e-30);
+        const double cos_t = dot_t / (std::sqrt(na * nb) + 1e-30);
+        const bool ok = (cos > 0.999999) && (max_abs <= 1e-4 * (max_ref + 1.0)) && (nbad == 0);
+        std::printf("[WMMA] %-44s max|diff|=%.6g  cos=%.9f  mismatches=%-5d -> %s\n",
+                    kNames[m], max_abs, cos, nbad, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            // Layout diagnostics: the one thing that cannot be settled without silicon.
+            std::printf("[WMMA]   diagnostic: cos against the TRANSPOSED hw tile = %.9f "
+                        "(max|diff|=%.6g). If that is the ~1.0 one, the D mapping\n"
+                        "[WMMA]   is lane%%16 = row, not column: flip d_row_perm()/mma_*_hw in "
+                        "include/nib_mma.h.\n", cos_t, max_abs_t);
+            const float * e = ref;
+            const float * w = ref + kChkTile;
+            std::printf("[WMMA]   tile 0, rows 0..3, cols 0..3:\n[WMMA]     emu:");
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) std::printf(" %7.2f", e[r * 16 + c]);
+            std::printf("\n[WMMA]     hw :");
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) std::printf(" %7.2f", w[r * 16 + c]);
+            std::printf("\n");
+        }
+        if (!ok) ++worst;
+    }
+    std::printf("[WMMA] %s\n", worst == 0 ? "PASS (hardware tile == emulated tile)"
+                                          : "FAIL (fragment layout is wrong -- keep NIB_GFX12_WMMA unset)");
+    return worst == 0 ? 0 : 1;
+}
+
 
 } // namespace inkling

@@ -76,6 +76,30 @@ constexpr bool FUSE_A   = true;  // A: dual mix + ctrl QKV3 + norm
         }                                                                               \
     } while (0)
 
+// ---------------------------------------------------------------------------
+// gfx12 hardware WMMA tile gate (declared in inkling_engine.h / include/nib_mma.h)
+// ---------------------------------------------------------------------------
+// One registry for the whole binary: every .hip TU that compiles the tile registers
+// a callback from its static initializer (only when NIB_GFX12_WMMA is set), and the
+// callbacks are run once the HIP runtime is up, because each TU has to write its own
+// private __device__ flag (one code object per .hip file, no -fgpu-rdc).
+namespace nib_mma {
+namespace {
+std::vector<gate_applier> & gate_list() {
+    static std::vector<gate_applier> v;   // constructed on first use: static-init safe
+    return v;
+}
+} // namespace
+
+void register_gate_applier(gate_applier f) { gate_list().push_back(f); }
+
+void apply_gate_appliers() {
+    for (gate_applier f : gate_list()) {
+        if (f != nullptr) f();
+    }
+}
+} // namespace nib_mma
+
 namespace inkling {
 
 InklingEngine::~InklingEngine() {
@@ -176,6 +200,11 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
     }
     HIP_CHECK(hipSetDevice(0));
     HIP_CHECK(hipStreamCreate(&stream_));
+
+    // gfx12 hardware WMMA tile gate (include/nib_mma.h): NIB_GFX12_WMMA=1 switches
+    // every registered .hip TU from the v_dot2 emulation to v_wmma_f32_16x16x16_f16.
+    // Unset -> nothing registered, no GPU work, validated emulation stays in use.
+    nib_mma::apply_gate_appliers();
 
     // Quest block-sparse Global attention: all pages that may ever be scored are
     // capped at SPARSE_MAX_PAGES; the trailing SPARSE_RECENT_PAGES pages are always

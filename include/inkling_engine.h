@@ -7,6 +7,22 @@
 #include <string>
 #include <vector>
 
+// ============================================================================
+// gfx12 hardware WMMA tile gate (include/nib_mma.h, NIB_GFX12_WMMA=1)
+// ============================================================================
+// nib builds one code object per .hip file, so the gate flag is a private
+// __device__ variable per translation unit and cannot be written through a single
+// symbol. Every .hip TU that uses the tile registers its own setter callback here
+// from a static initializer; nib_mma::apply_gate_appliers() runs them once, after
+// the HIP runtime and all code objects are up (InklingEngine::init and
+// run_wmma_tile_selftest both call it). No env var -> nothing is registered and no
+// GPU call is made.
+namespace nib_mma {
+typedef void (*gate_applier)();
+void register_gate_applier(gate_applier f);   // src/engine.cpp
+void apply_gate_appliers();                   // src/engine.cpp
+} // namespace nib_mma
+
 namespace inkling {
 
 // ============================================================================
@@ -702,5 +718,15 @@ void launch_moe_q8_prefill_wmma(
     const float        * post_conv_w  = nullptr, // [N_EMBD, 4] optional fused sconv_post_res
     float              * post_sconv_h = nullptr, // [N_EMBD, 3]
     const float        * post_res_add = nullptr);// [M, N_EMBD]
+
+// ============================================================================
+// 16x16x16 FP16 -> FP32 tile validation (`nib wmma-selftest`, no model needed)
+// ============================================================================
+// Runs the emulated tile (v_dot2_f32_f16) and the hardware tile (v_wmma, gfx12:
+// __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12) over random exact-in-FP16
+// 16x16x16 tiles staged in LDS, and compares them element by element in the nib
+// D layout. Prints max |diff| and cosine similarity; returns 0 on PASS.
+// This is the gate for NIB_GFX12_WMMA=1 (see include/nib_mma.h).
+int run_wmma_tile_selftest(int n_tiles);
 
 } // namespace inkling
