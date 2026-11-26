@@ -6,13 +6,13 @@
 
 **Nib** is a native, zero-framework C++17 / AMD RDNA3 HIP inference engine for **Inkling 2 Mini** (26B looped hybrid-attention MoE + Vision + DSpark MTP), built from scratch for **AMD RDNA3 (`gfx1100`, Navi 31) GPUs**.
 
-It fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **21.50 GiB VRAM** at startup (`--slots 1`, rising to **22.45 GiB** peak once high-resolution Vision activation buffers are lazily allocated; **21.89 GiB** startup @ `--slots 4`, **22.40 GiB** startup @ `--slots 8`), with **zero SGPR/VGPR/private-segment register spills** across every GPU kernel.
+It fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **22.18 GiB true VRAM** (`llm + mtp + vision` @ `--slots 1`; **22.57 GiB** @ `--slots 4`; **23.08 GiB** @ `--slots 8`) with a transient single-arena ViT workspace (`~132 MiB` at `1080p`, `~416 MiB` max at `4K`, freed immediately after each encode), **zero SGPR/VGPR/private-segment register spills** across every GPU kernel, and **VRAM-aware auto-defaults for 20 GB RX 7900 XT** cards.
 
 ---
 
 ## Performance Benchmarks (RX 7900 XTX, 262k Context)
 
-Measured natively on an **AMD Radeon RX 7900 XTX** with BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce prefix cache, `--slots 8 -c 262848 --kv-type q8_0 --sparse-pages 224`, lossless DSpark MTP + Vision loaded, `22.40 GiB` VRAM):
+Measured natively on an **AMD Radeon RX 7900 XTX** with BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce prefix cache, `--slots 8 -c 262848 --kv-type q8_0 --sparse-pages 224`, lossless DSpark MTP + Vision loaded, `23.08 GiB` total app VRAM):
 
 - **Single-Stream Weighted Decode (`c = 1`)**: **186.8 tok/s** median (`TTFT p50: 69.0 ms`, `update p99: 23.2 ms`) via static HIP Graph + lossless DSpark MTP fast path
 - **4-Way Parallel Streaming (`c = 4`)**: **223.9 tok/s aggregate** (**58.4 tok/s** per stream median, **104.7 ms** TTFT p50, `32/32` OK)
@@ -56,7 +56,8 @@ Measured natively on an **AMD Radeon RX 7900 XTX** with BetterBench (`0.6.1`, co
 | 128,168 | 36,611.9 | **3,500.8** | Centroid-damped Quest (`sp224`, WMMA scorer) |
 | 261,526 | 77,157.4 | **3,389.5** | Centroid-damped Quest (`sp224`, WMMA scorer) |
 
-Full BetterBench report: [`docs/betterbench_slots8_262k.html`](docs/betterbench_slots8_262k.html) · [`docs/betterbench_slots8_262k.json`](docs/betterbench_slots8_262k.json).
+Full BetterBench report: [`docs/betterbench_slots8_262k.html`](docs/betterbench_slots8_262k.html) · [`docs/betterbench_slots8_262k.json`](docs/betterbench_slots8_262k.json).  
+Per-GPU real-hardware evaluations & Vision-fix A/B reports: **[RX 7900 XTX (`docs/rx7900xtx/`)](docs/rx7900xtx/README.md)** · **[RX 7900 XT (`docs/rx7900xt/`)](docs/rx7900xt/README.md)**.
 
 ---
 
@@ -109,7 +110,8 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 - **Multi-Slot Continuous Batching (`--slots 1..8`)**: Zero-copy Global KV + Quest page partitioning (`65,536` tokens/slot at 4 slots, `32,768` tokens/slot at 8 slots, full `262,848` context on slot 0 when solo), per-slot SWA rings + short-conv histories + prefix KV caches, chunked prefill interleaving, and automatic switch between solo DSpark MTP and batched multi-slot HIP Graphs. Prefix caches cover **multimodal** prompts too: image segments are keyed by a 128-bit content hash, so a conversation that keeps re-sending the same image(s) replays the cached KV instead of re-running the ViT and prefill on every turn.
 - **262k Centroid-Damped Quest Sparse Global Attention + SWA**: Sliding-window attention (`1536` cap) paired with native NoPE-basis centroid-damped Quest (`k_mean`, `k_rad`, $\alpha = 0.25$, up to 254 pages; recommended `--sparse-pages 224`) on global attention layers and FWHT-rotated `Q8_0` / `Q4_1` KV cache. Prefill runs **exact dense FA** up to 64K tokens and an exact per-token RDNA3 FP16 WMMA scorer (`>= 224` pages) beyond 64K.
 - **Lossless DSpark MTP Speculative Decoding (Any Temperature)**: 3-layer DSpark drafter (`mtp.safetensors`) with a 32,834-token shortlist head (`models/draft_shortlist.bin`), adaptive confidence-threshold drafting (1–7 draft tokens/round), exact target-model verification + rollback, and lossless rejection sampling at both `temperature = 0` and `temperature > 0` (`top_k`, `min_p`, `top_p`) via a zero-spill GPU verify top-256 kernel.
-- **Native Vision Encoder**: 23-layer ViT (`mmproj-Inkling-2-Mini-Q8_0.gguf`) wired directly into both the CLI and OpenAI multimodal chat API.
+- **Native Vision Encoder (Aliased Single-Arena Workspace)**: 23-layer ViT (`mmproj-Inkling-2-Mini-Q8_0.gguf`) wired directly into both the CLI and OpenAI multimodal chat API. Non-overlapping ViT activation buffers are packed into a single 256-byte-aligned transient workspace (`~132 MiB` at `1080p`, `~416 MiB` max at `4K`/`2560×2560` — `-56%` peak scratch, bit-identical) that is freed immediately after each encode (leaving only `11–36 MiB` for the projected embeddings), with graceful `HTTP 400` protection if an image exceeds free VRAM.
+- **20 GB / Tight-VRAM Awareness (`--cpu-embd` & `< 22 GiB` Auto-Defaults)**: Zero behavioral change on `>= 22 GiB` GPUs. On `< 22 GiB` cards (such as 20 GB RX 7900 XT), unset flags automatically select `q4_1` KV, size `-c` to preserve safe headroom (including worst-case ViT workspace), and enable `--cpu-embd` (GPU-mapped pinned host RAM for `token_embd.weight`, saving `469.3 MiB` VRAM at `< 0.8%` plain decode delta while keeping `lm_head` in VRAM). Startup logs and `/health` report exact `llm + mtp + vision` VRAM, live `hipMemGetInfo` free VRAM, and PCIe GTT spillover warnings.
 - **Built-in OpenAI-Compatible HTTP Server & Web UI**: Zero-dependency C++ HTTP/SSE server (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/api/activity`, `/api/logs`, `/api/outputs`, `/api/reset-kv`) with live per-slot telemetry and an embedded SPA (Activity, Playground Chat with HTML Live Preview + Save-As folder picker + Files drawer, Load Test, Models, Logs, Performance, Settings, Light/Dark + 11 theme presets).
 
 ---
@@ -118,16 +120,17 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 
 | GPU (`gfx1100` / Navi 31) | CUs / VRAM | Verification | Recommended Config |
 |---|---:|---|---|
-| **RX 7900 XTX** | 96 CU / 24 GiB | **Measured on hardware** | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50 GiB` startup / `22.45 GiB` high-res Vision peak @ `--slots 1`; `21.89 GiB` startup @ `--slots 4`; `22.40 GiB` startup @ `--slots 8`) |
-| **Radeon PRO W7900** | 96 CU / 48 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB` startup, `+0.95 GiB` max Vision scratch) |
-| **Radeon PRO W7800 32 GB** | 70 CU / 32 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`21.50–22.40 GiB` startup, `+0.95 GiB` max Vision scratch) |
-| **RX 7900 XT** | 84 CU / 20 GiB | **Simulated** (`sim_gpu.sh`) | Up to `131,072` ctx + `--kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`~18.35 GiB`) |
+| **RX 7900 XTX** | 96 CU / 24 GiB | **Measured on hardware** ([report](docs/rx7900xtx/README.md)) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`22.18 GiB` @ `--slots 1`; `22.57 GiB` @ `--slots 4`; `23.08 GiB` @ `--slots 8`; WSL2 WDDM: `-c 196608` or `--cpu-embd`) |
+| **RX 7900 XT** | 84 CU / 20 GiB | **Measured on hardware** ([report](docs/rx7900xt/README.md)) | **Auto-default Multimodal (`4K` Vision + MTP):** `--mtp --mmproj` *(auto-selects `--slots 4 -c 65536 --kv-type q4_1 --cpu-embd`, `~18.21 GiB`, `0 MB` GTT through `4K`/`2560×2560`)*. **128K Multimodal (`1080p`):** `--slots 4 -c 131072 --kv-type q4_1 --mtp --mmproj` (`18.87 GiB`, auto `--cpu-embd`). **Text-only:** up to `160K` `q4_1` / `90K` `q8_0` + MTP, or full **`262,848`** `q4_0` non-MTP (`19.10 GiB`) |
+| **Radeon PRO W7900** | 96 CU / 48 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`22.18–23.08 GiB`) |
+| **Radeon PRO W7800 32 GB** | 70 CU / 32 GiB | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + Vision (`22.18–23.08 GiB`) |
 | **RX 7900 GRE / RX 7800 XT** | 16 GiB | **Not supported** | Does not fit the `~16.4 GiB` `NVFP4-Mixed` base weights |
 
-> **Note on other RDNA3 GPUs**: All benchmarks were measured natively on an **RX 7900 XTX**. Because I could not find anywhere to rent other RDNA3 cards (`W7900`, `W7800`, `7900 XT`), compatibility, VRAM budgets, and WGP co-residency guards for those GPUs were validated using an `LD_PRELOAD` HIP CU/VRAM simulator ([`scripts/sim_gpu.sh`](scripts/sim_gpu.sh)) on the 7900 XTX. Real-hardware reports from owners of those cards are welcome!
+> **Note on RDNA3 GPUs**: Both **RX 7900 XTX** ([`docs/rx7900xtx/`](docs/rx7900xtx/README.md)) and **RX 7900 XT** ([`docs/rx7900xt/`](docs/rx7900xt/README.md)) have been verified and benchmarked end-to-end on real silicon (decode, BetterBench multi-slot concurrency, long-context prefill, and `1080p`–`4K` Vision). Compatibility and WGP co-residency guards for **W7900** and **W7800** were validated using an `LD_PRELOAD` HIP CU/VRAM simulator ([`scripts/sim_gpu.sh`](scripts/sim_gpu.sh)). Real-hardware reports from owners of workstation cards are welcome!
 
-- **Vision VRAM**: `mmproj-Inkling-2-Mini-Q8_0.gguf` takes **`0.32 GiB`** at startup; [`VisionEncoder::ensure_scratch`](src/vision_encoder.cpp) lazily allocates high-water-mark ViT activation buffers on demand (up to **`+0.95 GiB`** on high-resolution screenshots → **`1.27 GiB`** peak Vision, **`22.45 GiB`** total at `--slots 1`).
-- **System RAM**: **~390 MiB** steady-state RSS (~`2.0–2.5 GiB` transient during startup staging). Runs on **8 GiB** systems; **32 GiB+** keeps the `16.4 GiB` `mmap`'d GGUF warm in Linux page cache for fast (~2s) restarts.
+- **Vision VRAM**: `mmproj-Inkling-2-Mini-Q8_0.gguf` takes **`0.32 GiB`** at startup. During each image encode, [`VisionEncoder`](src/vision_encoder.cpp) allocates a single aliased workspace (**`~132 MiB`** at `1080p`, **`~234 MiB`** at `1440p`, **`~416 MiB`** max at `4K`/`2560×2560`) and frees it immediately after encoding (`0 MiB` retained workspace; only the `11–36 MiB` projected embedding buffer stays resident). Pass `--vision-keep-scratch` to keep the workspace resident across images.
+- **20 GB / Tight-VRAM Tuning**: Passing `--cpu-embd` places `token_embd.weight` (`469.3 MiB`) in GPU-mapped pinned host RAM (`lm_head` stays in VRAM) at `< 0.8%` plain decode cost; pass `--no-cpu-embd` to keep embeddings in VRAM on `< 22 GiB` cards.
+- **System RAM**: **~390 MiB** steady-state RSS (**~860 MiB** with `--cpu-embd`; ~`2.0–2.5 GiB` transient during startup staging). Runs on **8 GiB** systems; **32 GiB+** keeps the `16.4 GiB` `mmap`'d GGUF warm in Linux page cache for fast (~2s) restarts.
 
 ---
 
@@ -191,6 +194,8 @@ HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
 ```
 Open **http://127.0.0.1:4444/** for the built-in Web UI, or connect any OpenAI-compatible client to `http://127.0.0.1:4444/v1`. Pass `--slots 4` to enable 4-way concurrent streaming (`+0.39 GiB` VRAM, `65k/slot` concurrent, full `262k` when solo).
 
+> **On 20 GB GPUs (RX 7900 XT)**: Omit `-c` and `--kv-type` (just pass `-m ... --mtp ... --mmproj ... --sparse-pages 224`) to let Nib automatically select `--kv-type q4_1`, `--cpu-embd`, and a safe `-c` (`65,536` @ 4 slots) with full `4K` / `2560×2560` Vision headroom and `0 MB` GTT spillover. See [`docs/rx7900xt/README.md`](docs/rx7900xt/README.md) for the complete 20 GB tuning matrix.
+
 ### 2. CLI Generation (with DSpark MTP)
 ```bash
 ./build/nib gen \
@@ -225,7 +230,7 @@ nib/
 ├── CMakeLists.txt           # Zero-dependency CMake + hipcc build
 ├── LICENSE                  # Apache-2.0
 ├── README.md
-├── docs/                    # Logo, BetterBench & gBench evaluation reports
+├── docs/                    # Logo, BetterBench, gBench, rx7900xt/ & rx7900xtx/ reports
 ├── include/                 # Engine, sparse-global, MTP, and kernel headers
 ├── models/                  # draft_shortlist.bin (large weights gitignored)
 ├── scripts/
