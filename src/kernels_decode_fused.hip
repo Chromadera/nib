@@ -2254,19 +2254,21 @@ void launch_mix_dual_ctrl_qkv3_norm_decode_mrows(
     // gfx12: this is one 96 x nrows grid-barrier launch; unless the whole grid is
     // co-resident, run the rows as separate single-token launches (same body).
     if (!df_coresident(g_occ_mix_dual, 96 * nrows)) {
+        const int ns0 = (n_states0 < MAX_RES_BLOCKS) ? n_states0 : MAX_RES_BLOCKS;
+        const int ns1 = (n_states1 < MAX_RES_BLOCKS) ? n_states1 : MAX_RES_BLOCKS;
         for (int r = 0; r < nrows; ++r) {
             const float * st0[MAX_RES_BLOCKS];
             const float * st1[MAX_RES_BLOCKS];
-            for (int i = 0; i < n_states0; ++i) st0[i] = states0[i] + (size_t)r * N_EMBD;
-            for (int i = 0; i < n_states1; ++i) st1[i] = states1[i] + (size_t)r * N_EMBD;
+            for (int i = 0; i < ns0; ++i) st0[i] = states0[i] + (size_t)r * N_EMBD;
+            for (int i = 0; i < ns1; ++i) st1[i] = states1[i] + (size_t)r * N_EMBD;
             float * on3r[3] = {
                 (out_norm[0] != nullptr) ? out_norm[0] + (size_t)r * N_EMBD : nullptr,
                 (out_norm[1] != nullptr) ? out_norm[1] + (size_t)r * N_EMBD : nullptr,
                 (out_norm[2] != nullptr) ? out_norm[2] + (size_t)r * N_EMBD : nullptr
             };
             launch_mix_dual_ctrl_qkv3_norm_decode(
-                query0, n_q0, st0, n_states0, out0 + (size_t)r * 4 * N_EMBD,
-                query1, n_q1, st1, n_states1, out1 + (size_t)r * 3 * N_EMBD,
+                query0, n_q0, st0, ns0, out0 + (size_t)r * 4 * N_EMBD,
+                query1, n_q1, st1, ns1, out1 + (size_t)r * 3 * N_EMBD,
                 w_down, w_gain, w_forget, w_norm,
                 tmp_gate + (size_t)r * 3 * LOOP_GATE_RANK, on3r, 1, eps, stream,
                 scratch + (size_t)r * 512);
