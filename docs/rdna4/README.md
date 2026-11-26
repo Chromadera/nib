@@ -65,9 +65,11 @@ in-register FWHT-128, the coalesced stores) is unchanged.
 
 * `spill_audit.sh GPU_TARGET=gfx1201` fails with VGPR spills in the emulated
   kernels — the tile math needs more live registers than the WMMA fragments:
-  prefill FA ~240–290 spills/920 B private, ctrl_apply prefill 493/1976 B,
-  dense GEMM 65/176 B, MoE 32–40/132–160 B, vision 0 spills. This is the price
-  of "correct first"; register budgets and LDS blocking need a re-tune pass.
+  `kernels_fa.o` 1600 spills total over its 6 prefill instantiations (~240–290
+  each, 920 B private), `kernels_core.o` 493 (ctrl_apply prefill, 1976 B
+  private), `kernels_wmma.o` 278 (dense GEMM 65, MoE 32–40), `kernels_vision.o`
+  0, `kernels_sparse_global.o` 2 (pre-existing). This is the price of "correct
+  first"; register budgets and LDS blocking need a re-tune pass.
 * Prefill GEMM/attention throughput will be far below the RDNA3 numbers
   (wmma → 64 dot2 + 16 LDS loads per tile per lane). Decode should be much less
   affected: the decode path (GEMV / FA decode v2-v4 / MoE decode) uses no WMMA.
