@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(ROCM_PATH "/opt/rocm" CACHE PATH "ROCm installation path")
 set(HIP_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH "HIP compiler")
-set(GPU_TARGET "gfx1100" CACHE STRING "AMD RDNA3 GPU target (e.g. gfx1100)")
+set(GPU_TARGET "gfx1100" CACHE STRING "GPU target (RDNA3: gfx1100/gfx1101/gfx1102/gfx1103, RDNA4: gfx1200/gfx1201)")
 
 set(NIB_GIT_SHA "unknown")
 find_package(Git QUIET)
@@ -43,7 +43,7 @@ function(add_hip_object target_name hip_src)
             "${CMAKE_CURRENT_SOURCE_DIR}/include/inkling_engine.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/include/sparse_global.h"
             ${ARGN}
-        COMMENT "Compiling RDNA3 HIP kernel ${hip_src} (${GPU_TARGET})"
+        COMMENT "Compiling RDNA HIP kernel ${hip_src} (${GPU_TARGET})"
     )
     set(${target_name}_OBJ "${obj_file}" PARENT_SCOPE)
 endfunction()

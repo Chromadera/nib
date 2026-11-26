@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "nib_target.h"
+
 namespace inkling {
 namespace {
 
@@ -37,6 +39,9 @@ typedef int v4i __attribute__((ext_vector_type(4)));
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ void rdna3_flush_stores() {
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
@@ -44,6 +49,9 @@ static __device__ __forceinline__ void rdna3_flush_stores() {
 
 static __device__ __forceinline__ void rdna3_inv_l0_l1() {
     __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - scope-qualified acquire atomics on gfx1201 emit
+    // `global_inv scope:SCOPE_DEV` themselves (ISA-checked), which replaces the RDNA3
+    // L0/L1 invalidation below and needs no hand-written cache asm.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
 #endif
@@ -2119,6 +2127,56 @@ void extract_states(const float * const * src, int n, DecStatePtrs & dst) {
     }
 }
 
+int device_wgp_count_df() {
+    static int cache[64] = {};
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
+        return 48;
+    }
+    if (cache[dev] == 0) {
+        int n = 0;
+        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || n <= 0) {
+            n = 48;
+        }
+        cache[dev] = n;
+    }
+    return cache[dev];
+}
+
+// ---------------------------------------------------------------------------
+// Co-residency gate for the grid-barrier kernels in this file.
+//
+// Every fused kernel here is ONE launch whose blocks synchronise through
+// self-resetting device counters, so a grid that is not fully resident deadlocks
+// (blocks in a later wave spin on blocks that never start). The grids were sized
+// for gfx1100 (96 CU): 96 x 288-thread blocks at __launch_bounds__(288, 1) need
+// 96 CUs, 192 blocks need 192, 384 need 384.
+//
+// On RDNA4 (gfx1200/gfx1201, 64 CU) the 96-block A grid (and the 96 x nrows verify
+// grid) does not fit, so those launchers fall back to the multi-launch
+// composition, which computes the same thing without a cross-block barrier.
+// gfx11 keeps the fused launch unconditionally: its behaviour is unchanged.
+// ---------------------------------------------------------------------------
+int g_occ_mix_dual = -1;   // blocks/CU of mix_dual_ctrl_qkv3_norm_decode_kernel
+int g_occ_mix_ffn_v2 = -1; // blocks/CU of mix_ffn_norm_router_topk_fused_v2_kernel
+int g_occ_mix_ctrl_v2 = -1;// blocks/CU of mix_ctrl_ffn_norm_router_topk_fused_v2_kernel
+
+inline bool df_coresident(int occ, int grid) {
+    if (occ <= 0) {
+        return false;
+    }
+    return (long long)occ * (long long)device_wgp_count_df() >= (long long)grid;
+}
+
+// 96 blocks x 288 threads needs 2 blocks/CU; the 32/33-block kernels fit anywhere.
+inline bool df_mix_dual_ok() {
+#if NIB_RDNA3
+    return true;  // gfx11: unchanged (statically co-resident on >=96 CU)
+#else
+    return df_coresident(g_occ_mix_dual, 96);
+#endif
+}
+
 } // namespace
 
 // ============================================================================
@@ -2143,7 +2201,7 @@ void launch_mix_dual_ctrl_qkv3_norm_decode(
     const float * msg_base = out0; // LOOP_CTRL_Q == 0
 
     if (n_tokens != 1 || n_states0 > 5 || n_states1 > 5 || n_q0 > 4 || n_q1 > 4 ||
-        scratch == nullptr) {
+        scratch == nullptr || !df_mix_dual_ok()) {
         launch_inkling_mix_dual(query0, n_q0, states0, n_states0, out0,
                                 query1, n_q1, states1, n_states1, out1, n_tokens, stream);
         launch_inkling_ctrl_qkv_norm(cur, msg_base, w_down, w_gain, w_forget, w_norm,
@@ -2191,6 +2249,28 @@ void launch_mix_dual_ctrl_qkv3_norm_decode_mrows(
                                               query1, n_q1, states1, n_states1, out1,
                                               w_down, w_gain, w_forget, w_norm,
                                               tmp_gate, out_norm, 1, eps, stream, scratch);
+        return;
+    }
+    // gfx12: this is one 96 x nrows grid-barrier launch; unless the whole grid is
+    // co-resident, run the rows as separate single-token launches (same body).
+    if (!df_coresident(g_occ_mix_dual, 96 * nrows)) {
+        for (int r = 0; r < nrows; ++r) {
+            const float * st0[MAX_RES_BLOCKS];
+            const float * st1[MAX_RES_BLOCKS];
+            for (int i = 0; i < n_states0; ++i) st0[i] = states0[i] + (size_t)r * N_EMBD;
+            for (int i = 0; i < n_states1; ++i) st1[i] = states1[i] + (size_t)r * N_EMBD;
+            float * on3r[3] = {
+                (out_norm[0] != nullptr) ? out_norm[0] + (size_t)r * N_EMBD : nullptr,
+                (out_norm[1] != nullptr) ? out_norm[1] + (size_t)r * N_EMBD : nullptr,
+                (out_norm[2] != nullptr) ? out_norm[2] + (size_t)r * N_EMBD : nullptr
+            };
+            launch_mix_dual_ctrl_qkv3_norm_decode(
+                query0, n_q0, st0, n_states0, out0 + (size_t)r * 4 * N_EMBD,
+                query1, n_q1, st1, n_states1, out1 + (size_t)r * 3 * N_EMBD,
+                w_down, w_gain, w_forget, w_norm,
+                tmp_gate + (size_t)r * 3 * LOOP_GATE_RANK, on3r, 1, eps, stream,
+                scratch + (size_t)r * 512);
+        }
         return;
     }
     const float * cur[3] = {
@@ -2241,6 +2321,20 @@ void launch_mix_ffn_norm_router_topk_decode_v2_mrows(
     }
     DecStatePtrs s;
     extract_states(states, n_states, s);
+    // gfx12: 33 x nrows blocks in one grid-barrier launch - fall back to one row per
+    // launch unless the whole grid is co-resident.
+    if (!df_coresident(g_occ_mix_ffn_v2, 33 * nrows)) {
+        for (int r = 0; r < nrows; ++r) {
+            const float * st[MAX_RES_BLOCKS];
+            for (int i = 0; i < n_states; ++i) st[i] = states[i] + (size_t)r * N_EMBD;
+            launch_mix_ffn_norm_router_topk_decode_v2(
+                res_query, st, n_states, ffn_norm_w, router_w, exp_probs_b,
+                x_norm_out + (size_t)r * N_EMBD,
+                topk_ids_out + (size_t)r * TOP_K, topk_w_out + (size_t)r * TOP_K,
+                router_scratch + (size_t)r * 512, stream);
+        }
+        return;
+    }
     mix_ffn_norm_router_topk_fused_v2_kernel<true><<<dim3(33, nrows), 192, 0, stream>>>(
         res_query, s, n_states, ffn_norm_w, router_w, exp_probs_b,
         x_norm_out, topk_ids_out, topk_w_out, router_scratch);
@@ -2274,7 +2368,8 @@ void launch_mix_ctrl_ffn_norm_router_topk_decode_v2_mrows(
     }
     DecStatePtrs s;
     extract_states(states, n_states, s);
-    if (n_states > 5 || router_scratch == nullptr) {
+    if (n_states > 5 || router_scratch == nullptr ||
+        !df_coresident(g_occ_mix_ctrl_v2, 32 * nrows)) {
         for (int r = 0; r < nrows; ++r) {
             const float * st[MAX_RES_BLOCKS];
             for (int i = 0; i < n_states; ++i) st[i] = states[i] + (size_t)r * N_EMBD;
@@ -2404,22 +2499,6 @@ void launch_soa_q8_gemv_qkv3_v2(
 }
 
 namespace {
-int device_wgp_count_df() {
-    static int cache[64] = {};
-    int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
-        return 48;
-    }
-    if (cache[dev] == 0) {
-        int n = 0;
-        if (hipDeviceGetAttribute(&n, hipDeviceAttributeMultiprocessorCount, dev) != hipSuccess || n <= 0) {
-            n = 48;
-        }
-        cache[dev] = n;
-    }
-    return cache[dev];
-}
-
 void qkv_unfused_fallback_df(
         const SoaQ8Matrix & W0, const float * x0, float * y0,
         const SoaQ8Matrix & W1, const float * x1, float * y1,
@@ -2592,6 +2671,28 @@ void launch_moe_nvfp4_decode_v2(
     launch_moe_nvfp4_gate_up_v2(gate_up, x_norm, topk_ids, tmp_act, stream);
     launch_moe_nvfp4_down_v2(down, tmp_act, topk_ids, topk_w, out, stream,
                              post_conv_w, post_sconv_h, post_res_add);
+}
+
+// Cache the blocks/CU of the grid-barrier kernels of this file. Host-side query
+// (no stream op), so it is capture-safe; called once from engine init.
+void decode_fused_prime_occupancy() {
+    int n = 0;
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, (const void *)mix_dual_ctrl_qkv3_norm_decode_kernel<false>, 288, 0) == hipSuccess) {
+        g_occ_mix_dual = n;
+    }
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, (const void *)mix_ffn_norm_router_topk_fused_v2_kernel<false>, 192, 0) == hipSuccess) {
+        g_occ_mix_ffn_v2 = n;
+    }
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+            &n, (const void *)mix_ctrl_ffn_norm_router_topk_fused_v2_kernel<5, false>, 288, 0) == hipSuccess) {
+        g_occ_mix_ctrl_v2 = n;
+    }
+    if (std::getenv("NIB_DUMP_OCC") != nullptr) {
+        std::fprintf(stderr, "[decode_fused] cu=%d occ/blk: mix_dual=%d mix_ffn_v2=%d mix_ctrl_v2=%d (grid 96 needs occ>=2 on 64 cu)\n",
+                     device_wgp_count_df(), g_occ_mix_dual, g_occ_mix_ffn_v2, g_occ_mix_ctrl_v2);
+    }
 }
 
 } // namespace inkling

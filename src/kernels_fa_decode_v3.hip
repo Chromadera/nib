@@ -113,6 +113,9 @@ static __device__ __forceinline__ void v3_fwht128_4(
 
 static __device__ __forceinline__ void v3_gl_fence_release() {
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
@@ -120,6 +123,9 @@ static __device__ __forceinline__ void v3_gl_fence_release() {
 
 static __device__ __forceinline__ void v3_gl_invalidate() {
     __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - scope-qualified acquire atomics on gfx1201 emit
+    // `global_inv scope:SCOPE_DEV` themselves (ISA-checked), which replaces the RDNA3
+    // L0/L1 invalidation below and needs no hand-written cache asm.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
 #endif
@@ -1283,6 +1289,9 @@ struct V3QkvSeg {
 
 static __device__ __forceinline__ void v3_rdna3_flush_stores() {
     __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
@@ -1290,6 +1299,9 @@ static __device__ __forceinline__ void v3_rdna3_flush_stores() {
 
 static __device__ __forceinline__ void v3_rdna3_inv_l0_l1() {
     __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - scope-qualified acquire atomics on gfx1201 emit
+    // `global_inv scope:SCOPE_DEV` themselves (ISA-checked), which replaces the RDNA3
+    // L0/L1 invalidation below and needs no hand-written cache asm.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
     asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
 #endif

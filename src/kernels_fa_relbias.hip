@@ -668,14 +668,20 @@ static __global__ void inkling_fa_decode_kernel(
     // In-kernel self-resetting atomic combine (when fa_done != nullptr && n_splits > 1 && n_tokens == 1)
     if (fa_done != nullptr && n_splits > 1 && n_tokens == 1) {
         __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-        asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
+    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
         __syncthreads();
         if (warp == 0 && lane == 0) {
             __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
+    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
             const int prev = __hip_atomic_fetch_add(
                 &fa_done[grp_id], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
@@ -685,8 +691,11 @@ static __global__ void inkling_fa_decode_kernel(
 
         if (s_is_last) {
             __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - scope-qualified acquire atomics on gfx1201 emit
+    // `global_inv scope:SCOPE_DEV` themselves (ISA-checked), which replaces the RDNA3
+    // L0/L1 invalidation below and needs no hand-written cache asm.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
+    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
 #endif
             if (warp == 0 && lane == 0) {
                 __hip_atomic_store(&fa_done[grp_id], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -1417,11 +1426,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                     tile_skip = skip ? 1 : 0;
                 }
             }
-            asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+            nib_lds_fence_barrier();
             const int32_t do_skip = tile_skip;
             if (do_skip != 0) {
                 // Ensure all warps finish reading tile_skip before warp 0 overwrites it on t+1!
-                asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+                nib_lds_fence_barrier();
                 continue;
             }
         }
@@ -1515,7 +1524,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
 
         // Hardware WMMA: S[nk] = K[nk*16 .. nk*16+15] * Q^T with 2-stage K double-buffering
         floatx8_t S[NK16];
@@ -1524,8 +1533,8 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             S[nk] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         }
 
-        halfx16_t kv_buf[2];
 #if NIB_MMA_NATIVE
+        halfx16_t kv_buf[2];
         kv_buf[0] = load_halfx16_b128(&smem.K[l_qlocal][0]);
 #endif
 
@@ -1572,7 +1581,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
 #endif
         }
         pin_wmma_acc(S);
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
 
         // Cooperatively dequantize & transpose V_T into LDS
         {
@@ -1616,7 +1625,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
 
         float m_tile = m_q;
         const bool q_in = (qp_val < q_pos_lim);
@@ -1796,7 +1805,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         }
 #endif
 
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
     }
 
     if (qp_val >= q_pos_lim) {
@@ -1973,13 +1982,19 @@ void launch_fa_relbias(
         const int n_kv = is_swa ? std::min(pos_start + n_tokens, kv_slot.cap) : (pos_start + n_tokens);
         constexpr int BC = 48;
 
+        // One CTA per (48-token Q-block, KV head) = 64 CTAs per split-K slice, so k slices
+        // are 64*k CTAs. Fill every CU with no tail wave:
+        //   gfx1100 (96 CU): 6 -> 384 CTAs = 4 CTAs/CU, 3 -> 192 = 2 CTAs/CU
+        //   gfx1200/1201 (64 CU): 6 -> 384 = 6 CTAs/CU, 3 -> 192 = 3 CTAs/CU
+        // Either way both are exact multiples of the CU count; the deeper split is what the
+        // 96-CU build was tuned for, so keep the same numbers and only re-label them.
         int split_k = 1;
         if (n_tokens <= MAX_UBATCH && tmp_o != nullptr && tmp_meta != nullptr) {
             if (!is_swa) {
                 if (n_kv >= 4096) {
-                    split_k = 6; // 8 Q-blocks * 8 KV-heads * 6 = 384 CTAs = exact 4 CTAs/CU (2 full waves of 192 CTAs)
+                    split_k = 6; // 64 * 6 = 384 CTAs = exact 4 CTAs/CU on 96 CU, 6/CU on 64 CU
                 } else if (n_kv >= 384 && n_tokens >= 256) {
-                    split_k = 3; // 8 Q-blocks * 8 KV-heads * 3 = 192 CTAs = exact 2 CTAs/CU (1 full wave of 192 CTAs)
+                    split_k = 3; // 64 * 3 = 192 CTAs = exact 2 CTAs/CU on 96 CU, 3/CU on 64 CU
                 }
             } else if (n_kv >= 512 && n_tokens >= 256) {
                 split_k = 3;
@@ -2028,8 +2043,8 @@ void launch_fa_relbias(
     }
 
     // Static-graph decode path (or n_tokens == 1):
-    constexpr int DEC_SWA_SPLITS  = 24; // 24 * 8 = 192 CTAs = exact 2 CTAs/CU + single-wave (<=32) combine!
-    constexpr int DEC_GLOB_SPLITS = 48; // 48 * 8 = 384 CTAs = exact 4 CTAs/CU across 96 CUs (zero tail wave!)
+    constexpr int DEC_SWA_SPLITS  = 24; // 24 * 8 = 192 CTAs = 2 CTAs/CU on 96 CU, 3/CU on 64 CU + single-wave (<=32) combine!
+    constexpr int DEC_GLOB_SPLITS = 48; // 48 * 8 = 384 CTAs = 4 CTAs/CU on 96 CU, 6/CU on 64 CU (zero tail wave!)
 
     int n_splits = is_swa ? DEC_SWA_SPLITS : DEC_GLOB_SPLITS;
     if (d_meta == nullptr) {

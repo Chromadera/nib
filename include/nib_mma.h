@@ -24,15 +24,16 @@
 // ============================================================================
 #pragma once
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#include "nib_target.h"
+
+#if NIB_RDNA3
 #define NIB_MMA_NATIVE 1
 #else
 #define NIB_MMA_NATIVE 0
 #endif
 
 // Targets whose 16x16x16 f16 tile this header can produce (native or emulated).
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
-    defined(__gfx1200__) || defined(__gfx1201__)
+#if NIB_RDNA3 || NIB_RDNA4
 #define NIB_MMA_TILE_TARGET 1
 #else
 #define NIB_MMA_TILE_TARGET 0

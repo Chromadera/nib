@@ -211,6 +211,10 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
     // Step 7H: no runtime occupancy query is needed (all grids are statically
     // co-resident), but keep the hook next to the Step 7F one.
     step7h_prime_occupancy();
+    // Step 7D (decode_fused): the v2 fused grids are single grid-barrier launches
+    // sized for a 96-CU gfx1100; cache their blocks/CU so the launchers can fall
+    // back to multi-launch compositions on a 64-CU RDNA4 part.
+    decode_fused_prime_occupancy();
     // Step 7I-1: cache the blocks/CU of every fused grid before graph capture
     // (the fused launchers fall back when a grid cannot be fully co-resident).
     step7i_prime_occupancy();

@@ -312,4 +312,10 @@ void launch_moe_nvfp4_decode_v2(
     float * tmp_act, float * out, hipStream_t stream,
     const float * post_conv_w, float * post_sconv_h, const float * post_res_add);
 
+// Caches blocks/CU of this file's grid-barrier kernels (see nib_target.h); the
+// launchers fall back to multi-launch compositions where a grid cannot be
+// co-resident (>=96 blocks on a 64-CU RDNA4 part). Call from engine init, outside
+// stream capture, next to the Step 7F/7H/7I hooks.
+void decode_fused_prime_occupancy();
+
 } // namespace inkling

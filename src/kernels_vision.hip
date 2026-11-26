@@ -484,7 +484,8 @@ vision_fa_wmma_d64_kernel(
 #else
                 (void)k_row;
                 // gfx12: A rows = the 16 K rows of this tile, B = this lane's Q row (q = l16).
-                nib_mma::mma_stride(&s_k[kt * 16][dk * 16], K_STRIDE, q_frag[dk], s_tile[kt], lane);
+                nib_mma::mma_stride(reinterpret_cast<const _Float16 *>(&s_k[kt * 16][dk * 16]),
+                                    K_STRIDE, q_frag[dk], s_tile[kt], lane);
 #endif
             }
         }

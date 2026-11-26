@@ -1408,14 +1408,20 @@ static __global__ void inkling_fa_decode_sparse_global_kernel(
 
     if (fa_done != nullptr && n_splits > 1) {
         __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-        asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
+    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
         __syncthreads();
         if (warp == 0 && lane == 0) {
             __scoped_atomic_thread_fence(__ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - on gfx1201 __scoped_atomic_thread_fence(RELEASE, AGENT)
+    // above already lowers to s_waitcnt + `global_wb scope:SCOPE_DEV` (ISA-checked with
+    // llvm-mc/hipcc -S), so gfx1200/gfx1201 need nothing extra here.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
+    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
             const int prev = __hip_atomic_fetch_add(
                 &fa_done[grp_id], 1, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
@@ -1425,8 +1431,11 @@ static __global__ void inkling_fa_decode_sparse_global_kernel(
 
         if (s_is_last) {
             __scoped_atomic_thread_fence(__ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+    // gfx12: no equivalent instruction - scope-qualified acquire atomics on gfx1201 emit
+    // `global_inv scope:SCOPE_DEV` themselves (ISA-checked), which replaces the RDNA3
+    // L0/L1 invalidation below and needs no hand-written cache asm.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
-            asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
+    asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
 #endif
             if (warp == 0 && lane == 0) {
                 __hip_atomic_store(&fa_done[grp_id], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
@@ -2174,7 +2183,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
 
         floatx8_t S[NK16];
         #pragma unroll
@@ -2182,8 +2191,8 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
             S[nk] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         }
 
-        halfx16_t kv_buf[2];
 #if NIB_MMA_NATIVE
+        halfx16_t kv_buf[2];
         kv_buf[0] = load_halfx16_b128(&smem.K[l_qlocal][0]);
 #endif
 
@@ -2243,7 +2252,16 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
 #endif
         }
         pin_wmma_acc(S);
+        // Keep the V loads in flight across the K*Q^T block (vmcnt(63) lets the
+        // in-flight V prefetches survive the barrier; gfx12 spells the same pair
+        // through the compiler, see nib_target.h).
+#if NIB_RDNA3
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier\n\ts_waitcnt vmcnt(63)" ::: "memory");
+#else
+        __builtin_amdgcn_s_waitcnt(0);
+        __builtin_amdgcn_s_barrier();
+        asm volatile("s_waitcnt vmcnt(63)" ::: "memory");
+#endif
 
         {
             const int l_subk = l_tmp & 3;
@@ -2268,7 +2286,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 }
             }
         }
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
 
         float m_tile = m_q;
         const bool q_in = (qp_val < q_pos_lim);
@@ -2406,8 +2424,8 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
         l_add += __shfl_xor(l_add, 16, 32);
         l_q += l_add;
 
-        kv_buf[0] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal);
 #if NIB_MMA_NATIVE
+        kv_buf[0] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal);
         #pragma unroll
         for (int nk = 0; nk < NK16; ++nk) {
             const halfx16_t Pnk = pack_p_frag_rdna3(S[nk], l_halfw);
@@ -2450,7 +2468,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
         }
 #endif
 
-        asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+        nib_lds_fence_barrier();
     }
 
     if (qp_val >= q_pos_lim) {
