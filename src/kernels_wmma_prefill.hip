@@ -42,6 +42,7 @@
 // Grids are sized from the host-known worst-case tile count; blocks past *d_num_tiles exit.
 // ============================================================================
 #include "inkling_engine.h"
+#include "nib_mma.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -375,6 +376,7 @@ struct TileGemm {
     }
 
     __device__ __forceinline__ void compute(Smem & sm, float8_t (&acc)[FM][FN], int wm, int wn, int l16) {
+#if NIB_MMA_NATIVE
         const int rlow = l16 & 7;
 #pragma unroll
         for (int kc = 0; kc < BK / 16; ++kc) {
@@ -394,6 +396,22 @@ struct TileGemm {
                 }
             }
         }
+#else
+        // gfx12: same tile from the same LDS staging (see include/nib_mma.h). The lane
+        // supplies its own B row (n = l16) and reads the 8 A rows it owns as D rows.
+        const int lane = threadIdx.x & 31;
+#pragma unroll
+        for (int kc = 0; kc < BK / 16; ++kc) {
+#pragma unroll
+            for (int j = 0; j < FN; ++j) {
+                const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], l16 & 7, kc);
+#pragma unroll
+                for (int i = 0; i < FM; ++i) {
+                    nib_mma::mma_xor64(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf, acc[i][j], lane, kc);
+                }
+            }
+        }
+#endif
     }
 
     __device__ __forceinline__ static int out_row(int i, int v) {
@@ -490,6 +508,7 @@ struct TileGemmMoe {
         if (!any) {
             return;
         }
+#if NIB_MMA_NATIVE
         const int rlow = l16 & 7;
 #pragma unroll
         for (int kc = 0; kc < BK / 16; ++kc) {
@@ -511,6 +530,23 @@ struct TileGemmMoe {
                 }
             }
         }
+#else
+        // gfx12: same tile from the same LDS staging (see include/nib_mma.h).
+        const int lane = threadIdx.x & 31;
+#pragma unroll
+        for (int kc = 0; kc < BK / 16; ++kc) {
+#pragma unroll
+            for (int j = 0; j < FN; ++j) {
+                const half16_t bf = lds_frag_xor(&sm.b[(b_frag_row(wn, j) + l16) * LDK_XOR], l16 & 7, kc);
+#pragma unroll
+                for (int i = 0; i < FM; ++i) {
+                    if (FM == 1 || live[i]) {
+                        nib_mma::mma_xor64(&sm.a[(wm * WTM + i * 16) * LDK_XOR], bf, acc[i][j], lane, kc);
+                    }
+                }
+            }
+        }
+#endif
     }
 
     __device__ __forceinline__ void run_super(Smem & sm, int K, float8_t (&acc)[FM][FN], int m_valid) {

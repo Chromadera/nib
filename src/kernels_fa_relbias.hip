@@ -1,4 +1,5 @@
 #include "inkling_engine.h"
+#include "nib_mma.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -1025,7 +1026,7 @@ static __global__ void inkling_fa_decode_combine_kernel(
 //   - Global interior causal fast-path (skips k_pos, min/max, valid_bits & far RelBias!)
 //   - Pure log2-domain online softmax (fast_exp2f -> 1-cycle v_exp_f32) + conditional O rescale
 // ============================================================================
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
 using halfx16_t = __attribute__((ext_vector_type(16))) _Float16;
 using floatx8_t = __attribute__((ext_vector_type(8)))  float;
 
@@ -1244,7 +1245,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         int                        pos_start,
         int                        n_kv,
         int                        split_k) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     static_assert(NWARPS % GQA_RATIO == 0, "NWARPS must be a multiple of GQA_RATIO=3");
     static_assert(BC == 32 || BC == 48 || BC == 64, "BC must be 32, 48, or 64");
 
@@ -1524,7 +1525,9 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         }
 
         halfx16_t kv_buf[2];
+#if NIB_MMA_NATIVE
         kv_buf[0] = load_halfx16_b128(&smem.K[l_qlocal][0]);
+#endif
 
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
@@ -1546,6 +1549,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 }
                 Qc = q_bcast.h16;
             }
+#if NIB_MMA_NATIVE
             #pragma unroll
             for (int nk = 0; nk < NK16; ++nk) {
                 const int cur_b = (c * NK16 + nk) & 1;
@@ -1558,6 +1562,14 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 S[nk] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kv_buf[cur_b], Qc, S[nk]);
                 __builtin_amdgcn_sched_barrier(0);
             }
+#else
+            // gfx12 (include/nib_mma.h): S[nk] = K[nk*16 .. nk*16+15] x Q^T, computed per row
+            // from the same LDS tile. Qc is this lane's B row (q = lane&15) either way.
+            #pragma unroll
+            for (int nk = 0; nk < NK16; ++nk) {
+                nib_mma::mma_stride(&smem.K[nk * 16][d_off], STRIDE_K, Qc, S[nk], lane);
+            }
+#endif
         }
         pin_wmma_acc(S);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
@@ -1738,6 +1750,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         l_q += l_add;
 
         // P * V_T with 2-stage V_T LDS double-buffering (overlaps ds_load_b128 under 32-cycle WMMA!)
+#if NIB_MMA_NATIVE
         kv_buf[0] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal);
         #pragma unroll
         for (int nk = 0; nk < NK16; ++nk) {
@@ -1755,6 +1768,33 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
+#else
+        // gfx12 (include/nib_mma.h): B row = P[q = lane&15][key 0..15] in ascending key order.
+        // This lane holds the keys of parity l_halfw (S[nk][idx] is key 2*idx + l_halfw), so the
+        // other parity comes from the partner lane (lane ^ 16) — 8 shuffles, no extra LDS.
+        #pragma unroll
+        for (int nk = 0; nk < NK16; ++nk) {
+            halfx16_t Prow;
+            {
+                union { halfx16_t h16; uint32_t u[8]; } pk;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float own = S[nk][t];
+                    const float oth = __shfl_xor(own, 16, 32);
+                    // hw == 0: (key 2t, key 2t+1) = (own, partner); hw == 1: (partner, own)
+                    pk.u[t] = bits_of((l_halfw == 0) ? __floats2half2_rn(own, oth)
+                                                     : __floats2half2_rn(oth, own));
+                }
+                Prow = pk.h16;
+            }
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                nib_mma::mma_rows(
+                    [&](int m) { return load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, c, nk, m); },
+                    Prow, O_acc[c], lane);
+            }
+        }
+#endif
 
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
     }

@@ -1,4 +1,5 @@
 #include "sparse_global.h"
+#include "nib_mma.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -1614,7 +1615,7 @@ static __global__ void inkling_fa_decode_sparse_reduce_kernel(
 // Prefill sparse Global FA: RDNA3 Wave32 FP16 WMMA, BM = 64, BC = 64 (one page)
 // ----------------------------------------------------------------------------
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
 using halfx16_t = __attribute__((ext_vector_type(16))) _Float16;
 using floatx8_t = __attribute__((ext_vector_type(8)))  float;
 
@@ -1832,7 +1833,7 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
         int n_tokens,
         int sparse_pages,
         float * __restrict__ page_scores) {      // [qb][N_HEAD_KV][max_pages]
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     constexpr int NWARPS = 12;                   // 4 Q-tiles (16 tok each) x 3 GQA heads
     constexpr int STRIDE = 136;                  // 128 + 8 halfs -> bank-conflict-free & 16B aligned
     constexpr float Q_NORM = KQ_SCALE * KQ_SCALE; // inverse FWHT scale * 1/sqrt(128) logit scale
@@ -1934,6 +1935,7 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
     // call (s_swappc + 16 B private stack frame for the captures, issue #6).
     auto score_tile_wmma = [&]() __attribute__((always_inline)) -> floatx8_t {
         floatx8_t S = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+#if NIB_MMA_NATIVE
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
             const int d_off = c * 16;
@@ -1944,6 +1946,17 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
             const halfx16_t Kr  = load_halfx16_b128(&smem.K_rad[q_local][d_off]);
             S = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Kr, Qca, S);
         }
+#else
+        // gfx12 (include/nib_mma.h): A = K rows (key), B = this lane's Q row (q = lane&15).
+        #pragma unroll
+        for (int c = 0; c < 8; ++c) {
+            const int d_off = c * 16;
+            const halfx16_t Qc  = load_halfx16_b128(&smem.Q[warp][q_local][d_off]);
+            nib_mma::mma_stride(&smem.K_mid[0][d_off], STRIDE, Qc, S, lane);
+            const halfx16_t Qca = abs_halfx16(Qc);
+            nib_mma::mma_stride(&smem.K_rad[0][d_off], STRIDE, Qca, S, lane);
+        }
+#endif
         // Keep the WMMAs here: clang 22 otherwise sinks them into the caller's `if (q_valid)`
         // block, keeping all 16 K/Q fragments (~190 VGPRs) live at once.
         pin_wmma_acc(S);
@@ -2025,7 +2038,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
         int                        n_tokens,
         int                        pos_start,
         int                        n_kv) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     static_assert(NWARPS % GQA_RATIO == 0, "NWARPS must be a multiple of GQA_RATIO=3");
     static_assert(BC == SPARSE_PAGE_SIZE, "BC must equal SPARSE_PAGE_SIZE");
 
@@ -2170,7 +2183,9 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
         }
 
         halfx16_t kv_buf[2];
+#if NIB_MMA_NATIVE
         kv_buf[0] = load_halfx16_b128(&smem.K[l_qlocal][0]);
+#endif
 
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
@@ -2206,6 +2221,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 }
                 Qc = qc.h16;
             }
+#if NIB_MMA_NATIVE
             #pragma unroll
             for (int nk = 0; nk < NK16; ++nk) {
                 const int cur_b = (c * NK16 + nk) & 1;
@@ -2218,6 +2234,13 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 S[nk] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kv_buf[cur_b], Qc, S[nk]);
                 __builtin_amdgcn_sched_barrier(0);
             }
+#else
+            // gfx12 (include/nib_mma.h): same tile from the same LDS K tile.
+            #pragma unroll
+            for (int nk = 0; nk < NK16; ++nk) {
+                nib_mma::mma_stride(&smem.K[nk * 16][d_off], STRIDE_K, Qc, S[nk], lane);
+            }
+#endif
         }
         pin_wmma_acc(S);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier\n\ts_waitcnt vmcnt(63)" ::: "memory");
@@ -2384,6 +2407,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
         l_q += l_add;
 
         kv_buf[0] = load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, 0, 0, l_qlocal);
+#if NIB_MMA_NATIVE
         #pragma unroll
         for (int nk = 0; nk < NK16; ++nk) {
             const halfx16_t Pnk = pack_p_frag_rdna3(S[nk], l_halfw);
@@ -2400,6 +2424,31 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
+#else
+        // gfx12 (include/nib_mma.h): B row = P[q = lane&15][key 0..15] ascending; the odd/even key
+        // parities live in the two halves of the wave (S[nk][idx] is key 2*idx + l_halfw).
+        #pragma unroll
+        for (int nk = 0; nk < NK16; ++nk) {
+            halfx16_t Prow;
+            {
+                union { halfx16_t h16; uint32_t u[8]; } pk;
+                #pragma unroll
+                for (int t = 0; t < 8; ++t) {
+                    const float own = S[nk][t];
+                    const float oth = __shfl_xor(own, 16, 32);
+                    pk.u[t] = bits_of((l_halfw == 0) ? __floats2half2_rn(own, oth)
+                                                     : __floats2half2_rn(oth, own));
+                }
+                Prow = pk.h16;
+            }
+            #pragma unroll
+            for (int c = 0; c < 8; ++c) {
+                nib_mma::mma_rows(
+                    [&](int m) { return load_vt_halfx16<STRIDE_V, SWIZ_V>(smem.V_T, c, nk, m); },
+                    Prow, O_acc[c], lane);
+            }
+        }
+#endif
 
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
     }

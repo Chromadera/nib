@@ -19,6 +19,7 @@
 // ============================================================================
 
 #include "vision_encoder.hpp"
+#include "nib_mma.h"
 
 #include <cmath>
 #include <cstdint>
@@ -136,7 +137,31 @@ vision_patch_embed_pos_cls_kernel(
             p_frag[i + 8] = hp1[i];
         }
 
+#if NIB_MMA_NATIVE
         acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(w_frag, p_frag, acc);
+#else
+        // gfx12 (include/nib_mma.h): A rows are the 8 output channels this lane owns as
+        // accumulator rows; they come straight from patch_w (converted here), B is s_p.
+        (void)w_frag;
+        {
+            const int lhalf = lane >> 4;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int oc = oc_base + warp * 16 + 2 * i + lhalf;
+                const float * wr = patch_w + (size_t)oc * kdim + k0;
+                fp16x16 w16;
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const float4 fw = *reinterpret_cast<const float4 *>(wr + q * 4);
+                    w16[q * 4 + 0] = (_Float16)fw.x;
+                    w16[q * 4 + 1] = (_Float16)fw.y;
+                    w16[q * 4 + 2] = (_Float16)fw.z;
+                    w16[q * 4 + 3] = (_Float16)fw.w;
+                }
+                acc[i] += nib_mma::dot16(w16, p_frag);
+            }
+        }
+#endif
         __syncthreads();
     }
 
@@ -444,6 +469,7 @@ vision_fa_wmma_d64_kernel(
             const int k_row = kt * 16 + l16;
 #pragma unroll
             for (int dk = 0; dk < 4; ++dk) {
+#if NIB_MMA_NATIVE
                 fp16x16 k_frag;
                 const uint4 lo = *reinterpret_cast<const uint4 *>(&s_k[k_row][dk * 16]);
                 const uint4 hi = *reinterpret_cast<const uint4 *>(&s_k[k_row][dk * 16 + 8]);
@@ -455,6 +481,11 @@ vision_fa_wmma_d64_kernel(
                     k_frag[i + 8] = p1[i];
                 }
                 s_tile[kt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(k_frag, q_frag[dk], s_tile[kt]);
+#else
+                (void)k_row;
+                // gfx12: A rows = the 16 K rows of this tile, B = this lane's Q row (q = l16).
+                nib_mma::mma_stride(&s_k[kt * 16][dk * 16], K_STRIDE, q_frag[dk], s_tile[kt], lane);
+#endif
             }
         }
 
@@ -492,23 +523,43 @@ vision_fa_wmma_d64_kernel(
         // Exponentiate S -> P using 1-cycle fast_exp2f and pack via v_perm_b32
         float tile_l = 0.0f;
         fp16x16 p_frag[4];
+        fp16x16 p_row[4]; // gfx12 only: B row = P[q = l16][key 0..15] in ascending key order
 #pragma unroll
         for (int kt = 0; kt < 4; ++kt) {
             union {
                 fp16x16  h16;
                 uint32_t u[8];
             } pk;
+            union {
+                fp16x16  h16;
+                uint32_t u[8];
+            } pr;
+            float e[8];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float e0 = fast_exp2f(s_tile[kt][2 * j]     - row_m);
                 const float e1 = fast_exp2f(s_tile[kt][2 * j + 1] - row_m);
                 tile_l += e0 + e1;
+                e[2 * j] = e0;
+                e[2 * j + 1] = e1;
                 const uint32_t mu = __builtin_bit_cast(uint32_t, __floats2half2_rn(e0, e1));
                 const uint32_t ou = __shfl_xor(mu, 16, 32);
                 pk.u[2 * j + 0] = __builtin_amdgcn_perm(ou, mu, perm0);
                 pk.u[2 * j + 1] = __builtin_amdgcn_perm(ou, mu, perm1);
             }
             p_frag[kt] = pk.h16;
+#if !NIB_MMA_NATIVE
+            // gfx12: s_tile[kt][i] is key 2*i + lhalf, so the partner half-wave holds the
+            // other key parity. Interleave both into keys 0..15 ascending (half2 = one key pair).
+#pragma unroll
+            for (int t = 0; t < 8; ++t) {
+                const float own = e[t];
+                const float oth = __shfl_xor(own, 16, 32);
+                pr.u[t] = __builtin_bit_cast(uint32_t,
+                    (lhalf == 0) ? __floats2half2_rn(own, oth) : __floats2half2_rn(oth, own));
+            }
+            p_row[kt] = pr.h16;
+#endif
         }
         tile_l += __shfl_xor(tile_l, 16, 32);
         row_l  += tile_l;
@@ -516,6 +567,7 @@ vision_fa_wmma_d64_kernel(
         // 4. O^T += V^T @ P^T (4 D-tiles x 4 K-tiles = 16 WMMAs)
 #pragma unroll
         for (int dt = 0; dt < 4; ++dt) {
+#if NIB_MMA_NATIVE
             const int d_row   = dt * 16 + l16;
             const int swiz_hi = (d_row >> 3) << 3; // matches write swizzle
 #pragma unroll
@@ -534,6 +586,31 @@ vision_fa_wmma_d64_kernel(
                 }
                 o_acc[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(v_frag, p_frag[kt], o_acc[dt]);
             }
+#else
+            // gfx12: A row m is s_vt[dt*16 + m], 8-half chunk index XOR-swizzled by (m >> 3) << 3.
+#pragma unroll
+            for (int kt = 0; kt < 4; ++kt) {
+                nib_mma::mma_rows(
+                    [&](int m) {
+                        const int row = dt * 16 + m;
+                        const int sw  = (row >> 3) << 3;
+                        const int k0  = (kt * 16 + 0) ^ sw;
+                        const int k1  = (kt * 16 + 8) ^ sw;
+                        fp16x16 v_frag;
+                        const uint4 lo = *reinterpret_cast<const uint4 *>(&s_vt[row][k0]);
+                        const uint4 hi = *reinterpret_cast<const uint4 *>(&s_vt[row][k1]);
+                        const _Float16 * q0 = reinterpret_cast<const _Float16 *>(&lo);
+                        const _Float16 * q1 = reinterpret_cast<const _Float16 *>(&hi);
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            v_frag[i]     = q0[i];
+                            v_frag[i + 8] = q1[i];
+                        }
+                        return v_frag;
+                    },
+                    p_row[kt], o_acc[dt], lane);
+            }
+#endif
         }
         __syncthreads();
     }

@@ -1,4 +1,5 @@
 #include "inkling_engine.h"
+#include "nib_mma.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -50,7 +51,7 @@ static __device__ __forceinline__ float dot_h8_f8(uint4 w, float4 x0, float4 x1,
     return acc;
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
 typedef int      v4i      __attribute__((ext_vector_type(4)));
 typedef _Float16 half16_t __attribute__((ext_vector_type(16)));
 typedef float    float8_t __attribute__((ext_vector_type(8)));
@@ -969,7 +970,7 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         HalfPtr3      w_down,
         float       * __restrict__ gate,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     constexpr int BM     = 16;
     constexpr int BN     = 16;
     constexpr int BK     = 64;
@@ -1063,11 +1064,18 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         }
         __syncthreads();
 
+#if NIB_MMA_NATIVE
         {
             const half16_t af = lds_frag(&smem.gemm.a[l16 * LDK + warp * 16]);
             const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc);
         }
+#else
+        {
+            const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
+            nib_mma::mma_stride(&smem.gemm.a[warp * 16], LDK, bf, acc, lane);
+        }
+#endif
         __syncthreads();
 
         // 2. Stage msg_norm (2 float4/thread) + w1 (1 uint4/thread)
@@ -1094,11 +1102,18 @@ static __global__ void inkling_ctrl_down_prefill_wmma_kernel(
         }
         __syncthreads();
 
+#if NIB_MMA_NATIVE
         {
             const half16_t af = lds_frag(&smem.gemm.a[l16 * LDK + warp * 16]);
             const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc);
         }
+#else
+        {
+            const half16_t bf = lds_frag(&smem.gemm.b[l16 * LDK + warp * 16]);
+            nib_mma::mma_stride(&smem.gemm.a[warp * 16], LDK, bf, acc, lane);
+        }
+#endif
         __syncthreads();
     }
 
@@ -1348,7 +1363,7 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
         HalfPtr3      w_forget,
         MutPtr3       out,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     constexpr int BM  = 64;
     constexpr int BN  = 64;
     constexpr int K   = LOOP_GATE_RANK; // 64
@@ -1418,12 +1433,20 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
     };
     #pragma unroll
     for (int kc = 0; kc < 4; ++kc) {
+#if NIB_MMA_NATIVE
         const half16_t af = lds_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16]);
         #pragma unroll
         for (int f = 0; f < 2; ++f) {
             const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
             acc_g[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc_g[f]);
         }
+#else
+        #pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
+            nib_mma::mma_stride(&s_gate[(wm * 16) * LDK + kc * 16], LDK, bf, acc_g[f], lane);
+        }
+#endif
     }
     __syncthreads();
 
@@ -1444,12 +1467,20 @@ static __global__ void inkling_ctrl_apply_prefill_wmma_kernel(
     };
     #pragma unroll
     for (int kc = 0; kc < 4; ++kc) {
+#if NIB_MMA_NATIVE
         const half16_t af = lds_frag(&s_gate[(wm * 16 + l16) * LDK + kc * 16]);
         #pragma unroll
         for (int f = 0; f < 2; ++f) {
             const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
             acc_f[f] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc_f[f]);
         }
+#else
+        #pragma unroll
+        for (int f = 0; f < 2; ++f) {
+            const half16_t bf = lds_frag(&s_w[(wn * 32 + f * 16 + l16) * LDK + kc * 16]);
+            nib_mma::mma_stride(&s_gate[(wm * 16) * LDK + kc * 16], LDK, bf, acc_f[f], lane);
+        }
+#endif
     }
 
     // 5. Epilogue: tanh + blend (100% coalesced 64B half-warp global stores!)
@@ -3067,7 +3098,7 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
         int32_t      * __restrict__ topk_ids_out,
         float        * __restrict__ topk_w_out,
         int n_tokens) {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__)
+#if NIB_MMA_TILE_TARGET
     static_assert(BM == 16 || BM == 32, "BM must be 16 or 32");
     constexpr int BK     = 32;
     constexpr int LDK    = BK + 8; // 40 halves (80 B -> 16B aligned)
@@ -3131,11 +3162,18 @@ static __global__ void router_gemm_topk_prefill_wmma_kernel(
 
         #pragma unroll
         for (int kc = 0; kc < 2; ++kc) {
+#if NIB_MMA_NATIVE
             const half16_t af  = lds_frag(&smem.gemm.a[(wm * 16 + l16) * LDK + kc * 16]);
             const half16_t bf0 = lds_frag(&smem.gemm.b[(wn * 32 +      l16) * LDK + kc * 16]);
             acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf0, acc0);
             const half16_t bf1 = lds_frag(&smem.gemm.b[(wn * 32 + 16 + l16) * LDK + kc * 16]);
             acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf1, acc1);
+#else
+            const half16_t bf0 = lds_frag(&smem.gemm.b[(wn * 32 +      l16) * LDK + kc * 16]);
+            nib_mma::mma_stride(&smem.gemm.a[(wm * 16) * LDK + kc * 16], LDK, bf0, acc0, lane);
+            const half16_t bf1 = lds_frag(&smem.gemm.b[(wn * 32 + 16 + l16) * LDK + kc * 16]);
+            nib_mma::mma_stride(&smem.gemm.a[(wm * 16) * LDK + kc * 16], LDK, bf1, acc1, lane);
+#endif
         }
         __syncthreads();
     }
