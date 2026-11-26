@@ -290,8 +290,16 @@ low-variance one). Recorded so nobody re-runs them:
 | `--amdgpu-unroll-threshold=800 / 1600` | -0.4% / -0.7% | already unrolled |
 | Queued-launch K+V fusion | +0.09% | launch count is not the cost |
 
-Two structural findings behind those rows: the grouped MoE runs at ~59 TFLOPS against a
-70-78 TFLOPS rocBLAS reference at the same aggregate shape (and 25 TFLOPS for the same work
-as 128 separate per-expert GEMMs, which is why the grouping matters), and the residual ~1.2x
-staging overhead comes from per-expert row quantisation, which a single large GEMM does not
-pay.
+Two structural findings behind those rows:
+
+* The grouped MoE runs at **~59 TFLOPS** against a 70-78 TFLOPS rocBLAS reference at the
+  same aggregate shape - and 25 TFLOPS for the same work as 128 separate per-expert GEMMs,
+  which is why the grouping matters. Once the per-tile padding is accounted for (below) the
+  kernel is **at vendor efficiency: 59 x (25088/20480) = 72.3 TFLOPS per full tile**.
+* That padding is measured, not assumed. Instrumenting the routing on a 2560-token chunk
+  (20,480 slot rows over 128 experts) gives `padded=25088, waste=18.4%`, with a heavy tail:
+  36 experts have <=32 rows, 24 have >256 (max 2095). It cannot be scheduled away - packing
+  rows across experts would need `experts + tiles - 1 = 448` weight stagings instead of 392,
+  because a straddling tile must stage both experts' weights, and weight staging is 2/3 of
+  the per-tile staging volume. A single big GEMM pays none of this because it has no expert
+  boundaries; a grouped MoE cannot avoid it.
