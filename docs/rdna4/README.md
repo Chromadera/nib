@@ -88,7 +88,11 @@ cmake --build build -j 8
 # 0. static checks, no GPU kernels involved (safe next to a busy GPU)
 ./scripts/verify_rdna4.sh
 
-# 1. does the loader + repack + one decode step work at all
+# 1. THE correctness gate: nib prefills 5 tokens with the prefill kernels, then
+#    runs the same 5 tokens one-by-one through the (unmodified) decode kernels and
+#    compares the logits. Pass = cos_sim > 0.999, exit code 0:
+#    [SELFTEST] Prefill vs Decode (5 tokens): next_pf=N next_dec=N | max_diff=... | cos_sim=0.9999999
+#    A low cos_sim means the gfx12 tile emulation is wrong, not the model.
 ./build/nib selftest -m models/Inkling-2-Mini-NVFP4-Mixed.gguf
 
 # 2. decode-only generation (exercises the GEMV/MoE/FA-decode path, ~50 tokens)
