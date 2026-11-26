@@ -141,6 +141,8 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 - CMake ≥ 3.21 and a C++17 host compiler
 - AMD RDNA3 GPU (default target `gfx1100`)
 
+> **ROCm / Compiler note:** Zero-spill builds (`./scripts/spill_audit.sh` passing across all 18 objects, 0 SGPR/VGPR spills, 0 private bytes) are verified on both **HIP 7.16 / AMD clang 24** and stable **ROCm 7.2.x / AMD clang 22** (Ubuntu 24.04 PIE toolchains supported out of the box).
+
 ### Compile & Spill Audit
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -169,7 +171,7 @@ Or place/symlink the files manually in `models/` (or pass paths via CLI flags `-
 |---|---|--:|---|
 | `models/Inkling-2-Mini-NVFP4-Mixed.gguf` | NVFP4 (`L0..19` MoE) + Q8_0 (`L20..23` MoE, attn, embd, head) | ~16.4 GiB | Main LLM |
 | `models/mtp.safetensors` | BF16 (repacked to SoA Q8_0 on load) | 607 MiB | Official DSpark MTP drafter |
-| `models/draft_shortlist.bin` | int32 vocab map (32,834 rows) | 256 KiB | Included in repo |
+| `models/draft_shortlist.bin` | int32 vocab map (32,834 rows) | 256 KiB | Included in repo; looked up next to `mtp.safetensors`, then `models/` (CWD or relative to `nib`) |
 | `models/mmproj-Inkling-2-Mini-Q8_0.gguf` | Q8_0 + F16/F32 | 330 MiB | Optional vision encoder |
 
 > **Why NVFP4-Mixed?** Thinking Machines trained and released `Inkling-2-Mini` natively with layers `0..19` MoE experts in NVFP4 and layers `20..23` in MXFP8. Matching that precision split in GGUF avoids bloating those 20 layers to Q8_0/BF16 while preserving native quality and fitting `262k` context + MTP + Vision into 24 GiB VRAM.

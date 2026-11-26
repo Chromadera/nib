@@ -29,6 +29,7 @@ function(add_hip_object target_name hip_src)
         OUTPUT "${obj_file}"
         COMMAND "${HIP_COMPILER}"
             -O3
+            -fPIC
             --offload-arch=${GPU_TARGET}
             -std=c++17
             -Wall -Wextra -Wno-unused-parameter -Wno-unused-function

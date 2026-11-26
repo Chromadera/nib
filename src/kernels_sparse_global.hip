@@ -931,6 +931,10 @@ static __global__ void inkling_fa_decode_sparse_global_kernel(
         const float * rel_base = USE_R_PREP ? nullptr
                                              : rel_table + (size_t)TOK * N_HEAD * N_REL_EXTENT
                                                          + (size_t)h_base * N_REL_EXTENT;
+        // One 64-bit base for the GQA r_prep rows (+g*N_REL folds into immediate offsets) instead
+        // of three separately sign-extended row pointers: clang 22 ran out of SGPRs (106 + VCC)
+        // in the USE_R_PREP Q4 variants and spilled qgate_in to a VGPR lane (issue #6).
+        const float * rp_base = USE_R_PREP ? r_prep + (size_t)h_base * N_REL : nullptr;
         const int v_blk = lane >> 3;
         const int32_t * sel = selected_pages + (size_t)grp_id * SPARSE_MAX_SELECTED;
         const size_t head_base = (size_t)h_kv * (size_t)kv_slot.cap;
@@ -1056,7 +1060,7 @@ static __global__ void inkling_fa_decode_sparse_global_kernel(
                             #pragma unroll
                             for (int g = 0; g < GQA; ++g) {
                                 const float * rp_row = USE_R_PREP
-                                    ? r_prep + (size_t)(h_base + g) * N_REL : nullptr;
+                                    ? rp_base + (size_t)g * N_REL : nullptr;
                                 sc_k[g] += rel_logit<USE_R_PREP>(
                                     rel_base + (size_t)g * N_REL_EXTENT, rp_row,
                                     attn_rel_bias, dist) * LOG2E;
@@ -1221,7 +1225,7 @@ static __global__ void inkling_fa_decode_sparse_global_kernel(
                             #pragma unroll
                             for (int g = 0; g < GQA; ++g) {
                                 const float * rp_row = USE_R_PREP
-                                    ? r_prep + (size_t)(h_base + g) * N_REL : nullptr;
+                                    ? rp_base + (size_t)g * N_REL : nullptr;
                                 sc_k[g] += rel_logit<USE_R_PREP>(
                                     rel_base + (size_t)g * N_REL_EXTENT, rp_row,
                                     attn_rel_bias, dist) * LOG2E;
@@ -1614,6 +1618,23 @@ static __global__ void inkling_fa_decode_sparse_reduce_kernel(
 using halfx16_t = __attribute__((ext_vector_type(16))) _Float16;
 using floatx8_t = __attribute__((ext_vector_type(8)))  float;
 
+// Materialize WMMA accumulators in VGPRs at this program point (zero instructions emitted).
+// The K*Q^T WMMAs are pure arithmetic, so nothing ties them to the inline-asm s_barrier that
+// follows them. AMD clang 22 (ROCm 7.2.x) sinks all of them past that barrier and the whole
+// V dequant/transpose phase, keeping every K fragment plus O_acc live across it -> ~200 VGPR
+// spills per prefill kernel (issue #6). The volatile asm cannot move across the volatile barrier
+// asm, so S must be complete before it. clang 24 already schedules them here: no-op for it.
+static __device__ __forceinline__ void pin_wmma_acc(floatx8_t & acc) {
+    asm volatile("" : "+v"(acc));
+}
+template <int N>
+static __device__ __forceinline__ void pin_wmma_acc(floatx8_t (&acc)[N]) {
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        pin_wmma_acc(acc[i]);
+    }
+}
+
 static __device__ __forceinline__ halfx16_t load_halfx16_b128(const _Float16 * ptr) {
     const uint4 v0 = *(const uint4 *)(ptr + 0);
     const uint4 v1 = *(const uint4 *)(ptr + 8);
@@ -1909,7 +1930,9 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
         }
     };
 
-    auto score_tile_wmma = [&]() -> floatx8_t {
+    // always_inline: clang 22 (ROCm 7.2.x) otherwise outlines this twice-used lambda into a real
+    // call (s_swappc + 16 B private stack frame for the captures, issue #6).
+    auto score_tile_wmma = [&]() __attribute__((always_inline)) -> floatx8_t {
         floatx8_t S = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
         #pragma unroll
         for (int c = 0; c < 8; ++c) {
@@ -1921,6 +1944,9 @@ static __global__ void sparse_score_pages_prefill_wmma_kernel(
             const halfx16_t Kr  = load_halfx16_b128(&smem.K_rad[q_local][d_off]);
             S = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(Kr, Qca, S);
         }
+        // Keep the WMMAs here: clang 22 otherwise sinks them into the caller's `if (q_valid)`
+        // block, keeping all 16 K/Q fragments (~190 VGPRs) live at once.
+        pin_wmma_acc(S);
         return S;
     };
 
@@ -2193,6 +2219,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
+        pin_wmma_acc(S);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier\n\ts_waitcnt vmcnt(63)" ::: "memory");
 
         {

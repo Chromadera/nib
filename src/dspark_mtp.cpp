@@ -392,14 +392,38 @@ bool DSparkDrafter::init(const std::string & mtp_path, const ModelWeights & w, i
         {
             std::vector<uint32_t> ranks;
             {
-                const std::string dir = mtp_path.substr(0, mtp_path.find_last_of('/') + 1);
-                std::string sl = dir + "draft_shortlist.bin";
-                FILE * fp = std::fopen(sl.c_str(), "rb");
-                if (!fp) {
-                    sl = "models/draft_shortlist.bin";
-                    fp = std::fopen(sl.c_str(), "rb");
+                std::vector<std::string> candidates;
+                const size_t slash = mtp_path.find_last_of('/');
+                const std::string mtp_dir = (slash == std::string::npos) ? std::string() : mtp_path.substr(0, slash + 1);
+                candidates.push_back(mtp_dir + "draft_shortlist.bin");
+                candidates.push_back("models/draft_shortlist.bin");
+
+                char exe_buf[4096];
+                const ssize_t exe_len = ::readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+                if (exe_len > 0) {
+                    exe_buf[exe_len] = '\0';
+                    const std::string exe_path(exe_buf);
+                    const size_t eslash = exe_path.find_last_of('/');
+                    if (eslash != std::string::npos) {
+                        const std::string exe_dir = exe_path.substr(0, eslash + 1);
+                        candidates.push_back(exe_dir + "draft_shortlist.bin");
+                        candidates.push_back(exe_dir + "models/draft_shortlist.bin");
+                        candidates.push_back(exe_dir + "../models/draft_shortlist.bin");
+                        candidates.push_back(exe_dir + "../share/nib/draft_shortlist.bin");
+                    }
                 }
-                if (!fp) throw std::runtime_error("mtp: cannot open draft_shortlist.bin");
+
+                FILE * fp = nullptr;
+                for (const auto & cand : candidates) {
+                    fp = std::fopen(cand.c_str(), "rb");
+                    if (fp) break;
+                }
+                if (!fp) {
+                    std::string msg = "mtp: cannot open draft_shortlist.bin (place it next to mtp.safetensors; searched:";
+                    for (const auto & cand : candidates) msg += " " + cand;
+                    msg += ")";
+                    throw std::runtime_error(msg);
+                }
                 ranks.resize(65536);
                 const size_t got = std::fread(ranks.data(), 4, ranks.size(), fp);
                 std::fclose(fp);

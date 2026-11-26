@@ -1029,6 +1029,33 @@ static __global__ void inkling_fa_decode_combine_kernel(
 using halfx16_t = __attribute__((ext_vector_type(16))) _Float16;
 using floatx8_t = __attribute__((ext_vector_type(8)))  float;
 
+// Materialize WMMA accumulators in VGPRs at this program point (zero instructions emitted).
+// The K*Q^T WMMAs are pure arithmetic, so nothing ties them to the inline-asm s_barrier that
+// follows them. AMD clang 22 (ROCm 7.2.x) sinks all of them past that barrier and the whole
+// V dequant/transpose phase, keeping every K fragment plus O_acc live across it -> ~200 VGPR
+// spills per prefill kernel (issue #6). The volatile asm cannot move across the volatile barrier
+// asm, so S must be complete before it. clang 24 already schedules them here: no-op for it.
+static __device__ __forceinline__ void pin_wmma_acc(floatx8_t & acc) {
+    asm volatile("" : "+v"(acc));
+}
+template <int N>
+static __device__ __forceinline__ void pin_wmma_acc(floatx8_t (&acc)[N]) {
+    #pragma unroll
+    for (int i = 0; i < N; ++i) {
+        pin_wmma_acc(acc[i]);
+    }
+}
+
+// Bit-exact __shfl_xor(v, MASK, 32) for a fully active wave32, via ds_swizzle BitMode
+// (and_mask = 0x1F, xor_mask = MASK). Unlike __shfl_xor's ds_bpermute it needs no lane-index
+// VGPR, so LICM has nothing to hoist out of the KV tile loop and keep live across it (clang 22
+// spilled exactly those lane^k indices in the 6-warp kernel, issue #6).
+template <int MASK>
+static __device__ __forceinline__ int shfl_xor_swz(int v) {
+    static_assert(MASK > 0 && MASK < 32, "ds_swizzle BitMode xor_mask is 5 bits");
+    return __builtin_amdgcn_ds_swizzle(v, (MASK << 10) | 0x1F);
+}
+
 static __device__ __forceinline__ halfx16_t load_halfx16_b128(const _Float16 * ptr) {
     const uint4 v0 = *(const uint4 *)(ptr + 0);
     const uint4 v1 = *(const uint4 *)(ptr + 8);
@@ -1371,16 +1398,16 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                         }
                     }
                 }
-                mn = min(mn, __shfl_xor(mn, 16, 32));
-                mn = min(mn, __shfl_xor(mn,  8, 32));
-                mn = min(mn, __shfl_xor(mn,  4, 32));
-                mn = min(mn, __shfl_xor(mn,  2, 32));
-                mn = min(mn, __shfl_xor(mn,  1, 32));
-                mx = max(mx, __shfl_xor(mx, 16, 32));
-                mx = max(mx, __shfl_xor(mx,  8, 32));
-                mx = max(mx, __shfl_xor(mx,  4, 32));
-                mx = max(mx, __shfl_xor(mx,  2, 32));
-                mx = max(mx, __shfl_xor(mx,  1, 32));
+                mn = min(mn, shfl_xor_swz<16>(mn));
+                mn = min(mn, shfl_xor_swz<8>(mn));
+                mn = min(mn, shfl_xor_swz<4>(mn));
+                mn = min(mn, shfl_xor_swz<2>(mn));
+                mn = min(mn, shfl_xor_swz<1>(mn));
+                mx = max(mx, shfl_xor_swz<16>(mx));
+                mx = max(mx, shfl_xor_swz<8>(mx));
+                mx = max(mx, shfl_xor_swz<4>(mx));
+                mx = max(mx, shfl_xor_swz<2>(mx));
+                mx = max(mx, shfl_xor_swz<1>(mx));
                 if (l_tmp == 0) {
                     tile_min_kp = mn;
                     tile_max_kp = mx;
@@ -1532,6 +1559,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                 __builtin_amdgcn_sched_barrier(0);
             }
         }
+        pin_wmma_acc(S);
         asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 
         // Cooperatively dequantize & transpose V_T into LDS
@@ -1586,7 +1614,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             if (!far_no_rel) {
                 const bool lane_has_rel = q_in && ((qp_val - (kp_base + BC - 1)) < N_REL_EXTENT);
                 if (__any(lane_has_rel) && q_in) {
-                    int32_t qi_rel = qp_val - pos_start;
+                    int32_t qi_rel = q_block + qt * 16 + l_qlocal; // == qp_val - pos_start
                     asm volatile("" : "+v"(qi_rel));
                     const int h_rel = h_kv * GQA_RATIO + g;
                     const float * rel_row = rel_table + ((int64_t)qi_rel * N_HEAD + h_rel) * N_REL_EXTENT;
@@ -1634,7 +1662,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
                                       (qp_val >= tile_min_kp) &&
                                       ((qp_val - tile_max_kp) < N_REL_EXTENT);
             if (__any(lane_has_rel)) {
-                int32_t qi_rel = qp_val - pos_start;
+                int32_t qi_rel = q_block + qt * 16 + l_qlocal; // == qp_val - pos_start
                 asm volatile("" : "+v"(qi_rel));
                 const int h_rel = h_kv * GQA_RATIO + g;
                 const float * rel_row = q_in ? (rel_table + ((int64_t)qi_rel * N_HEAD + h_rel) * N_REL_EXTENT) : nullptr;
@@ -1734,12 +1762,17 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
     if (qp_val >= q_pos_lim) {
         return;
     }
-    const int qi = qp_val - pos_start;
+    // Re-derive the lane-dependent epilogue indices from a fresh opaque lane copy instead of
+    // carrying qi / half_w across the whole KV loop (clang 22 spilled both at the 6-warp cap).
+    int l_epi = lane;
+    asm volatile("" : "+v"(l_epi));
+    const int half_w_e = l_epi >> 4;
+    const int qi = q_block + qt * 16 + (l_epi & 15); // == qp_val - pos_start
     const int h  = h_kv * GQA_RATIO + g;
 
     if (split_k > 1) {
         const int64_t meta_idx = ((int64_t)qi * N_HEAD + h) * split_k + split;
-        if (half_w == 0) {
+        if (half_w_e == 0) {
             tmp_meta[meta_idx] = make_float2(m_q, l_q);
         }
         if (m_q > -INFINITY) {
@@ -1748,7 +1781,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
             for (int c = 0; c < 8; ++c) {
                 #pragma unroll
                 for (int idx = 0; idx < 8; ++idx) {
-                    dst[c * 16 + 2 * idx + half_w] = O_acc[c][idx];
+                    dst[c * 16 + 2 * idx + half_w_e] = O_acc[c][idx];
                 }
             }
         }
@@ -1778,7 +1811,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         for (int idx = 0; idx < 8; ++idx) {
             const float cur   = O_acc[c][idx];
             const float other = __shfl_xor(cur, 16, 32);
-            O_acc[c][idx] = (half_w == 0) ? (cur + other) : (other - cur);
+            O_acc[c][idx] = (half_w_e == 0) ? (cur + other) : (other - cur);
         }
     }
     // Stage 1 (h = 2, bit 1 = idx & 1)
@@ -1849,7 +1882,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         for (int c = 0; c < 8; ++c) {
             #pragma unroll
             for (int idx = 0; idx < 8; ++idx) {
-                const int d = c * 16 + 2 * idx + half_w;
+                const int d = c * 16 + 2 * idx + half_w_e;
                 const float g_val = gate_ptr[d];
                 dst_ptr[d] = O_acc[c][idx] * (1.0f / (1.0f + fast_exp2f(-g_val * LOG2E)));
             }
@@ -1859,7 +1892,7 @@ static __global__ void inkling_fa_prefill_gqa_wmma_kernel(
         for (int c = 0; c < 8; ++c) {
             #pragma unroll
             for (int idx = 0; idx < 8; ++idx) {
-                dst_ptr[c * 16 + 2 * idx + half_w] = O_acc[c][idx];
+                dst_ptr[c * 16 + 2 * idx + half_w_e] = O_acc[c][idx];
             }
         }
     }
