@@ -18,13 +18,14 @@
     "mmproj": "mmproj-Inkling-2-Mini-Q8_0.gguf",
     "mmproj_weights_mib": 329.9
   },
-  "environment_salad_wsl2": {
-    "node_instance": "76622ddf-3916-4cf3-970e-369bfa2419a6",
+  "environment_windows_wsl2": {
     "kernel": "6.18.58.1-microsoft-standard-WSL2",
     "container_image": "rocm/dev-ubuntu-24.04:7.2.4",
-    "priority": "medium",
-    "hourly_usd": 0.134,
-    "idle_vram_mb": { "used": 173, "free": 24387, "gtt": 18 },
+    "idle_vram_mb": {
+      "used": 173,
+      "free": 24387,
+      "gtt": 18
+    },
     "wsl2_wddm_single_process_cap_gib": 23.0
   },
   "bench_ab_q8_0_c16384": {
@@ -48,7 +49,7 @@
       "cpu_embd": false,
       "non_mtp_pp512_tps": 4799.67,
       "non_mtp_pp512_std": 147.47,
-      "non_mtp_tg128_tps": 141.80,
+      "non_mtp_tg128_tps": 141.8,
       "non_mtp_tg128_std": 0.18,
       "decode_graph_nodes": 296,
       "mtp_tg128_tps": 232.18,
@@ -85,8 +86,18 @@
     "s4_256k_q8_mtp_vision": {
       "baseline_sp224": {
         "boot_reported_vram_gib": 21.878,
-        "1080p": { "ok": true, "ttft_ms": 585.7, "tps": 205.8, "vis_vram_gib": 0.623, "peak_vram_mb": 24222, "min_free_mb": 338 },
-        "1440p": { "ok": false, "error": "OOM crash (Connection refused)" }
+        "1080p": {
+          "ok": true,
+          "ttft_ms": 585.7,
+          "tps": 205.8,
+          "vis_vram_gib": 0.623,
+          "peak_vram_mb": 24222,
+          "min_free_mb": 338
+        },
+        "1440p": {
+          "ok": false,
+          "error": "OOM crash (Connection refused)"
+        }
       },
       "patched_default_flags": {
         "ctx": 262144,
@@ -95,51 +106,214 @@
         "cpu_embd": false,
         "boot_vram_gib": 22.495,
         "boot_free_gib": 0.592,
-        "1080p":   { "ok": true, "tps": 208.8, "vis_vram_gib": 0.333, "ws_now_mib": 0.0, "ws_peak_mib": 131.65, "peak_vram_mb": 24453, "min_free_mb": 107 },
-        "1440p":   { "ok": true, "ttft_ms": 1114.8, "tps": 230.3, "vis_vram_gib": 0.342, "ws_now_mib": 0.0, "ws_peak_mib": 234.03, "peak_vram_mb": 23997, "min_free_mb": 563 },
-        "4k":      { "ok": true, "ttft_ms": 2360.5, "tps": 219.5, "vis_vram_gib": 0.357, "ws_now_mib": 0.0, "ws_peak_mib": 414.40, "peak_vram_mb": 24280, "min_free_mb": 280 },
-        "max2560": { "ok": true, "ttft_ms": 2259.4, "tps": 222.8, "vis_vram_gib": 0.357, "ws_now_mib": 0.0, "ws_peak_mib": 416.03, "peak_vram_mb": 24282, "min_free_mb": 278 },
-        "text_after": { "ok": true, "ttft_ms": 64.0, "tps": 163.0, "peak_vram_mb": 23864, "min_free_mb": 696 }
+        "1080p": {
+          "ok": true,
+          "tps": 208.8,
+          "vis_vram_gib": 0.333,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 131.65,
+          "peak_vram_mb": 24453,
+          "min_free_mb": 107
+        },
+        "1440p": {
+          "ok": true,
+          "ttft_ms": 1114.8,
+          "tps": 230.3,
+          "vis_vram_gib": 0.342,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 234.03,
+          "peak_vram_mb": 23997,
+          "min_free_mb": 563
+        },
+        "4k": {
+          "ok": true,
+          "ttft_ms": 2360.5,
+          "tps": 219.5,
+          "vis_vram_gib": 0.357,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 414.4,
+          "peak_vram_mb": 24280,
+          "min_free_mb": 280
+        },
+        "max2560": {
+          "ok": true,
+          "ttft_ms": 2259.4,
+          "tps": 222.8,
+          "vis_vram_gib": 0.357,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 416.03,
+          "peak_vram_mb": 24282,
+          "min_free_mb": 278
+        },
+        "text_after": {
+          "ok": true,
+          "ttft_ms": 64.0,
+          "tps": 163.0,
+          "peak_vram_mb": 23864,
+          "min_free_mb": 696
+        }
       }
     },
     "s4_128k_q8_sp224_mtp_vision": {
       "baseline": {
         "boot_reported_vram_gib": 19.716,
-        "1080p":      { "ok": true, "ttft_ms": 587.4,  "tps": 204.7, "vis_vram_gib": 0.623, "peak_vram_mb": 21999, "min_free_mb": 2561 },
-        "1440p":      { "ok": true, "ttft_ms": 1117.7, "tps": 230.7, "vis_vram_gib": 0.858, "peak_vram_mb": 22245, "min_free_mb": 2315 },
-        "4k":         { "ok": true, "ttft_ms": 2361.2, "tps": 223.2, "vis_vram_gib": 1.271, "peak_vram_mb": 22650, "min_free_mb": 1910 },
-        "max2560":    { "ok": true, "ttft_ms": 2275.6, "tps": 226.6, "vis_vram_gib": 1.274, "peak_vram_mb": 22672, "min_free_mb": 1888 },
-        "text_after": { "ok": true, "ttft_ms": 64.4,   "tps": 152.7, "peak_vram_mb": 22672, "min_free_mb": 1888 }
+        "1080p": {
+          "ok": true,
+          "ttft_ms": 587.4,
+          "tps": 204.7,
+          "vis_vram_gib": 0.623,
+          "peak_vram_mb": 21999,
+          "min_free_mb": 2561
+        },
+        "1440p": {
+          "ok": true,
+          "ttft_ms": 1117.7,
+          "tps": 230.7,
+          "vis_vram_gib": 0.858,
+          "peak_vram_mb": 22245,
+          "min_free_mb": 2315
+        },
+        "4k": {
+          "ok": true,
+          "ttft_ms": 2361.2,
+          "tps": 223.2,
+          "vis_vram_gib": 1.271,
+          "peak_vram_mb": 22650,
+          "min_free_mb": 1910
+        },
+        "max2560": {
+          "ok": true,
+          "ttft_ms": 2275.6,
+          "tps": 226.6,
+          "vis_vram_gib": 1.274,
+          "peak_vram_mb": 22672,
+          "min_free_mb": 1888
+        },
+        "text_after": {
+          "ok": true,
+          "ttft_ms": 64.4,
+          "tps": 152.7,
+          "peak_vram_mb": 22672,
+          "min_free_mb": 1888
+        }
       },
       "patched": {
         "boot_vram_gib": 20.398,
         "boot_free_gib": 2.777,
         "cpu_embd": false,
-        "1080p":      { "ok": true, "ttft_ms": 576.0,  "tps": 205.9, "vis_vram_gib": 0.333, "ws_now_mib": 0.0, "ws_peak_mib": 131.65, "peak_vram_mb": 21817, "min_free_mb": 2743 },
-        "1440p":      { "ok": true, "ttft_ms": 1100.8, "tps": 230.0, "vis_vram_gib": 0.342, "ws_now_mib": 0.0, "ws_peak_mib": 234.03, "peak_vram_mb": 21931, "min_free_mb": 2629 },
-        "4k":         { "ok": true, "ttft_ms": 2327.5, "tps": 222.4, "vis_vram_gib": 0.357, "ws_now_mib": 0.0, "ws_peak_mib": 414.40, "peak_vram_mb": 22126, "min_free_mb": 2434 },
-        "max2560":    { "ok": true, "ttft_ms": 2253.1, "tps": 224.5, "vis_vram_gib": 0.357, "ws_now_mib": 0.0, "ws_peak_mib": 416.03, "peak_vram_mb": 22128, "min_free_mb": 2432 },
-        "text_after": { "ok": true, "ttft_ms": 64.4,   "tps": 164.9, "peak_vram_mb": 21709, "min_free_mb": 2851 }
+        "1080p": {
+          "ok": true,
+          "ttft_ms": 576.0,
+          "tps": 205.9,
+          "vis_vram_gib": 0.333,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 131.65,
+          "peak_vram_mb": 21817,
+          "min_free_mb": 2743
+        },
+        "1440p": {
+          "ok": true,
+          "ttft_ms": 1100.8,
+          "tps": 230.0,
+          "vis_vram_gib": 0.342,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 234.03,
+          "peak_vram_mb": 21931,
+          "min_free_mb": 2629
+        },
+        "4k": {
+          "ok": true,
+          "ttft_ms": 2327.5,
+          "tps": 222.4,
+          "vis_vram_gib": 0.357,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 414.4,
+          "peak_vram_mb": 22126,
+          "min_free_mb": 2434
+        },
+        "max2560": {
+          "ok": true,
+          "ttft_ms": 2253.1,
+          "tps": 224.5,
+          "vis_vram_gib": 0.357,
+          "ws_now_mib": 0.0,
+          "ws_peak_mib": 416.03,
+          "peak_vram_mb": 22128,
+          "min_free_mb": 2432
+        },
+        "text_after": {
+          "ok": true,
+          "ttft_ms": 64.4,
+          "tps": 164.9,
+          "peak_vram_mb": 21709,
+          "min_free_mb": 2851
+        }
       }
     }
   },
   "betterbench_native_flagship_baseline": {
     "source": "../betterbench_slots8_262k.json",
-    "config": { "slots": 8, "ctx": 262848, "kv_type": "q8_0", "sparse_pages": 224, "mtp": true, "vision": true },
+    "config": {
+      "slots": 8,
+      "ctx": 262848,
+      "kv_type": "q8_0",
+      "sparse_pages": 224,
+      "mtp": true,
+      "vision": true
+    },
     "single_stream_weighted_tps": 186.8,
     "single_stream_ttft_p50_ms": 69.0,
     "single_stream_update_p99_ms": 23.2,
     "concurrency": [
-      { "level": 1, "ok": 32, "requests": 32, "wall_s": 73.4, "aggregate_tps": 172.7, "median_stream_tps": 185.8, "ttft_p50_ms": 71.6 },
-      { "level": 2, "ok": 32, "requests": 32, "wall_s": 75.4, "aggregate_tps": 168.5, "median_stream_tps": 87.1,  "ttft_p50_ms": 87.1 },
-      { "level": 4, "ok": 32, "requests": 32, "wall_s": 56.1, "aggregate_tps": 223.9, "median_stream_tps": 58.4,  "ttft_p50_ms": 104.7 },
-      { "level": 8, "ok": 32, "requests": 32, "wall_s": 47.3, "aggregate_tps": 268.0, "median_stream_tps": 36.0,  "ttft_p50_ms": 138.2 }
+      {
+        "level": 1,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 73.4,
+        "aggregate_tps": 172.7,
+        "median_stream_tps": 185.8,
+        "ttft_p50_ms": 71.6
+      },
+      {
+        "level": 2,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 75.4,
+        "aggregate_tps": 168.5,
+        "median_stream_tps": 87.1,
+        "ttft_p50_ms": 87.1
+      },
+      {
+        "level": 4,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 56.1,
+        "aggregate_tps": 223.9,
+        "median_stream_tps": 58.4,
+        "ttft_p50_ms": 104.7
+      },
+      {
+        "level": 8,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 47.3,
+        "aggregate_tps": 268.0,
+        "median_stream_tps": 36.0,
+        "ttft_p50_ms": 138.2
+      }
     ]
   },
   "betterbench_patched_visionfix_local": {
     "source": "betterbench_slots8_196k_visionfix.json",
-    "node": "76622ddf",
-    "config": { "slots": 8, "ctx": 196608, "kv_type": "q8_0", "sparse_pages": 224, "mtp": true, "vision": true, "cpu_embd": false },
+    "config": {
+      "slots": 8,
+      "ctx": 196608,
+      "kv_type": "q8_0",
+      "sparse_pages": 224,
+      "mtp": true,
+      "vision": true,
+      "cpu_embd": false
+    },
     "batch_graphs_captured": 34,
     "single_stream_category_median_tps": {
       "chat": 141.0,
@@ -155,19 +329,63 @@
       "update_p99_ms": 22.7
     },
     "concurrency": [
-      { "level": 1, "ok": 32, "requests": 32, "wall_s": 73.3, "aggregate_tps": 172.2, "median_stream_tps": 191.8, "ttft_p50_ms": 71.8,  "ttft_p99_ms": 88.7 },
-      { "level": 2, "ok": 32, "requests": 32, "wall_s": 73.7, "aggregate_tps": 170.9, "median_stream_tps": 88.0,  "ttft_p50_ms": 83.5,  "ttft_p99_ms": 139.3 },
-      { "level": 4, "ok": 32, "requests": 32, "wall_s": 56.3, "aggregate_tps": 224.7, "median_stream_tps": 58.7,  "ttft_p50_ms": 101.8, "ttft_p99_ms": 288.7 },
-      { "level": 8, "ok": 32, "requests": 32, "wall_s": 47.0, "aggregate_tps": 264.0, "median_stream_tps": 35.2,  "ttft_p50_ms": 137.4, "ttft_p99_ms": 617.0 }
+      {
+        "level": 1,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 73.3,
+        "aggregate_tps": 172.2,
+        "median_stream_tps": 191.8,
+        "ttft_p50_ms": 71.8,
+        "ttft_p99_ms": 88.7
+      },
+      {
+        "level": 2,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 73.7,
+        "aggregate_tps": 170.9,
+        "median_stream_tps": 88.0,
+        "ttft_p50_ms": 83.5,
+        "ttft_p99_ms": 139.3
+      },
+      {
+        "level": 4,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 56.3,
+        "aggregate_tps": 224.7,
+        "median_stream_tps": 58.7,
+        "ttft_p50_ms": 101.8,
+        "ttft_p99_ms": 288.7
+      },
+      {
+        "level": 8,
+        "ok": 32,
+        "requests": 32,
+        "wall_s": 47.0,
+        "aggregate_tps": 264.0,
+        "median_stream_tps": 35.2,
+        "ttft_p50_ms": 137.4,
+        "ttft_p99_ms": 617.0
+      }
     ],
-    "post_concurrency_vram_mb": { "used": 23443, "free": 1117, "gtt": 77 },
+    "post_concurrency_vram_mb": {
+      "used": 23443,
+      "free": 1117,
+      "gtt": 77
+    },
     "post_concurrency_1080p_vision_smoke": {
       "ok": true,
       "prompt_tokens": 1321,
       "completion_tokens": 85,
       "ttft_ms": 618.9,
       "decode_tps": 221.7,
-      "post_vram_mb": { "used": 23455, "free": 1105, "gtt": 77 },
+      "post_vram_mb": {
+        "used": 23455,
+        "free": 1105,
+        "gtt": 77
+      },
       "health": {
         "vram_gib": 22.0025,
         "llm_vram_gib": 20.9883,

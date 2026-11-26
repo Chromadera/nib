@@ -1,6 +1,6 @@
 # AMD Radeon RX 7900 XTX (24 GB) — Real-Hardware Nib Evaluation & Vision-Fix Verification
 
-Real-silicon characterization and baseline-vs-patched A/B verification of **Nib** running **Inkling 2 Mini** (`Inkling-2-Mini-NVFP4-Mixed.gguf`, `16.34 GiB` weights) on **AMD Radeon RX 7900 XTX** (`gfx1100` / Navi 31, `96 CU` / `48 WGP`, `24 GB` GDDR6 @ `960 GB/s`, `96 MiB` L3 Infinity Cache), tested on both native Linux (ROCm 7.16) and SaladCloud Windows/WSL2 ROCDXG (`rocm/dev-ubuntu-24.04:7.2.4`, node `76622ddf`) on **2026-11-26**.
+Real-silicon characterization and baseline-vs-patched A/B verification of **Nib** running **Inkling 2 Mini** (`Inkling-2-Mini-NVFP4-Mixed.gguf`, `16.34 GiB` weights) on **AMD Radeon RX 7900 XTX** (`gfx1100` / Navi 31, `96 CU` / `48 WGP`, `24 GB` GDDR6 @ `960 GB/s`, `96 MiB` L3 Infinity Cache), tested on both native Linux (ROCm 7.16) and Windows/WSL2 ROCDXG (`rocm/dev-ubuntu-24.04:7.2.4`) on **2026-11-26**.
 
 > **TL;DR**
 > - **Zero regression on the 24 GB RX 7900 XTX hot path:** `< 22 GiB` auto-defaults are a complete no-op on 24 GB GPUs (`kv=q8_0`, `ctx=262144`, `cpu_embd=False`, identical `296`-node non-MTP / `300`-node MTP decode HIP graphs). `nib bench` matches baseline within `0.1%` (`141.99 → 141.80 tok/s` non-MTP; `233.13 → 232.18 tok/s` MTP, `verify = 13.21 → 13.22 ms`).
@@ -30,14 +30,12 @@ Real-silicon characterization and baseline-vs-patched A/B verification of **Nib*
 
 ## 1. Test Environments & Platform Notes
 
-| Layer | Native Linux Flagship Baseline | SaladCloud WSL2/ROCDXG A/B Host (`nib-rx7900xtx`) |
+| Layer | Native Linux Flagship Baseline | Windows/WSL2 ROCDXG A/B Host |
 |---|---|---|
 | **GPU** | AMD Radeon RX 7900 XTX (`gfx1100`, `96 CU` / `48 WGP`, `384-bit`, `960 GB/s`, `96 MiB` L3) | AMD Radeon RX 7900 XTX (`gfx1100`, `96 CU` / `48 WGP`, `384-bit`, `960 GB/s`, `96 MiB` L3) |
 | **Physical VRAM** | `24,560 MB` (`23.94 GiB` usable) | `24,560 MB` (`24,387 MB` free when idle; `~23.0 GiB` single-process WSL2 WDDM DXG cap) |
 | **OS / Virtualization** | Native Linux (`/dev/kfd`) | Windows WDDM + WSL2 (`6.18.58.1-microsoft-standard-WSL2`), `/dev/dxg` (`ROCDXG`) |
 | **ROCm / Compiler** | ROCm 7.16 (clang 24, **0 spills** across all 18 objects) | `rocm/dev-ubuntu-24.04:7.2.4` (clang 22; `-DCMAKE_EXE_LINKER_FLAGS="-no-pie"`, 0 decode spills) |
-| **Container Resources** | Host native | `4 vCPU`, `16,384 MB` RAM, `8,192 MB` `/dev/shm`, `45 GiB` persistent storage, `medium` priority (`$0.134/hr`, PID 1 = `sleep infinity`) |
-| **Node / Instance** | Local workstation | SaladCloud instance `76622ddf-3916-4cf3-970e-369bfa2419a6` |
 
 ### Key WSL2 vs Native Linux Finding on 24 GB RX 7900 XTX
 - On **native Linux**, `--slots 8 -c 262848 --kv-type q8_0 --sparse-pages 224 --mtp --mmproj` (`22.06 GiB` LLM + `0.68 GiB` MTP + `0.32 GiB` Vision = `23.08 GiB` app + `~0.42 GiB` HIP runtime) boots and runs with full `262K` context.
@@ -50,7 +48,7 @@ Real-silicon characterization and baseline-vs-patched A/B verification of **Nib*
 
 ## 2. Zero-Regression A/B Verification (`build_base/nib` vs `build/nib`)
 
-Both binaries were compiled from the exact same checkout (`build_base/nib` unpatched vs `build/nib` with all 9 host-only C++ changes: aliased single-arena ViT scratch + post-encode release, `--cpu-embd`, `< 22 GiB` auto defaults, accurate VRAM accounting) and benchmarked back-to-back on node `76622ddf`.
+Both binaries were compiled from the exact same checkout (`build_base/nib` unpatched vs `build/nib` with all 9 host-only C++ changes: aliased single-arena ViT scratch + post-encode release, `--cpu-embd`, `< 22 GiB` auto defaults, accurate VRAM accounting) and benchmarked back-to-back on the same Windows/WSL2 ROCDXG system.
 
 ### 24 GB Default Policy Check
 Launching `build/nib serve -m ... --mtp ... --mmproj ...` with **no** `-c`, `--kv-type`, or `--cpu-embd` flags left 24 GB defaults completely untouched:

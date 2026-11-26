@@ -68,7 +68,7 @@
     ],
     "notes": {
       "gpu": "rx7900xt_84cu_20gb",
-      "host": "saladcloud_wsl2_rocdxg",
+      "host": "windows_wsl2_rocdxg",
       "rocm": "7.2.4",
       "slots": "4",
       "max_ctx": "131072",

@@ -1,13 +1,15 @@
 # AMD Radeon RX 7900 XT (20 GB) — Real-Hardware Nib Evaluation
 
-Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-Mini-NVFP4-Mixed.gguf`, `16.34 GiB` weights) on **AMD Radeon RX 7900 XT** (`gfx1100` / Navi 31, `84 CU` / `42 WGP`, `20 GB` GDDR6 @ `800 GB/s`), tested across SaladCloud community nodes on **2026-11-25 – 2026-11-26** (including pre-fix reproduction and post-fix verification of [`Chromadera/nib#5`](https://github.com/Chromadera/nib/issues/5)).
+Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-Mini-NVFP4-Mixed.gguf`, `16.34 GiB` weights) on **AMD Radeon RX 7900 XT** (`gfx1100` / Navi 31, `84 CU` / `42 WGP`, `20 GB` GDDR6 @ `800 GB/s`), tested under Windows/WSL2 (`ROCDXG`, ROCm 7.2.4) on **2026-11-25 – 2026-11-26** (including pre-fix reproduction and post-fix verification of [`Chromadera/nib#5`](https://github.com/Chromadera/nib/issues/5)).
 
 > **TL;DR**
-> - **Decode matches 90–92% of RX 7900 XTX** (`168.2 tok/s` weighted BetterBench MTP on clean host `b121017c`, `114–125 tok/s` non-MTP, `143–166 tok/s` MTP up to `142K` tokens) — beating the raw 83.3% memory-bandwidth ratio (`800 / 960 GB/s`) thanks to 80 MiB Infinity Cache.
+> - **Decode matches 90–92% of RX 7900 XTX** (`168.2 tok/s` weighted BetterBench MTP on a low-desktop-VRAM host, `114–125 tok/s` non-MTP, `143–166 tok/s` MTP up to `142K` tokens) — beating the raw 83.3% memory-bandwidth ratio (`800 / 960 GB/s`) thanks to 80 MiB Infinity Cache.
 > - **Plug-and-play Vision up to `4K` / `2560×2560` max-res with `0 MB` GTT spill:** With single-arena aliased ViT scratch (freed immediately post-encode, `-56%` workspace), `--cpu-embd` (`-469.3 MiB` VRAM, `< 0.8%` plain decode delta), and `< 22 GiB` VRAM-aware auto-defaults, launching `nib serve --mtp --mmproj` with **zero `-c`/`--kv-type` flags** automatically configures `--slots 4 -c 65536 --kv-type q4_1 --cpu-embd` and passes **`1080p → 1440p → 4K 3840×2160 → 2560×2560` max (`4,096` img toks)** at **`143–173 tok/s`** with **`0 MB` GTT** and **`561–908 MB` free at peak**. Even `mandrav`'s `--slots 4 -c 131072 q4_1 + MTP + Vision` config (previously hard OOM / `38–53 tok/s` GTT spill) now passes **`1080p` at `168.3 tok/s` (`0 MB` GTT)** and cleanly returns `HTTP 400` on oversize images.
-> - **True 4-Way & 8-Way Parallel Streaming (`--slots 8 -c 65536 --kv-type q4_1 --mtp`, localhost zero-RTT, `48/48 OK`):** **`192.7 tok/s` agg** at `c = 4` (`50.0 tok/s`/stream, `118.7 ms` TTFT p50) and **`213.0 tok/s` agg** at `c = 8` (`30.4 tok/s`/stream, `162.5 ms` TTFT p50, 33 static batch HIP graphs captured) — with up to **`55.2 tok/s`/stream** at `c = 4` on lower-desktop-VRAM hosts (`b121017c`).
+> - **True 4-Way & 8-Way Parallel Streaming (`--slots 8 -c 65536 --kv-type q4_1 --mtp`, localhost zero-RTT, `48/48 OK`):** **`192.7 tok/s` agg** at `c = 4` (`50.0 tok/s`/stream, `118.7 ms` TTFT p50) and **`213.0 tok/s` agg** at `c = 8` (`30.4 tok/s`/stream, `162.5 ms` TTFT p50, 33 static batch HIP graphs captured) — with up to **`55.2 tok/s`/stream** at `c = 4` on lower-desktop-VRAM hosts.
 > - **Full native 256K context (`262,848`) fits and runs cleanly on 20 GB even under Windows/WSL2** using `--kv-type q4_0 --sparse-pages 224 --no-vision` (no MTP): **`19.10 GiB`**, holding **`114.2 tok/s` decode** and **`2,278 tok/s` prefill** at `256,000` depth.
 > - **With DSpark MTP enabled (text-only, `--no-vision`)**, the WSL2 safe ceiling (`≤19.10 GiB` solo; `≤18.7 GiB` recommended for multi-slot to avoid Windows WDDM 2s TDR when host desktop VRAM is pinned) supports up to **`90K` (`q8_0`)**, **`160K` (`q4_1`)**, or **`176K` (`q4_0`)** solo, **`128K` @ `--slots 4`** (`q4_1`), and **`64K` @ `--slots 8`** (`q4_1`, `8K/slot`) — with an additional `+469 MiB` headroom available via `--cpu-embd`.
+>
+> **Update (`NVFP4-23`, 2026-11-26):** Using [`Inkling-2-Mini-NVFP4-23.gguf`](https://huggingface.co/degenmeowster/Inkling-2-Mini-Nib-Pack) (`14.99 GiB`, `-1.43 GiB` vs. Mixed, `0.00483` Mean KLD) unlocks **full `262,848` context with DSpark MTP across `--slots 1, 4, 8`** (`157.2` solo / `199.0` `c = 4` / `207.6 tok/s` `c = 8` agg; `3,218 tok/s` prefill @ `204K`) plus **`4K` / `2560²` Vision + MTP at `262,848` (`s1`)** with `0 MB` GTT spill. See the full evaluation in **[`nvfp4_23_2026-11-26/README.md`](nvfp4_23_2026-11-26/README.md)**.
 
 ---
 
@@ -19,10 +21,9 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 | [`benchmarks.json`](benchmarks.json) | Machine-readable dataset of all Stage 1/2 VRAM probes, non-MTP `nib bench`, MTP `nib gen`, and BetterBench summaries (both `--slots 4` WAN and `--slots 8` localhost) |
 | [`betterbench_slots8_64k_local.json`](betterbench_slots8_64k_local.json) | Zero-WAN-RTT localhost BetterBench JSON (`--slots 8 -c 65536 q4_1 + MTP`, single-stream + true `c=1,2,4,8` parallel streaming, `48/48` reqs/level) |
 | [`betterbench_slots8_64k_local.html`](betterbench_slots8_64k_local.html) | Interactive localhost `--slots 8` BetterBench HTML report |
-| [`betterbench_slots4_128k.json`](betterbench_slots4_128k.json) | Complete unified BetterBench JSON (`--slots 4 -c 131072 q4_1 + MTP`, over SaladCloud WAN gateway: single-stream + `c=1,2,4,8` + prefill ladder) |
+| [`betterbench_slots4_128k.json`](betterbench_slots4_128k.json) | Complete unified BetterBench JSON (`--slots 4 -c 131072 q4_1 + MTP`, over remote WAN gateway: single-stream + `c=1,2,4,8` + prefill ladder) |
 | [`betterbench_slots4_128k.html`](betterbench_slots4_128k.html) | Interactive `--slots 4` BetterBench HTML report |
 | [`rx7900xt_vs_xtx_chart.html`](rx7900xt_vs_xtx_chart.html) | Visual RX 7900 XT vs. RX 7900 XTX comparison dashboard |
-| [`scripts/salad_bootstrap.sh`](scripts/salad_bootstrap.sh) | Container bootstrap for SaladCloud RX 7900 XT (`nib` build, `aria2c` weights, IPv6↔IPv4 `socat` bridge, multi-slot fallback) |
 | [`scripts/vram_ceiling_probe.sh`](scripts/vram_ceiling_probe.sh) | Stage 1 raw HIP `hipMalloc`/`hipMemset` + Stage 2 real `nib` VRAM ceiling matrix |
 | [`scripts/bench_nonmtp.sh`](scripts/bench_nonmtp.sh) | Non-MTP `nib bench` depth sweep (`q4_1`, `q8_0`, `q4_0`) |
 | [`scripts/bench_q40_262k.sh`](scripts/bench_q40_262k.sh) | Focused same-GPU `q4_0 @ 131K` vs. `q4_0 @ 262,848` (`0 → 256,000`) benchmark |
@@ -34,7 +35,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 
 ## 1. Test Environment & Platform Notes
 
-### Hardware & Stack (3-Layer SaladCloud AMD Architecture)
+### Hardware & Software Stack
 
 | Layer | Specification |
 |---|---|
@@ -42,9 +43,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 | **Reported VRAM** | `20,464 MB` (`amd-smi`) / `20,420.8 MiB` = `19.942 GiB` (`hipGetDeviceProperties`) |
 | **Host OS & Driver** | Windows host (WDDM) + AMD Software Adrenalin `26.20.29.02-261116a-206168C` |
 | **Virtualization** | WSL2 (`6.18.58.1-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC x86_64`), GPU exposed via `/dev/dxg` (`ROCDXG` / `librocdxg`; no `/dev/kfd` or `/dev/dri`) |
-| **Container Image** | `rocm/dev-ubuntu-24.04:7.2.4` (`1.22 GB` compressed; HIP `7.2.53211`, AMD clang `22.0.0git`) |
-| **Container Resources** | `4 vCPU`, `16,384 MB` RAM, `8,192 MB` `/dev/shm`, `40 GiB` ephemeral disk, `medium` priority (`$0.122/hr`) |
-| **Nodes Tested** | `b121017c` (BetterBench), `6eb9be11` (VRAM probe + MTP matrix), `dddf7d23` (Non-MTP sweep), `b840ff22` (Non-MTP `q4_0` 256K) |
+| **ROCm / Image** | `rocm/dev-ubuntu-24.04:7.2.4` (HIP `7.2.53211`, AMD clang `22.0.0git`) |
 
 ### Key Deployment & Compiler Findings
 
@@ -54,17 +53,13 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
    - Local native Linux **ROCm 7.16 (clang 24)** compiles all 18 `nib` objects with **0 spills**.
    - Container **ROCm 7.2.4 (clang 22)** spills `1312 VGPR / 4 SGPR` in `kernels_fa.o` and `1286 VGPR` in `kernels_sparse_global.o`, while **all decode kernels remain 0-spill**.
    - Result: decode hits **90–92% of RX 7900 XTX**, while dense `32K` and sparse `64K–256K` prefill land at **~72–75% of XTX** (estimated ~85% on native Linux ROCm 7.16 / `7.14.1-full`).
-4. **IPv6 Gateway Bridge:** `nib serve` binds IPv4 (`AF_INET`), whereas Salad Container Gateway connects over IPv6 — bridged cleanly with:
-   ```bash
-   socat TCP6-LISTEN:4444,ipv6only=0,fork,reuseaddr,nodelay,backlog=128 TCP4:127.0.0.1:4445
-   ```
-5. **Co-Residency Guards Verified on 42 WGPs:** Every node logged `occupancy blocks/WGP (wgp=42): wo_b=2 wo_c=2 wo_c_h2=3 mix_rms_qkv=4 a_qkv=4` and captured the 312-node static decode HIP graph with zero hangs or parity issues.
+4. **Co-Residency Guards Verified on 42 WGPs:** Startup logged `occupancy blocks/WGP (wgp=42): wo_b=2 wo_c=2 wo_c_h2=3 mix_rms_qkv=4 a_qkv=4` and captured the 312-node static decode HIP graph with zero hangs or parity issues.
 
 ---
 
 ## 2. Exact VRAM Ceiling & WDDM Behavior
 
-### Stage 1 — Raw HIP Allocation Ceiling (`6eb9be11`)
+### Stage 1 — Raw HIP Allocation Ceiling
 
 - **Idle at boot:** `18,591.2 MiB` (`18.155 GiB`) free (`1,829.6 MiB` held by Windows host).
 - **WDDM eviction under pressure:** Crossing `18 GiB` caused Windows WDDM to page ~`1.65 GiB` of host desktop VRAM out to system RAM (`used` dropped to `173.7 MiB` after freeing).
@@ -74,7 +69,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 
 > **Accounting note:** In the pre-fix binary used during the initial Stage 2 ceiling probe, `InklingEngine`'s `total_vram` and `/health`'s `vram_gib` omitted DSpark MTP's **`697 MiB` (`0.681 GiB`)**. Adding MTP plus ~**`0.30–0.41 GiB`** of HIP runtime / code objects / HIP graph metadata reconciles the `nib` cliff (`19.10 GiB`) with Stage 1 (`19.44 GiB`) to the megabyte. **Fixed in current `nib`:** startup logs and `/health` now report exact `llm + mtp + vision` VRAM, live `hipMemGetInfo` device free VRAM, and an explicit PCIe GTT spillover warning when free VRAM drops below `512 MiB`.
 
-| Config (`--slots 1` unless noted) | Engine VRAM | + MTP | Engine + MTP | Result on SaladCloud WSL2 |
+| Config (`--slots 1` unless noted) | Engine VRAM | + MTP | Engine + MTP | Result on Windows/WSL2 |
 |---|---:|---:|---:|---|
 | `q8_0` @ `65,536` + MTP | `17.91 GiB` | `0.68 GiB` | **`18.59 GiB`** | **PASS** |
 | `q4_1` @ `131,072` + MTP | `18.06 GiB` | `0.68 GiB` | **`18.74 GiB`** | **PASS** |
@@ -147,13 +142,13 @@ Calibrated to all measured hardware points (`≤0.007 GiB` error). Extra concurr
 | **`224,000`** | — | — | `116.14` | — | `114.70` | — |
 | **`256,000`** | — | — | — | — | **`114.20`** (`90.5%` XTX) | `126.22` |
 
-*\*`q4_0` measured on node `b840ff22` (which clocked ~3% lower than `dddf7d23` across both `131K` and `262K`, normal AIB clock variance). Comparing `131K` vs `262K` on `b840ff22` confirms `<1%` difference — zero WDDM throttling at `19.10 GiB`.*
+*\*`q4_0` measured on a second RX 7900 XT host (which clocked ~3% lower across both `131K` and `262K`, normal AIB clock variance). Comparing `131K` vs `262K` on the same GPU confirms `<1%` difference — zero WDDM throttling at `19.10 GiB`.*
 
 ---
 
 ## 5. MTP Benchmarks (`nib gen --mtp -n 256 --sparse-pages 224`)
 
-Measured on `6eb9be11` using identical real code+docs prompts (`README.md` + `src/engine.cpp` + `src/server.cpp` + C++17 `RingBuffer<T, N>` coding task):
+Measured using identical real code+docs prompts (`README.md` + `src/engine.cpp` + `src/server.cpp` + C++17 `RingBuffer<T, N>` coding task):
 
 | Config (`--slots 1`, MTP ON) | Engine + MTP VRAM | Prompt Tokens | Cumulative Prefill (`tok/s`) | MTP Decode (`tok/s`) | `tok/round` (`avg_m`) | `draft` / `verify` ms |
 |---|---:|---:|---:|---:|---:|---:|
@@ -178,8 +173,8 @@ Measured on `6eb9be11` using identical real code+docs prompts (`README.md` + `sr
 
 Two complementary BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce prefix cache) runs were executed on RX 7900 XT:
 
-1. **True 8-Slot Localhost Run (`127.0.0.1`, zero WAN RTT)** on `6eb9be11`: `--slots 8 -c 65536 --kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`17.98 GiB` engine / `18.66 GiB` total, `8K/slot` concurrent · `64K` solo, **48 requests/level**). Full reports: [`betterbench_slots8_64k_local.html`](betterbench_slots8_64k_local.html) · [`betterbench_slots8_64k_local.json`](betterbench_slots8_64k_local.json).
-2. **4-Slot 128K WAN Gateway Run** on `b121017c` (lower host desktop VRAM): `--slots 4 -c 131072 --kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`18.31 GiB` engine / `19.00 GiB` total, `32K/slot` concurrent · `128K` solo, **32 requests/level**, includes `~1.0–1.3s` SaladCloud WAN RTT). Full reports: [`betterbench_slots4_128k.html`](betterbench_slots4_128k.html) · [`betterbench_slots4_128k.json`](betterbench_slots4_128k.json).
+1. **True 8-Slot Localhost Run (`127.0.0.1`, zero WAN RTT):** `--slots 8 -c 65536 --kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`17.98 GiB` engine / `18.66 GiB` total, `8K/slot` concurrent · `64K` solo, **48 requests/level**). Full reports: [`betterbench_slots8_64k_local.html`](betterbench_slots8_64k_local.html) · [`betterbench_slots8_64k_local.json`](betterbench_slots8_64k_local.json).
+2. **4-Slot 128K WAN Gateway Run** (lower host desktop VRAM): `--slots 4 -c 131072 --kv-type q4_1 --sparse-pages 224 --mtp --no-vision` (`18.31 GiB` engine / `19.00 GiB` total, `32K/slot` concurrent · `128K` solo, **32 requests/level**, includes `~1.0–1.3s` remote WAN RTT). Full reports: [`betterbench_slots4_128k.html`](betterbench_slots4_128k.html) · [`betterbench_slots4_128k.json`](betterbench_slots4_128k.json).
 
 ### Parallel Concurrency — True 8-Way Localhost (`--slots 8 -c 65536`, Zero WAN RTT, `48/48 OK`)
 
@@ -191,9 +186,9 @@ Two complementary BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce pr
 | **`c = 8`** *(Batched 8-slot)* | `48/48` | **`213.0`** | **`30.4`** | **`162.5 ms`** | `268.0` / `36.0` / `138.2 ms` | `79.5%` / `84.4%` |
 
 - **33 dynamic static batch HIP graphs (`B = 2..8`)** were captured across the sweep, adding only **`~88 MB` total (`~2.8 MB/graph`)** (`amd-smi`: `USED_GTT 623 → 711 MB`).
-- **WSL2 WDDM multi-slot headroom & TDR finding:** Node `6eb9be11` kept `~1.1–1.4 GB` of Windows host desktop VRAM pinned even at idle, so `18.66 GiB` still had `~217–305 MB` of GTT spill (shaving ~8–10% off throughput vs. clean host `b121017c`, which hit `83.6 tok/s` at `c = 2` and `55.2 tok/s` at `c = 4`). Pushing `≥18.98 GiB` under multi-slot load on `6eb9be11` (`--slots 8 -c 98304` or `--slots 4 -c 131072`) triggered Windows' **2-second WDDM TDR** GPU reset during `B = 2 → B = 1` tail transitions. On native Linux (no Windows desktop VRAM, no 2s WDDM TDR), full `c = 4`/`c = 8` throughput scales cleanly to ~`88–92%` of XTX (`~205–210` agg @ `c = 4`, `~235–245` agg @ `c = 8`).
+- **WSL2 WDDM multi-slot headroom & TDR finding:** One Windows/WSL2 test host kept `~1.1–1.4 GB` of Windows host desktop VRAM pinned even at idle, so `18.66 GiB` still had `~217–305 MB` of GTT spill (shaving ~8–10% off throughput vs. a lower-desktop-VRAM host, which hit `83.6 tok/s` at `c = 2` and `55.2 tok/s` at `c = 4`). Pushing `≥18.98 GiB` under multi-slot load on that host (`--slots 8 -c 98304` or `--slots 4 -c 131072`) triggered Windows' **2-second WDDM TDR** GPU reset during `B = 2 → B = 1` tail transitions. On native Linux (no Windows desktop VRAM, no 2s WDDM TDR), full `c = 4`/`c = 8` throughput scales cleanly to ~`88–92%` of XTX (`~205–210` agg @ `c = 4`, `~235–245` agg @ `c = 8`).
 
-### Parallel Concurrency — 4-Slot 128K WAN Gateway (`b121017c`, `32/32 OK`)
+### Parallel Concurrency — 4-Slot 128K WAN Gateway (`32/32 OK`)
 
 | Concurrency | XT Per-Stream Median (`tok/s`) | XT Aggregate (`tok/s`) | XT Median TTFT | XTX Ref (`med` / `agg`) |
 |---:|---:|---:|---:|---:|
@@ -204,7 +199,7 @@ Two complementary BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce pr
 
 ### Single-Stream Decode (8 Categories, Greedy, Cold Nonce Prefix)
 
-| Category | XT `b121017c` (`--slots 4`, `128K`) | XT `6eb9be11` (`--slots 8`, `64K` local) | RX 7900 XTX Ref (`tok/s`) | Best XT / XTX |
+| Category | XT (`--slots 4`, `128K`) | XT (`--slots 8`, `64K` local) | RX 7900 XTX Ref (`tok/s`) | Best XT / XTX |
 |---|---:|---:|---:|---:|
 | `json` | **`192.9`** | `189.3` | `223.8` | `86.2%` |
 | `file_edit` | **`187.5`** | `181.5` | `213.1` | `88.0%` |
@@ -216,7 +211,7 @@ Two complementary BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce pr
 | `prose` | **`123.2`** | `118.7` | `137.9` | `89.3%` |
 | **Weighted Overall** | **`168.2`** | `156.2` *(TTFT `83 ms`, p99 `26.8 ms`)* | **`186.8`** | **`90.0%`** |
 
-### BetterBench Prefill Ladder (`q4_1 + MTP`, ROCm 7.2.4 + WAN RTT on `b121017c`)
+### BetterBench Prefill Ladder (`q4_1 + MTP`, ROCm 7.2.4 + WAN RTT)
 
 | Prompt Tokens | XT Prefill Median (`tok/s`) | XT Median TTFT | XTX Ref (`tok/s`, ROCm 7.16 local) |
 |---:|---:|---:|---:|
@@ -230,7 +225,7 @@ Two complementary BetterBench (`0.6.1`, corpus `v1.0`, `--greedy`, cold nonce pr
 
 ## 7. Vision (`--mmproj`) + MTP Matrix & Issue #5 Resolution
 
-Tested on clean RX 7900 XT node `f90c2c79` (`292 MB` idle VRAM, **`20,172 MB` / `19.70 GiB` free**, `0 MB` GTT — matching native Linux desktop headroom) with `mmproj-Inkling-2-Mini-Q8_0.gguf` (`329.9 MiB` weights), reproducing and verifying the fix for [`Chromadera/nib#5`](https://github.com/Chromadera/nib/issues/5).
+Tested on an RX 7900 XT host (`292 MB` idle VRAM, **`20,172 MB` / `19.70 GiB` free**, `0 MB` GTT — matching native Linux desktop headroom) with `mmproj-Inkling-2-Mini-Q8_0.gguf` (`329.9 MiB` weights), reproducing and verifying the fix for [`Chromadera/nib#5`](https://github.com/Chromadera/nib/issues/5).
 
 ### 7.1 Pre-Fix Reproduction (Issue #5 Root Cause)
 

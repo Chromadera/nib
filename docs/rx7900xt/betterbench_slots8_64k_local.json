@@ -49,7 +49,7 @@
   },
   "env": {
     "timestamp": "2026-11-25T21:56:27+0000",
-    "host": "1976ff70-3514-4baa-bdf9-0724036a521c",
+    "host": "rx7900xt-wsl2",
     "os": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
     "python": "3.12.3",
     "endpoint": "http://127.0.0.1:4444/v1",
@@ -75,7 +75,7 @@
       "sparse_pages": "224",
       "mtp": "dspark",
       "vision": "none",
-      "env": "saladcloud-wsl2-rocm724-localhost"
+      "env": "windows-wsl2-rocm724-localhost"
     },
     "corpus_hash": "e332dceff176d033",
     "max_model_len": 65536

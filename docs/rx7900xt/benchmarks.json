@@ -12,7 +12,6 @@
     "native_max_ctx": 262848
   },
   "environment": {
-    "provider": "SaladCloud",
     "gpu_market_name": "AMD Radeon RX 7900 XT",
     "gpu_arch": "gfx1100",
     "compute_units": 84,
@@ -36,26 +35,10 @@
       "kernels_sparse_global_o": "1286 VGPR spills (0 spills on ROCm 7.16 / clang 24)",
       "decode_kernels": "0 spills"
     },
-    "linker_flag_required": "-DCMAKE_EXE_LINKER_FLAGS=-no-pie",
-    "container_resources": {
-      "vcpu": 4,
-      "ram_mb": 16384,
-      "shm_mb": 8192,
-      "storage_gib": 40,
-      "priority": "medium",
-      "price_usd_per_hr": 0.122
-    },
-    "nodes_tested": [
-      { "id": "b121017c", "role": "nib-rx7900xt live server + BetterBench" },
-      { "id": "6eb9be11", "role": "Stage 1/2 VRAM ceiling probe + MTP prefill/decode matrix + slots=8 local BetterBench" },
-      { "id": "dddf7d23", "role": "Non-MTP nib bench (q4_1 131K, q8_0 131K, q4_1 229K, q4_0 262K partial)" },
-      { "id": "b840ff22", "role": "Non-MTP q4_0 131K + full q4_0 262K (0..256,000)" },
-      { "id": "f90c2c79", "role": "Pre-fix Vision + MTP matrix + post-fix aliased ViT scratch / --cpu-embd / <22 GiB auto-default & 4K escalation verification" }
-    ]
+    "linker_flag_required": "-DCMAKE_EXE_LINKER_FLAGS=-no-pie"
   },
   "vram_ceiling_probe": {
     "stage1_raw_hip": {
-      "node": "6eb9be11",
       "total_global_mem_mib": 20420.8,
       "idle_start_used_mib": 1829.6,
       "idle_start_free_mib": 18591.2,
@@ -66,104 +49,398 @@
       "niblike_512x32M_touched_max_mib": 19908.0,
       "niblike_512x32M_touched_max_gib": 19.4414,
       "hip_runtime_and_graph_overhead_est_gib": 0.34,
-      "nib_safe_reported_ceiling_gib": 19.10,
+      "nib_safe_reported_ceiling_gib": 19.1,
       "nib_wddm_stall_cliff_gib": 19.13,
       "nib_hard_oom_gib": 19.28
     },
     "stage2_nib_matrix": [
-      { "kv": "q8_0", "ctx": 65536,  "slots": 1, "mtp": true,  "eng_gib": 17.91, "total_gib": 18.59, "status": "PASS" },
-      { "kv": "q4_1", "ctx": 131072, "slots": 1, "mtp": true,  "eng_gib": 18.06, "total_gib": 18.74, "status": "PASS" },
-      { "kv": "q4_1", "ctx": 131072, "slots": 4, "mtp": true,  "eng_gib": 18.29, "total_gib": 18.97, "status": "PASS" },
-      { "kv": "q8_0", "ctx": 90112,  "slots": 1, "mtp": true,  "eng_gib": 18.31, "total_gib": 18.99, "status": "PASS" },
-      { "kv": "q8_0", "ctx": 131072, "slots": 1, "mtp": false, "eng_gib": 18.99, "total_gib": 18.99, "status": "PASS" },
-      { "kv": "q4_1", "ctx": 229376, "slots": 1, "mtp": false, "eng_gib": 19.02, "total_gib": 19.02, "status": "PASS" },
-      { "kv": "q4_0", "ctx": 180224, "slots": 1, "mtp": true,  "eng_gib": 18.36, "total_gib": 19.04, "status": "PASS" },
-      { "kv": "q4_1", "ctx": 131072, "slots": 5, "mtp": true,  "eng_gib": 18.37, "total_gib": 19.05, "status": "PASS" },
-      { "kv": "q4_1", "ctx": 163840, "slots": 1, "mtp": true,  "eng_gib": 18.38, "total_gib": 19.06, "status": "PASS" },
-      { "kv": "q4_0", "ctx": 262848, "slots": 1, "mtp": false, "eng_gib": 19.10, "total_gib": 19.10, "status": "PASS" },
-      { "kv": "q8_0", "ctx": 98304,  "slots": 1, "mtp": true,  "eng_gib": 18.45, "total_gib": 19.13, "status": "STALL_WDDM_CLIFF" },
-      { "kv": "q4_1", "ctx": 131072, "slots": 6, "mtp": true,  "eng_gib": 18.45, "total_gib": 19.13, "status": "STALL_WDDM_CLIFF" },
-      { "kv": "q4_1", "ctx": 131072, "slots": 8, "mtp": true,  "eng_gib": 18.60, "total_gib": 19.28, "status": "FAIL_MTP_OOM" },
-      { "kv": "q4_1", "ctx": 262848, "slots": 1, "mtp": false, "eng_gib": 19.35, "total_gib": 19.35, "status": "FAIL_ENGINE_OOM" },
-      { "kv": "q4_1", "ctx": 196608, "slots": 1, "mtp": true,  "eng_gib": 18.70, "total_gib": 19.38, "status": "FAIL_MTP_OOM" },
-      { "kv": "q8_0", "ctx": 131072, "slots": 1, "mtp": true,  "eng_gib": 18.99, "total_gib": 19.67, "status": "FAIL_MTP_OOM" },
-      { "kv": "q4_0", "ctx": 262848, "slots": 1, "mtp": true,  "eng_gib": 19.10, "total_gib": 19.78, "status": "FAIL_MTP_OOM" },
-      { "kv": "q8_0", "ctx": 196608, "slots": 1, "mtp": false, "eng_gib": 20.07, "total_gib": 20.07, "status": "FAIL_ENGINE_OOM" }
+      {
+        "kv": "q8_0",
+        "ctx": 65536,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 17.91,
+        "total_gib": 18.59,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 131072,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.06,
+        "total_gib": 18.74,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 131072,
+        "slots": 4,
+        "mtp": true,
+        "eng_gib": 18.29,
+        "total_gib": 18.97,
+        "status": "PASS"
+      },
+      {
+        "kv": "q8_0",
+        "ctx": 90112,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.31,
+        "total_gib": 18.99,
+        "status": "PASS"
+      },
+      {
+        "kv": "q8_0",
+        "ctx": 131072,
+        "slots": 1,
+        "mtp": false,
+        "eng_gib": 18.99,
+        "total_gib": 18.99,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 229376,
+        "slots": 1,
+        "mtp": false,
+        "eng_gib": 19.02,
+        "total_gib": 19.02,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_0",
+        "ctx": 180224,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.36,
+        "total_gib": 19.04,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 131072,
+        "slots": 5,
+        "mtp": true,
+        "eng_gib": 18.37,
+        "total_gib": 19.05,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 163840,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.38,
+        "total_gib": 19.06,
+        "status": "PASS"
+      },
+      {
+        "kv": "q4_0",
+        "ctx": 262848,
+        "slots": 1,
+        "mtp": false,
+        "eng_gib": 19.1,
+        "total_gib": 19.1,
+        "status": "PASS"
+      },
+      {
+        "kv": "q8_0",
+        "ctx": 98304,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.45,
+        "total_gib": 19.13,
+        "status": "STALL_WDDM_CLIFF"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 131072,
+        "slots": 6,
+        "mtp": true,
+        "eng_gib": 18.45,
+        "total_gib": 19.13,
+        "status": "STALL_WDDM_CLIFF"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 131072,
+        "slots": 8,
+        "mtp": true,
+        "eng_gib": 18.6,
+        "total_gib": 19.28,
+        "status": "FAIL_MTP_OOM"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 262848,
+        "slots": 1,
+        "mtp": false,
+        "eng_gib": 19.35,
+        "total_gib": 19.35,
+        "status": "FAIL_ENGINE_OOM"
+      },
+      {
+        "kv": "q4_1",
+        "ctx": 196608,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.7,
+        "total_gib": 19.38,
+        "status": "FAIL_MTP_OOM"
+      },
+      {
+        "kv": "q8_0",
+        "ctx": 131072,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 18.99,
+        "total_gib": 19.67,
+        "status": "FAIL_MTP_OOM"
+      },
+      {
+        "kv": "q4_0",
+        "ctx": 262848,
+        "slots": 1,
+        "mtp": true,
+        "eng_gib": 19.1,
+        "total_gib": 19.78,
+        "status": "FAIL_MTP_OOM"
+      },
+      {
+        "kv": "q8_0",
+        "ctx": 196608,
+        "slots": 1,
+        "mtp": false,
+        "eng_gib": 20.07,
+        "total_gib": 20.07,
+        "status": "FAIL_ENGINE_OOM"
+      }
     ]
   },
   "non_mtp_nib_bench": {
     "params": "-p 512 -n 64 -r 2 --sparse-pages 224 --slots 1",
     "configs": {
       "q4_1_131k": {
-        "node": "dddf7d23",
         "kv": "q4_1",
         "ctx": 131072,
         "vram_gib": 18.06,
         "rows": [
-          { "depth": 0,      "pp512_tps": 4240.46, "pp512_std": 70.56, "tg64_tps": 124.55, "tg64_std": 0.01 },
-          { "depth": 8192,   "pp512_tps": 3233.30, "pp512_std": 23.29, "tg64_tps": 121.05, "tg64_std": 0.04 },
-          { "depth": 32768,  "pp512_tps": 2357.00, "pp512_std":  0.31, "tg64_tps": 118.48, "tg64_std": 0.01 },
-          { "depth": 65536,  "pp512_tps": 2532.76, "pp512_std":  4.57, "tg64_tps": 118.14, "tg64_std": 0.36 },
-          { "depth": 128000, "pp512_tps": 2504.03, "pp512_std": 10.26, "tg64_tps": 117.77, "tg64_std": 0.03 }
+          {
+            "depth": 0,
+            "pp512_tps": 4240.46,
+            "pp512_std": 70.56,
+            "tg64_tps": 124.55,
+            "tg64_std": 0.01
+          },
+          {
+            "depth": 8192,
+            "pp512_tps": 3233.3,
+            "pp512_std": 23.29,
+            "tg64_tps": 121.05,
+            "tg64_std": 0.04
+          },
+          {
+            "depth": 32768,
+            "pp512_tps": 2357.0,
+            "pp512_std": 0.31,
+            "tg64_tps": 118.48,
+            "tg64_std": 0.01
+          },
+          {
+            "depth": 65536,
+            "pp512_tps": 2532.76,
+            "pp512_std": 4.57,
+            "tg64_tps": 118.14,
+            "tg64_std": 0.36
+          },
+          {
+            "depth": 128000,
+            "pp512_tps": 2504.03,
+            "pp512_std": 10.26,
+            "tg64_tps": 117.77,
+            "tg64_std": 0.03
+          }
         ]
       },
       "q8_0_131k": {
-        "node": "dddf7d23",
         "kv": "q8_0",
         "ctx": 131072,
         "vram_gib": 18.99,
         "rows": [
-          { "depth": 0,      "pp512_tps": 4255.70, "pp512_std": 74.92, "tg64_tps": 122.80, "tg64_std": 0.58 },
-          { "depth": 8192,   "pp512_tps": 3234.17, "pp512_std":  7.32, "tg64_tps": 118.96, "tg64_std": 0.31 },
-          { "depth": 32768,  "pp512_tps": 2312.02, "pp512_std": 25.04, "tg64_tps": 116.17, "tg64_std": 0.01 },
-          { "depth": 65536,  "pp512_tps": 2528.61, "pp512_std":  2.80, "tg64_tps": 115.48, "tg64_std": 0.93 },
-          { "depth": 128000, "pp512_tps": 2476.52, "pp512_std": 32.46, "tg64_tps": 115.46, "tg64_std": 0.03 }
+          {
+            "depth": 0,
+            "pp512_tps": 4255.7,
+            "pp512_std": 74.92,
+            "tg64_tps": 122.8,
+            "tg64_std": 0.58
+          },
+          {
+            "depth": 8192,
+            "pp512_tps": 3234.17,
+            "pp512_std": 7.32,
+            "tg64_tps": 118.96,
+            "tg64_std": 0.31
+          },
+          {
+            "depth": 32768,
+            "pp512_tps": 2312.02,
+            "pp512_std": 25.04,
+            "tg64_tps": 116.17,
+            "tg64_std": 0.01
+          },
+          {
+            "depth": 65536,
+            "pp512_tps": 2528.61,
+            "pp512_std": 2.8,
+            "tg64_tps": 115.48,
+            "tg64_std": 0.93
+          },
+          {
+            "depth": 128000,
+            "pp512_tps": 2476.52,
+            "pp512_std": 32.46,
+            "tg64_tps": 115.46,
+            "tg64_std": 0.03
+          }
         ]
       },
       "q4_1_229k": {
-        "node": "dddf7d23",
         "kv": "q4_1",
         "ctx": 229376,
         "vram_gib": 19.02,
         "rows": [
-          { "depth": 0,      "pp512_tps": 4239.12, "pp512_std": 82.74, "tg64_tps": 123.58, "tg64_std": 1.38 },
-          { "depth": 8192,   "pp512_tps": 3238.42, "pp512_std": 16.03, "tg64_tps": 120.59, "tg64_std": 0.67 },
-          { "depth": 32768,  "pp512_tps": 2358.80, "pp512_std":  7.35, "tg64_tps": 116.93, "tg64_std": 0.27 },
-          { "depth": 65536,  "pp512_tps": 2515.98, "pp512_std": 20.63, "tg64_tps": 118.37, "tg64_std": 0.02 },
-          { "depth": 128000, "pp512_tps": 2501.02, "pp512_std":  3.56, "tg64_tps": 117.74, "tg64_std": 0.00 },
-          { "depth": 224000, "pp512_tps": 2444.48, "pp512_std": 14.01, "tg64_tps": 116.14, "tg64_std": 1.05 }
+          {
+            "depth": 0,
+            "pp512_tps": 4239.12,
+            "pp512_std": 82.74,
+            "tg64_tps": 123.58,
+            "tg64_std": 1.38
+          },
+          {
+            "depth": 8192,
+            "pp512_tps": 3238.42,
+            "pp512_std": 16.03,
+            "tg64_tps": 120.59,
+            "tg64_std": 0.67
+          },
+          {
+            "depth": 32768,
+            "pp512_tps": 2358.8,
+            "pp512_std": 7.35,
+            "tg64_tps": 116.93,
+            "tg64_std": 0.27
+          },
+          {
+            "depth": 65536,
+            "pp512_tps": 2515.98,
+            "pp512_std": 20.63,
+            "tg64_tps": 118.37,
+            "tg64_std": 0.02
+          },
+          {
+            "depth": 128000,
+            "pp512_tps": 2501.02,
+            "pp512_std": 3.56,
+            "tg64_tps": 117.74,
+            "tg64_std": 0.0
+          },
+          {
+            "depth": 224000,
+            "pp512_tps": 2444.48,
+            "pp512_std": 14.01,
+            "tg64_tps": 116.14,
+            "tg64_std": 1.05
+          }
         ]
       },
       "q4_0_131k": {
-        "node": "b840ff22",
         "kv": "q4_0",
         "ctx": 131072,
         "vram_gib": 17.93,
         "rows": [
-          { "depth": 0,      "pp512_tps": 4144.51, "pp512_std": 99.75, "tg64_tps": 122.41, "tg64_std": 0.83 },
-          { "depth": 32768,  "pp512_tps": 2248.51, "pp512_std": 47.19, "tg64_tps": 116.83, "tg64_std": 0.67 },
-          { "depth": 128000, "pp512_tps": 2361.31, "pp512_std":  4.41, "tg64_tps": 116.00, "tg64_std": 0.01 }
+          {
+            "depth": 0,
+            "pp512_tps": 4144.51,
+            "pp512_std": 99.75,
+            "tg64_tps": 122.41,
+            "tg64_std": 0.83
+          },
+          {
+            "depth": 32768,
+            "pp512_tps": 2248.51,
+            "pp512_std": 47.19,
+            "tg64_tps": 116.83,
+            "tg64_std": 0.67
+          },
+          {
+            "depth": 128000,
+            "pp512_tps": 2361.31,
+            "pp512_std": 4.41,
+            "tg64_tps": 116.0,
+            "tg64_std": 0.01
+          }
         ]
       },
       "q4_0_262k": {
-        "node": "b840ff22",
         "kv": "q4_0",
         "ctx": 262848,
-        "vram_gib": 19.10,
+        "vram_gib": 19.1,
         "rows": [
-          { "depth": 0,      "pp512_tps": 4102.42, "pp512_std": 178.19, "tg64_tps": 121.17, "tg64_std": 1.45 },
-          { "depth": 8192,   "pp512_tps": 3073.97, "pp512_std":  23.91, "tg64_tps": 118.12, "tg64_std": 1.08 },
-          { "depth": 32768,  "pp512_tps": 2243.41, "pp512_std":  45.14, "tg64_tps": 116.30, "tg64_std": 0.34 },
-          { "depth": 65536,  "pp512_tps": 2374.73, "pp512_std":  68.19, "tg64_tps": 115.74, "tg64_std": 0.85 },
-          { "depth": 128000, "pp512_tps": 2385.25, "pp512_std":   3.19, "tg64_tps": 115.07, "tg64_std": 0.55 },
-          { "depth": 224000, "pp512_tps": 2291.17, "pp512_std":  64.88, "tg64_tps": 114.70, "tg64_std": 0.59 },
-          { "depth": 256000, "pp512_tps": 2278.37, "pp512_std":   3.99, "tg64_tps": 114.20, "tg64_std": 0.74 }
+          {
+            "depth": 0,
+            "pp512_tps": 4102.42,
+            "pp512_std": 178.19,
+            "tg64_tps": 121.17,
+            "tg64_std": 1.45
+          },
+          {
+            "depth": 8192,
+            "pp512_tps": 3073.97,
+            "pp512_std": 23.91,
+            "tg64_tps": 118.12,
+            "tg64_std": 1.08
+          },
+          {
+            "depth": 32768,
+            "pp512_tps": 2243.41,
+            "pp512_std": 45.14,
+            "tg64_tps": 116.3,
+            "tg64_std": 0.34
+          },
+          {
+            "depth": 65536,
+            "pp512_tps": 2374.73,
+            "pp512_std": 68.19,
+            "tg64_tps": 115.74,
+            "tg64_std": 0.85
+          },
+          {
+            "depth": 128000,
+            "pp512_tps": 2385.25,
+            "pp512_std": 3.19,
+            "tg64_tps": 115.07,
+            "tg64_std": 0.55
+          },
+          {
+            "depth": 224000,
+            "pp512_tps": 2291.17,
+            "pp512_std": 64.88,
+            "tg64_tps": 114.7,
+            "tg64_std": 0.59
+          },
+          {
+            "depth": 256000,
+            "pp512_tps": 2278.37,
+            "pp512_std": 3.99,
+            "tg64_tps": 114.2,
+            "tg64_std": 0.74
+          }
         ]
       }
     }
   },
   "mtp_nib_gen": {
-    "node": "6eb9be11",
     "params": "nib gen --mtp -n 256 --sparse-pages 224 --slots 1 (code+docs prompts)",
     "configs": {
       "q8_0_90k": {
@@ -172,9 +449,42 @@
         "eng_gib": 18.31,
         "total_gib": 18.99,
         "rows": [
-          { "prompt_tokens": 2740,  "prefill_s": 1.30,  "prefill_tps": 2108.0, "decode_tps": 160.84, "rounds": 57, "avg_accepted": 3.47, "tok_per_round": 4.47, "avg_m": 5.21, "draft_ms": 1.89, "verify_ms": 24.83 },
-          { "prompt_tokens": 38178, "prefill_s": 21.31, "prefill_tps": 1791.9, "decode_tps": 157.51, "rounds": 62, "avg_accepted": 3.23, "tok_per_round": 4.23, "avg_m": 4.44, "draft_ms": 2.08, "verify_ms": 23.08 },
-          { "prompt_tokens": 75106, "prefill_s": 48.95, "prefill_tps": 1534.3, "decode_tps": 165.69, "rounds": 54, "avg_accepted": 3.72, "tok_per_round": 4.72, "avg_m": 5.22, "draft_ms": 2.21, "verify_ms": 25.26 }
+          {
+            "prompt_tokens": 2740,
+            "prefill_s": 1.3,
+            "prefill_tps": 2108.0,
+            "decode_tps": 160.84,
+            "rounds": 57,
+            "avg_accepted": 3.47,
+            "tok_per_round": 4.47,
+            "avg_m": 5.21,
+            "draft_ms": 1.89,
+            "verify_ms": 24.83
+          },
+          {
+            "prompt_tokens": 38178,
+            "prefill_s": 21.31,
+            "prefill_tps": 1791.9,
+            "decode_tps": 157.51,
+            "rounds": 62,
+            "avg_accepted": 3.23,
+            "tok_per_round": 4.23,
+            "avg_m": 4.44,
+            "draft_ms": 2.08,
+            "verify_ms": 23.08
+          },
+          {
+            "prompt_tokens": 75106,
+            "prefill_s": 48.95,
+            "prefill_tps": 1534.3,
+            "decode_tps": 165.69,
+            "rounds": 54,
+            "avg_accepted": 3.72,
+            "tok_per_round": 4.72,
+            "avg_m": 5.22,
+            "draft_ms": 2.21,
+            "verify_ms": 25.26
+          }
         ]
       },
       "q4_1_163k": {
@@ -183,10 +493,54 @@
         "eng_gib": 18.38,
         "total_gib": 19.06,
         "rows": [
-          { "prompt_tokens": 2740,   "prefill_s": 1.12,  "prefill_tps": 2439.3, "decode_tps": 153.24, "rounds": 66, "avg_accepted": 2.92, "tok_per_round": 3.92, "avg_m": 4.64, "draft_ms": 1.79, "verify_ms": 22.25 },
-          { "prompt_tokens": 38178,  "prefill_s": 21.59, "prefill_tps": 1768.4, "decode_tps": 143.22, "rounds": 70, "avg_accepted": 2.67, "tok_per_round": 3.67, "avg_m": 4.43, "draft_ms": 1.94, "verify_ms": 22.68 },
-          { "prompt_tokens": 75106,  "prefill_s": 49.11, "prefill_tps": 1529.5, "decode_tps": 146.56, "rounds": 64, "avg_accepted": 3.00, "tok_per_round": 4.00, "avg_m": 4.95, "draft_ms": 2.13, "verify_ms": 24.09 },
-          { "prompt_tokens": 142265, "prefill_s": 84.01, "prefill_tps": 1693.4, "decode_tps": 144.71, "rounds": 66, "avg_accepted": 2.97, "tok_per_round": 3.97, "avg_m": 4.58, "draft_ms": 2.29, "verify_ms": 23.49 }
+          {
+            "prompt_tokens": 2740,
+            "prefill_s": 1.12,
+            "prefill_tps": 2439.3,
+            "decode_tps": 153.24,
+            "rounds": 66,
+            "avg_accepted": 2.92,
+            "tok_per_round": 3.92,
+            "avg_m": 4.64,
+            "draft_ms": 1.79,
+            "verify_ms": 22.25
+          },
+          {
+            "prompt_tokens": 38178,
+            "prefill_s": 21.59,
+            "prefill_tps": 1768.4,
+            "decode_tps": 143.22,
+            "rounds": 70,
+            "avg_accepted": 2.67,
+            "tok_per_round": 3.67,
+            "avg_m": 4.43,
+            "draft_ms": 1.94,
+            "verify_ms": 22.68
+          },
+          {
+            "prompt_tokens": 75106,
+            "prefill_s": 49.11,
+            "prefill_tps": 1529.5,
+            "decode_tps": 146.56,
+            "rounds": 64,
+            "avg_accepted": 3.0,
+            "tok_per_round": 4.0,
+            "avg_m": 4.95,
+            "draft_ms": 2.13,
+            "verify_ms": 24.09
+          },
+          {
+            "prompt_tokens": 142265,
+            "prefill_s": 84.01,
+            "prefill_tps": 1693.4,
+            "decode_tps": 144.71,
+            "rounds": 66,
+            "avg_accepted": 2.97,
+            "tok_per_round": 3.97,
+            "avg_m": 4.58,
+            "draft_ms": 2.29,
+            "verify_ms": 23.49
+          }
         ]
       },
       "q4_0_180k": {
@@ -195,17 +549,60 @@
         "eng_gib": 18.36,
         "total_gib": 19.04,
         "rows": [
-          { "prompt_tokens": 2740,   "prefill_s": 1.09,  "prefill_tps": 2509.6, "decode_tps": 156.70, "rounds": 63, "avg_accepted": 3.06, "tok_per_round": 4.06, "avg_m": 4.86, "draft_ms": 1.72, "verify_ms": 22.38 },
-          { "prompt_tokens": 38178,  "prefill_s": 22.61, "prefill_tps": 1688.4, "decode_tps": 164.90, "rounds": 59, "avg_accepted": 3.44, "tok_per_round": 4.44, "avg_m": 4.58, "draft_ms": 1.97, "verify_ms": 23.34 },
-          { "prompt_tokens": 75106,  "prefill_s": 48.33, "prefill_tps": 1554.2, "decode_tps": 149.87, "rounds": 63, "avg_accepted": 3.06, "tok_per_round": 4.06, "avg_m": 5.05, "draft_ms": 2.02, "verify_ms": 24.18 },
-          { "prompt_tokens": 142265, "prefill_s": 82.36, "prefill_tps": 1727.4, "decode_tps": 144.10, "rounds": 67, "avg_accepted": 2.91, "tok_per_round": 3.91, "avg_m": 4.43, "draft_ms": 2.02, "verify_ms": 22.75 }
+          {
+            "prompt_tokens": 2740,
+            "prefill_s": 1.09,
+            "prefill_tps": 2509.6,
+            "decode_tps": 156.7,
+            "rounds": 63,
+            "avg_accepted": 3.06,
+            "tok_per_round": 4.06,
+            "avg_m": 4.86,
+            "draft_ms": 1.72,
+            "verify_ms": 22.38
+          },
+          {
+            "prompt_tokens": 38178,
+            "prefill_s": 22.61,
+            "prefill_tps": 1688.4,
+            "decode_tps": 164.9,
+            "rounds": 59,
+            "avg_accepted": 3.44,
+            "tok_per_round": 4.44,
+            "avg_m": 4.58,
+            "draft_ms": 1.97,
+            "verify_ms": 23.34
+          },
+          {
+            "prompt_tokens": 75106,
+            "prefill_s": 48.33,
+            "prefill_tps": 1554.2,
+            "decode_tps": 149.87,
+            "rounds": 63,
+            "avg_accepted": 3.06,
+            "tok_per_round": 4.06,
+            "avg_m": 5.05,
+            "draft_ms": 2.02,
+            "verify_ms": 24.18
+          },
+          {
+            "prompt_tokens": 142265,
+            "prefill_s": 82.36,
+            "prefill_tps": 1727.4,
+            "decode_tps": 144.1,
+            "rounds": 67,
+            "avg_accepted": 2.91,
+            "tok_per_round": 3.91,
+            "avg_m": 4.43,
+            "draft_ms": 2.02,
+            "verify_ms": 22.75
+          }
         ]
       }
     }
   },
   "betterbench_api_summary": {
     "artifact": "betterbench_slots4_128k.json",
-    "node": "b121017c",
     "serve_config": "--slots 4 -c 131072 --kv-type q4_1 --sparse-pages 224 --mtp models/mtp.safetensors --no-vision",
     "eng_vram_gib": 18.3143,
     "total_vram_gib_with_mtp": 18.995,
@@ -222,27 +619,79 @@
       "unweighted_mean": 169.3
     },
     "concurrency": [
-      { "level": 1, "ok": 32, "requests": 32, "median_stream_tps": 170.7, "aggregate_tps": 97.8,  "median_ttft_ms": 1301 },
-      { "level": 2, "ok": 32, "requests": 32, "median_stream_tps": 83.6,  "aggregate_tps": 120.0, "median_ttft_ms": 1126 },
-      { "level": 4, "ok": 32, "requests": 32, "median_stream_tps": 55.2,  "aggregate_tps": 184.8, "median_ttft_ms": 1072 },
-      { "level": 8, "ok": 32, "requests": 32, "median_stream_tps": 51.4,  "aggregate_tps": 193.7, "median_ttft_ms": 7908 }
+      {
+        "level": 1,
+        "ok": 32,
+        "requests": 32,
+        "median_stream_tps": 170.7,
+        "aggregate_tps": 97.8,
+        "median_ttft_ms": 1301
+      },
+      {
+        "level": 2,
+        "ok": 32,
+        "requests": 32,
+        "median_stream_tps": 83.6,
+        "aggregate_tps": 120.0,
+        "median_ttft_ms": 1126
+      },
+      {
+        "level": 4,
+        "ok": 32,
+        "requests": 32,
+        "median_stream_tps": 55.2,
+        "aggregate_tps": 184.8,
+        "median_ttft_ms": 1072
+      },
+      {
+        "level": 8,
+        "ok": 32,
+        "requests": 32,
+        "median_stream_tps": 51.4,
+        "aggregate_tps": 193.7,
+        "median_ttft_ms": 7908
+      }
     ],
     "prefill_ladder": [
-      { "target_depth": 2560,  "prompt_tokens": 2032,  "pp_median_tps": 1073.4, "ttft_median_s": 1.89 },
-      { "target_depth": 10240, "prompt_tokens": 8072,  "pp_median_tps": 1937.1, "ttft_median_s": 4.17 },
-      { "target_depth": 20480, "prompt_tokens": 16092, "pp_median_tps": 1708.5, "ttft_median_s": 10.05 },
-      { "target_depth": 40960, "prompt_tokens": 32218, "pp_median_tps": 2198.5, "ttft_median_s": 14.65 },
-      { "target_depth": 81920, "prompt_tokens": 64020, "pp_median_tps": 1851.4, "ttft_median_s": 34.78 }
+      {
+        "target_depth": 2560,
+        "prompt_tokens": 2032,
+        "pp_median_tps": 1073.4,
+        "ttft_median_s": 1.89
+      },
+      {
+        "target_depth": 10240,
+        "prompt_tokens": 8072,
+        "pp_median_tps": 1937.1,
+        "ttft_median_s": 4.17
+      },
+      {
+        "target_depth": 20480,
+        "prompt_tokens": 16092,
+        "pp_median_tps": 1708.5,
+        "ttft_median_s": 10.05
+      },
+      {
+        "target_depth": 40960,
+        "prompt_tokens": 32218,
+        "pp_median_tps": 2198.5,
+        "ttft_median_s": 14.65
+      },
+      {
+        "target_depth": 81920,
+        "prompt_tokens": 64020,
+        "pp_median_tps": 1851.4,
+        "ttft_median_s": 34.78
+      }
     ]
   },
   "betterbench_slots8_local_summary": {
     "artifact": "betterbench_slots8_64k_local.json",
-    "node": "6eb9be11",
     "endpoint": "http://127.0.0.1:4444/v1",
     "serve_config": "--slots 8 -c 65536 --kv-type q4_1 --sparse-pages 224 --mtp models/mtp.safetensors --no-vision",
     "slot_ctx": 8192,
     "eng_vram_gib": 17.9793,
-    "total_vram_gib_with_mtp": 18.660,
+    "total_vram_gib_with_mtp": 18.66,
     "batch_graphs_captured": 33,
     "amd_smi_vram_mb": {
       "idle_used": 1099,
@@ -266,32 +715,175 @@
       "update_p99_ms": 26.8
     },
     "concurrency": [
-      { "level": 1, "ok": 48, "requests": 48, "wall_s": 133.7, "median_stream_tps": 170.0, "aggregate_tps": 148.2, "ttft_p50_ms": 82.6,  "ttft_p99_ms": 110.7 },
-      { "level": 2, "ok": 48, "requests": 48, "wall_s": 135.9, "median_stream_tps": 75.3,  "aggregate_tps": 147.9, "ttft_p50_ms": 97.5,  "ttft_p99_ms": 164.1 },
-      { "level": 4, "ok": 48, "requests": 48, "wall_s": 103.8, "median_stream_tps": 50.0,  "aggregate_tps": 192.7, "ttft_p50_ms": 118.7, "ttft_p99_ms": 331.4 },
-      { "level": 8, "ok": 48, "requests": 48, "wall_s": 93.8,  "median_stream_tps": 30.4,  "aggregate_tps": 213.0, "ttft_p50_ms": 162.5, "ttft_p99_ms": 728.2 }
+      {
+        "level": 1,
+        "ok": 48,
+        "requests": 48,
+        "wall_s": 133.7,
+        "median_stream_tps": 170.0,
+        "aggregate_tps": 148.2,
+        "ttft_p50_ms": 82.6,
+        "ttft_p99_ms": 110.7
+      },
+      {
+        "level": 2,
+        "ok": 48,
+        "requests": 48,
+        "wall_s": 135.9,
+        "median_stream_tps": 75.3,
+        "aggregate_tps": 147.9,
+        "ttft_p50_ms": 97.5,
+        "ttft_p99_ms": 164.1
+      },
+      {
+        "level": 4,
+        "ok": 48,
+        "requests": 48,
+        "wall_s": 103.8,
+        "median_stream_tps": 50.0,
+        "aggregate_tps": 192.7,
+        "ttft_p50_ms": 118.7,
+        "ttft_p99_ms": 331.4
+      },
+      {
+        "level": 8,
+        "ok": 48,
+        "requests": 48,
+        "wall_s": 93.8,
+        "median_stream_tps": 30.4,
+        "aggregate_tps": 213.0,
+        "ttft_p50_ms": 162.5,
+        "ttft_p99_ms": 728.2
+      }
     ],
-    "notes": "Zero-WAN-RTT localhost run on 6eb9be11 (48 reqs/level). All 33 dynamic batch HIP graphs (B=2..8) consumed ~88 MB total (~2.8 MB/graph). Host kept ~1.1 GB Windows desktop VRAM pinned, causing ~217-305 MB WDDM GTT spill at 18.66 GiB; pushing >=18.98 GiB on this host triggered Windows 2s WDDM TDR resets during multi-slot B=2->B=1 tail transitions."
+    "notes": "Zero-WAN-RTT localhost run (48 reqs/level). All 33 dynamic batch HIP graphs (B=2..8) consumed ~88 MB total (~2.8 MB/graph). Host kept ~1.1 GB Windows desktop VRAM pinned, causing ~217-305 MB WDDM GTT spill at 18.66 GiB; pushing >=18.98 GiB on this host triggered Windows 2s WDDM TDR resets during multi-slot B=2->B=1 tail transitions."
   },
   "vision_mtp_matrix": {
-    "node": "f90c2c79",
-    "idle_vram_mb": { "used": 292, "free": 20172, "gtt": 0 },
+    "idle_vram_mb": {
+      "used": 292,
+      "free": 20172,
+      "gtt": 0
+    },
     "mmproj_weights_mib": 329.9,
-    "lazy_scratch_gib": { "boot": 0.322, "after_1024x512": 0.401, "after_1920x1080": 0.623 },
+    "lazy_scratch_gib": {
+      "boot": 0.322,
+      "after_1024x512": 0.401,
+      "after_1920x1080": 0.623
+    },
     "reference_issue": "https://github.com/Chromadera/nib/issues/5",
     "cases": [
-      { "tag": "solo_s1_32k_mtp",      "slots": 1, "ctx": 32768,  "kv": "q4_1", "mtp": true,  "mmproj": true, "app_vram_gib": 18.12, "boot_used_mb": 19346, "boot_free_mb": 1118, "end_used_mb": 19673, "end_free_mb": 791, "end_gtt_mb": 0, "ttft_1080p_ms": 792.2, "decode_1080p_tps": 157.0, "status": "PASS" },
-      { "tag": "solo_s1_64k_mtp",      "slots": 1, "ctx": 65536,  "kv": "q4_1", "mtp": true,  "mmproj": true, "app_vram_gib": 18.44, "boot_used_mb": 19675, "boot_free_mb": 789,  "end_used_mb": 20001, "end_free_mb": 463, "end_gtt_mb": 0, "ttft_1080p_ms": 792.9, "decode_1080p_tps": 149.7, "status": "PASS" },
-      { "tag": "mandrav_s4_64k_mtp",   "slots": 4, "ctx": 65536,  "kv": "q4_1", "mtp": true,  "mmproj": true, "app_vram_gib": 18.67, "boot_used_mb": 19917, "boot_free_mb": 547,  "end_used_mb": 20244, "end_free_mb": 220, "end_gtt_mb": 0, "ttft_1080p_ms": 788.1, "decode_1080p_tps": 166.1, "status": "PASS" },
-      { "tag": "solo_s1_128k_nomtp",   "slots": 1, "ctx": 131072, "kv": "q4_1", "mtp": false, "mmproj": true, "app_vram_gib": 18.38, "boot_used_mb": 19570, "boot_free_mb": 894,  "end_used_mb": 19897, "end_free_mb": 567, "end_gtt_mb": 0, "ttft_1080p_ms": 765.3, "decode_1080p_tps": 91.4,  "status": "PASS" },
-      { "tag": "solo_s1_64k_q8_nomtp", "slots": 1, "ctx": 65536,  "kv": "q8_0", "mtp": false, "mmproj": true, "app_vram_gib": 18.23, "boot_used_mb": 19415, "boot_free_mb": 1049, "end_used_mb": 19742, "end_free_mb": 722, "end_gtt_mb": 0, "ttft_1080p_ms": 770.8, "decode_1080p_tps": 90.8,  "status": "PASS" },
-      { "tag": "mandrav_s2_128k_mtp",  "slots": 2, "ctx": 131072, "kv": "q4_1", "mtp": true,  "mmproj": true, "app_vram_gib": 19.16, "status": "STALL_WARMUP", "note": "Fits text-only on native Linux with ~0 headroom for 1080p lazy ViT scratch (+301 MiB); stalls during HIP graph warmup on WSL2." },
-      { "tag": "mandrav_s4_128k_mtp",  "slots": 4, "ctx": 131072, "kv": "q4_1", "mtp": true,  "mmproj": true, "app_vram_gib": 19.31, "status": "OOM", "error": "HIP error 2 (out of memory) at vision_encoder.cpp:313: hipMalloc(&p, bytes)", "note": "On native Linux amdgpu TTM silently evicts into PCIe GTT, collapsing solo decode to 38-53 tok/s (Issue #5)." }
+      {
+        "tag": "solo_s1_32k_mtp",
+        "slots": 1,
+        "ctx": 32768,
+        "kv": "q4_1",
+        "mtp": true,
+        "mmproj": true,
+        "app_vram_gib": 18.12,
+        "boot_used_mb": 19346,
+        "boot_free_mb": 1118,
+        "end_used_mb": 19673,
+        "end_free_mb": 791,
+        "end_gtt_mb": 0,
+        "ttft_1080p_ms": 792.2,
+        "decode_1080p_tps": 157.0,
+        "status": "PASS"
+      },
+      {
+        "tag": "solo_s1_64k_mtp",
+        "slots": 1,
+        "ctx": 65536,
+        "kv": "q4_1",
+        "mtp": true,
+        "mmproj": true,
+        "app_vram_gib": 18.44,
+        "boot_used_mb": 19675,
+        "boot_free_mb": 789,
+        "end_used_mb": 20001,
+        "end_free_mb": 463,
+        "end_gtt_mb": 0,
+        "ttft_1080p_ms": 792.9,
+        "decode_1080p_tps": 149.7,
+        "status": "PASS"
+      },
+      {
+        "tag": "mandrav_s4_64k_mtp",
+        "slots": 4,
+        "ctx": 65536,
+        "kv": "q4_1",
+        "mtp": true,
+        "mmproj": true,
+        "app_vram_gib": 18.67,
+        "boot_used_mb": 19917,
+        "boot_free_mb": 547,
+        "end_used_mb": 20244,
+        "end_free_mb": 220,
+        "end_gtt_mb": 0,
+        "ttft_1080p_ms": 788.1,
+        "decode_1080p_tps": 166.1,
+        "status": "PASS"
+      },
+      {
+        "tag": "solo_s1_128k_nomtp",
+        "slots": 1,
+        "ctx": 131072,
+        "kv": "q4_1",
+        "mtp": false,
+        "mmproj": true,
+        "app_vram_gib": 18.38,
+        "boot_used_mb": 19570,
+        "boot_free_mb": 894,
+        "end_used_mb": 19897,
+        "end_free_mb": 567,
+        "end_gtt_mb": 0,
+        "ttft_1080p_ms": 765.3,
+        "decode_1080p_tps": 91.4,
+        "status": "PASS"
+      },
+      {
+        "tag": "solo_s1_64k_q8_nomtp",
+        "slots": 1,
+        "ctx": 65536,
+        "kv": "q8_0",
+        "mtp": false,
+        "mmproj": true,
+        "app_vram_gib": 18.23,
+        "boot_used_mb": 19415,
+        "boot_free_mb": 1049,
+        "end_used_mb": 19742,
+        "end_free_mb": 722,
+        "end_gtt_mb": 0,
+        "ttft_1080p_ms": 770.8,
+        "decode_1080p_tps": 90.8,
+        "status": "PASS"
+      },
+      {
+        "tag": "mandrav_s2_128k_mtp",
+        "slots": 2,
+        "ctx": 131072,
+        "kv": "q4_1",
+        "mtp": true,
+        "mmproj": true,
+        "app_vram_gib": 19.16,
+        "status": "STALL_WARMUP",
+        "note": "Fits text-only on native Linux with ~0 headroom for 1080p lazy ViT scratch (+301 MiB); stalls during HIP graph warmup on WSL2."
+      },
+      {
+        "tag": "mandrav_s4_128k_mtp",
+        "slots": 4,
+        "ctx": 131072,
+        "kv": "q4_1",
+        "mtp": true,
+        "mmproj": true,
+        "app_vram_gib": 19.31,
+        "status": "OOM",
+        "error": "HIP error 2 (out of memory) at vision_encoder.cpp:313: hipMalloc(&p, bytes)",
+        "note": "On native Linux amdgpu TTM silently evicts into PCIe GTT, collapsing solo decode to 38-53 tok/s (Issue #5)."
+      }
     ]
   },
   "post_fix_verification": {
     "date": "2026-11-26",
-    "node": "f90c2c79",
     "reference_issue": "https://github.com/Chromadera/nib/issues/5",
     "changes": [
       "Aliased single-arena transient ViT workspace + immediate post-encode release (src/vision_encoder.{hpp,cpp})",
@@ -300,7 +892,11 @@
       "Accurate llm + mtp + vision VRAM accounting, hipMemGetInfo GTT spillover warnings, and /health telemetry"
     ],
     "vision_parity": {
-      "1024x512": { "elements": 778752, "bit_diffs": 0, "max_abs_diff": 0.0 },
+      "1024x512": {
+        "elements": 778752,
+        "bit_diffs": 0,
+        "max_abs_diff": 0.0
+      },
       "1920x1080": {
         "elements": 2985984,
         "bit_diffs": 0,
@@ -328,7 +924,12 @@
     },
     "vision_hires_escalation_matrix": {
       "amd_smi_poll_ms": 200,
-      "resolutions": ["1920x1080 (131.7 MiB ws)", "2560x1440 (234.0 MiB ws)", "3840x2160 (414.4 MiB ws)", "2560x2560 max (416.0 MiB ws, 4096 img toks)"],
+      "resolutions": [
+        "1920x1080 (131.7 MiB ws)",
+        "2560x1440 (234.0 MiB ws)",
+        "3840x2160 (414.4 MiB ws)",
+        "2560x2560 max (416.0 MiB ws, 4096 img toks)"
+      ],
       "cases": [
         {
           "tag": "auto_default",
@@ -337,10 +938,26 @@
           "boot_free_mib": 1016,
           "post_hires_free_mb": 999,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 159.6, "min_free_mb": 890 },
-          "r1440p": { "status": "PASS", "decode_tps": 143.8, "min_free_mb": 776 },
-          "r4k":    { "status": "PASS", "decode_tps": 142.7, "min_free_mb": 582 },
-          "r2560":  { "status": "PASS", "decode_tps": 154.6, "min_free_mb": 580 },
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 159.6,
+            "min_free_mb": 890
+          },
+          "r1440p": {
+            "status": "PASS",
+            "decode_tps": 143.8,
+            "min_free_mb": 776
+          },
+          "r4k": {
+            "status": "PASS",
+            "decode_tps": 142.7,
+            "min_free_mb": 582
+          },
+          "r2560": {
+            "status": "PASS",
+            "decode_tps": 154.6,
+            "min_free_mb": 580
+          },
           "concurrent_4_mixed_2img_2txt_tps": 153.6
         },
         {
@@ -350,10 +967,27 @@
           "boot_free_mib": 997,
           "post_hires_free_mb": 980,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 173.1, "ttft_ms": 791.0, "min_free_mb": 871 },
-          "r1440p": { "status": "PASS", "decode_tps": 149.5, "min_free_mb": 757 },
-          "r4k":    { "status": "PASS", "decode_tps": 145.4, "min_free_mb": 563 },
-          "r2560":  { "status": "PASS", "decode_tps": 143.1, "min_free_mb": 561 }
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 173.1,
+            "ttft_ms": 791.0,
+            "min_free_mb": 871
+          },
+          "r1440p": {
+            "status": "PASS",
+            "decode_tps": 149.5,
+            "min_free_mb": 757
+          },
+          "r4k": {
+            "status": "PASS",
+            "decode_tps": 145.4,
+            "min_free_mb": 563
+          },
+          "r2560": {
+            "status": "PASS",
+            "decode_tps": 143.1,
+            "min_free_mb": 561
+          }
         },
         {
           "tag": "s1_128k_nomtp",
@@ -362,10 +996,27 @@
           "boot_free_mib": 1343,
           "post_hires_free_mb": 1327,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 91.9, "ttft_ms": 762.6, "min_free_mb": 1218 },
-          "r1440p": { "status": "PASS", "decode_tps": 92.2, "min_free_mb": 1104 },
-          "r4k":    { "status": "PASS", "decode_tps": 91.5, "min_free_mb": 910 },
-          "r2560":  { "status": "PASS", "decode_tps": 91.9, "min_free_mb": 908 }
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 91.9,
+            "ttft_ms": 762.6,
+            "min_free_mb": 1218
+          },
+          "r1440p": {
+            "status": "PASS",
+            "decode_tps": 92.2,
+            "min_free_mb": 1104
+          },
+          "r4k": {
+            "status": "PASS",
+            "decode_tps": 91.5,
+            "min_free_mb": 910
+          },
+          "r2560": {
+            "status": "PASS",
+            "decode_tps": 91.9,
+            "min_free_mb": 908
+          }
         },
         {
           "tag": "s4_64k_mtp_nocpu",
@@ -374,10 +1025,21 @@
           "boot_free_mib": 527,
           "post_hires_free_mb": 510,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 162.6 },
-          "r1440p": { "status": "PASS", "decode_tps": 153.2, "min_free_mb": 287 },
-          "r4k":    { "status": "HTTP_400_GUARD" },
-          "r2560":  { "status": "HTTP_400_GUARD" }
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 162.6
+          },
+          "r1440p": {
+            "status": "PASS",
+            "decode_tps": 153.2,
+            "min_free_mb": 287
+          },
+          "r4k": {
+            "status": "HTTP_400_GUARD"
+          },
+          "r2560": {
+            "status": "HTTP_400_GUARD"
+          }
         },
         {
           "tag": "s2_128k_mtp_auto",
@@ -386,10 +1048,22 @@
           "boot_free_mib": 498,
           "post_hires_free_mb": 481,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 168.6, "min_free_mb": 373 },
-          "r1440p": { "status": "PASS", "decode_tps": 151.6, "min_free_mb": 258 },
-          "r4k":    { "status": "HTTP_400_GUARD" },
-          "r2560":  { "status": "HTTP_400_GUARD" }
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 168.6,
+            "min_free_mb": 373
+          },
+          "r1440p": {
+            "status": "PASS",
+            "decode_tps": 151.6,
+            "min_free_mb": 258
+          },
+          "r4k": {
+            "status": "HTTP_400_GUARD"
+          },
+          "r2560": {
+            "status": "HTTP_400_GUARD"
+          }
         },
         {
           "tag": "s4_128k_mtp_auto",
@@ -399,10 +1073,21 @@
           "boot_free_mib": 338,
           "post_hires_free_mb": 320,
           "peak_gtt_mb": 0,
-          "r1080p": { "status": "PASS", "decode_tps": 168.3, "ttft_ms": 781.6, "min_free_mb": 212 },
-          "r1440p": { "status": "HTTP_400_GUARD" },
-          "r4k":    { "status": "HTTP_400_GUARD" },
-          "r2560":  { "status": "HTTP_400_GUARD" },
+          "r1080p": {
+            "status": "PASS",
+            "decode_tps": 168.3,
+            "ttft_ms": 781.6,
+            "min_free_mb": 212
+          },
+          "r1440p": {
+            "status": "HTTP_400_GUARD"
+          },
+          "r4k": {
+            "status": "HTTP_400_GUARD"
+          },
+          "r2560": {
+            "status": "HTTP_400_GUARD"
+          },
           "concurrent_4_mixed_2img_2txt_tps": 151.8
         }
       ]

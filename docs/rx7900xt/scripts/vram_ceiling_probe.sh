@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Two-stage VRAM ceiling probe for SaladCloud AMD RX 7900 XT (20GB, gfx1100, WSL2/ROCDXG).
+# Two-stage VRAM ceiling probe for AMD RX 7900 XT (20GB, gfx1100, WSL2/ROCDXG).
 # Stage 1 (~30-60s): raw HIP hipMemGetInfo + hipMalloc + hipMemset ceiling probe (no weights download).
 # Stage 2: real nib gen + serve config matrix across q4_1 / q4_0 / q8_0, 64k..262k, +/- MTP, slots.
 set -uo pipefail

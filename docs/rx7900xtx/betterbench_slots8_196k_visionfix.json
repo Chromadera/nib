@@ -49,7 +49,7 @@
   },
   "env": {
     "timestamp": "2026-11-26T00:59:56+0000",
-    "host": "76622ddf-3916-4cf3-970e-369bfa2419a6",
+    "host": "rx7900xtx-wsl2",
     "os": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
     "python": "3.12.3",
     "endpoint": "http://127.0.0.1:4444/v1",
