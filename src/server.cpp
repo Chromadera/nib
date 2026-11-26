@@ -1534,7 +1534,7 @@ public:
             }
 
 #ifndef NIB_VERSION
-#define NIB_VERSION "0.1.1"
+#define NIB_VERSION "0.1.2"
 #endif
             const auto now = std::chrono::steady_clock::now();
             std::ostringstream oss;
