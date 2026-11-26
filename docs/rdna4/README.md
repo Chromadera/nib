@@ -109,6 +109,24 @@ or the high 8 halves of the 16-half B fragment it already holds.
 Cost per tile per lane: `1 ds_load_b128 + 1 v_wmma` (+2 address ops) instead of
 `8 ds_load_b128 + 64 v_dot2 + 8 v_add_f32`.
 
+### Fragment loads: 8 halves, not 16
+
+The instruction consumes 8 halves per lane, but the shared (RDNA3-compatible) staging
+path produces 16-half fragments. Loading all 16 and then halving them with `pick8()`
+reads 32 B of LDS to use 16 B. Each lane's half is exactly one 16 B block of the
+XOR-swizzled row - block `(2*kc + laneGrp) ^ (row & 7)` - so it can be fetched alone:
+
+```cpp
+nib_f16x8 load8_xor(const _Float16 * row, int row_low3, int kc, int lane) {
+    return d4[(2 * kc + (lane >> 4)) ^ row_low3];   // one ds_load_b128
+}
+```
+
+The values are identical (greedy output unchanged) and B-fragment LDS traffic halves.
+On the grouped MoE and dense tiles together this measured **+14.3% prefill at 32K**
+(3,826 -> 4,373 tok/s pp2560) and +17.8% at depth 0, matching the bandwidth arithmetic:
+fragment reads had been consuming ~87% of the MMA issue time.
+
 ### Where it is wired in
 
 `nib_mma::mma_stride`, `mma_xor64` and `mma_rows` keep their signatures and their nib
