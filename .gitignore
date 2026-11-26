@@ -28,3 +28,7 @@ core.*
 .idea/
 *.swp
 *~
+
+# Secondary (cross-target) build trees
+build-*/
+models/fetch_pack.sh
