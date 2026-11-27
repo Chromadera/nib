@@ -34,6 +34,18 @@ Full scripts, `benchmarks.json`, and BetterBench `0.6.1` HTML/JSON reports live 
 
 **Takeaway for 16 GB cards:** Quantizing `blk.23` (`NVFP4-23` → `NVFP4-All`) costs only **`+0.00046` Mean KLD** (`-0.12%` top-1, `+0.0034` PPL) at identical speed, while freeing `0.48 GiB` VRAM — delivering **3–4× the context**, **2× the slots**, and the only working Vision configuration on 16 GB.
 
+### Nib `v0.2.1` Rerun (`2026-11-27`, `NVFP4-All`)
+
+Re-verified on commit `9de6314` (`-DGPU_TARGET=gfx1201`, ROCm `7.2.4`, Windows/WSL2 ROCDXG). Build, `spill_audit.sh` (`0/0/0/0`), `nib_kernel_test` (**9/9**), and `q8_0` selftest (`cos_sim = 0.9999909`) all passed (`q4_1` selftest returned `0.9979789`, bit-identical to `v0.2.0` and RX 9060 XT — pre-existing RDNA4-wide 4-bit KV tolerance behavior). See [`v0.2.1_2026-11-27/NOTES.md`](v0.2.1_2026-11-27/NOTES.md).
+
+- **`nib bench` (`NVFP4-All`, `--sparse-pages 224 --cpu-embd`):**
+  - `q4_0 @ 73,728` (`15.06 GiB`): `tg128` **`95.53 → 93.40 tok/s`** (`d0 → 72.7K`), `pp512` **`4,669.7`** (`8K`) → `4,044.4` (`32K`) → **`4,211.6 tok/s`** (`72.7K`) *(first `d0` repeat had host warmup variance: `4,287.3 ± 1,399.4`)*.
+  - `q4_1 @ 65,536` (`15.06 GiB`): `tg128` **`95.42 → 93.18 tok/s`** (`d0 → 64.5K`), `pp512` **`4,663.4`** (`8K`) → `3,480.9 tok/s` (`64.5K`).
+- **BetterBench `0.6.1` (`nib serve`, `32/32 OK` every level):**
+  - **`--slots 1 -c 73728 q4_0`:** Single-stream **`97.0 tok/s`** (`74.8 ms` TTFT); prefill **`4,449.4`** (`8K`) → `4,334.5` (`32K`) → **`4,098.9 tok/s`** (`55,980` real tokens) — [`html`](v0.2.1_2026-11-27/bb_All_s1_q4_0_c73728.html) · [`json`](v0.2.1_2026-11-27/bb_All_s1_q4_0_c73728.json).
+  - **`--slots 4 -c 49152 q4_0`:** Single-stream **`96.9 tok/s`** (`74.7 ms` TTFT); aggregate **`95.2` / `128.2` / `163.8 tok/s`** (`c = 1 / 2 / 4`, `42.5 tok/s`/stream & `121.6 ms` TTFT p50 at `c = 4`); prefill **`4,271.2 tok/s`** (`36,967` real tokens) — [`html`](v0.2.1_2026-11-27/bb_All_s4_q4_0_c49152.html) · [`json`](v0.2.1_2026-11-27/bb_All_s4_q4_0_c49152.json).
+- **Stability note:** Two intermittent hangs occurred early on this WSL2 node in `nib bench q4_0` right after graph capture; a 6-run alternating `v0.2.1` vs. `v0.2.0` A/B passed **6/6** cleanly at identical `95.4–95.5 tok/s`, and the full `nib bench` + BetterBench pipeline completed with zero further hangs.
+
 ---
 
 ## 2. Why 16 GB Cards Top Out Below 128K–262K (and How to Push Higher)

@@ -9,7 +9,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 > - **Full native 256K context (`262,848`) fits and runs cleanly on 20 GB even under Windows/WSL2** using `--kv-type q4_0 --sparse-pages 224 --no-vision` (no MTP): **`19.10 GiB`**, holding **`114.2 tok/s` decode** and **`2,278 tok/s` prefill** at `256,000` depth.
 > - **With DSpark MTP enabled (text-only, `--no-vision`)**, the WSL2 safe ceiling (`≤19.10 GiB` solo; `≤18.7 GiB` recommended for multi-slot to avoid Windows WDDM 2s TDR when host desktop VRAM is pinned) supports up to **`90K` (`q8_0`)**, **`160K` (`q4_1`)**, or **`176K` (`q4_0`)** solo, **`128K` @ `--slots 4`** (`q4_1`), and **`64K` @ `--slots 8`** (`q4_1`, `8K/slot`) — with an additional `+469 MiB` headroom available via `--cpu-embd`.
 >
-> **Update (`NVFP4-23`, 2026-11-26):** Using [`Inkling-2-Mini-NVFP4-23.gguf`](https://huggingface.co/degenmeowster/Inkling-2-Mini-Nib-Pack) (`14.99 GiB`, `-1.43 GiB` vs. Mixed, `0.00483` Mean KLD) unlocks **full `262,848` context with DSpark MTP across `--slots 1, 4, 8`** (`157.2` solo / `199.0` `c = 4` / `207.6 tok/s` `c = 8` agg; `3,218 tok/s` prefill @ `204K`) plus **`4K` / `2560²` Vision + MTP at `262,848` (`s1`)** with `0 MB` GTT spill. See the full evaluation in **[`nvfp4_23_2026-11-26/README.md`](nvfp4_23_2026-11-26/README.md)**.
+> **Update (`NVFP4-23`, 2026-11-26 & `v0.2.1` rerun 2026-11-27):** Using [`Inkling-2-Mini-NVFP4-23.gguf`](https://huggingface.co/degenmeowster/Inkling-2-Mini-Nib-Pack) (`14.99 GiB`, `-1.43 GiB` vs. Mixed, `0.00483` Mean KLD) unlocks **full `262,848` context with DSpark MTP across `--slots 1, 4, 8`** (`v0.2.1`: **`163.2`** solo / **`200.9`** `c = 4` / **`206.4 tok/s`** `c = 8` agg; `3,215 tok/s` prefill @ `204K`, `128/128 OK`) plus **`4K` / `2560²` Vision + MTP at `262,848` (`s1`)** with `0 MB` GTT spill. See **[`nvfp4_23_2026-11-26/README.md`](nvfp4_23_2026-11-26/README.md)** and [Section 9](#9-nib-v021-nvfp4-23-2026-11-27-rerun-summary).
 
 ---
 
@@ -297,3 +297,31 @@ Every run below recorded **`peak_gtt_mb = 0 MB`** across all samples, and `visio
 | **Max solo context with MTP (WSL2, text-only)** | `--slots 1 -c 163840 --kv-type q4_1 --mtp models/mtp.safetensors --no-vision` *(or `180224` `q4_0`)* | `19.06 GiB` | Add `--cpu-embd` for even higher context ceiling |
 | **Full native 256K context on 20 GB (WSL2)** | `--slots 1 -c 262848 --kv-type q4_0 --no-vision` *(no MTP)* | `19.10 GiB` | Verified `0 → 256,000` (`114.2 tok/s` decode, `2,278 tok/s` prefill) |
 | **Full native 256K context on 20 GB (Native Linux)** | `--slots 1 -c 262848 --kv-type q4_1 --no-vision` *(no MTP)* | `19.35 GiB` | Or `~18.89 GiB` with `--cpu-embd` |
+
+---
+
+## 9. Nib `v0.2.1` (`NVFP4-23`, 2026-11-27) Rerun Summary
+
+Re-verified on commit `9de6314` (`-DGPU_TARGET=gfx1100`, ROCm `7.2.4`, Windows/WSL2 ROCDXG) using `Inkling-2-Mini-NVFP4-23.gguf` + DSpark MTP. Build, `spill_audit.sh` (`0/0/0/0`), `nib_kernel_test` (**9/9**), and `nib selftest` (`q4_1` `cos_sim = 0.9996158`, `q8_0`, and `q4_1 + MTP`) all passed cleanly. See [`v0.2.1_2026-11-27/NOTES.md`](v0.2.1_2026-11-27/NOTES.md).
+
+### Non-MTP `nib bench` (`NVFP4-23`, `-c 262848 -p 512 -n 128 --sparse-pages 224`)
+
+| Depth | `q4_1 @ 262,848` `pp512` / `tg128` (`17.47 GiB`) | `q4_0 @ 262,848` `pp512` / `tg128` (`17.21 GiB`) |
+|---:|---:|---:|
+| **`0`** | `4,577.1` / **`124.47`** | `4,553.0` / **`124.49`** |
+| **`8,192`** | `4,005.2` / `120.90` | `3,968.1` / `121.22` |
+| **`32,768`** | `3,337.6` / `118.54` | `3,323.7` / `119.06` |
+| **`65,536`** | `3,394.7` / `118.25` | `3,379.9` / `118.71` |
+| **`131,072`** | `3,323.9` / `117.38` | `3,318.9` / `117.69` |
+| **`196,608`** | `3,245.9` / `116.57` | `3,238.6` / `116.91` |
+| **`229,376`** | `3,226.3` / `116.55` | `3,237.3` / `117.02` |
+| **`256,000`** | **`3,185.3`** / **`116.27`** | **`3,200.8`** / **`116.75`** |
+
+### BetterBench `0.6.1` (`--slots 8 -c 262848 --kv-type q4_1 --sparse-pages 224 --mtp`)
+
+Full interactive report: [`bb_23_s8_q4_1_c262848_mtp.html`](v0.2.1_2026-11-27/bb_23_s8_q4_1_c262848_mtp.html) · [`bb_23_s8_q4_1_c262848_mtp.json`](v0.2.1_2026-11-27/bb_23_s8_q4_1_c262848_mtp.json).
+
+- **Single-Stream Weighted Decode (MTP):** **`163.2 tok/s`** (`76.5 ms` TTFT p50; peaks: `file_edit` `182.5`, `summarization` `181.5`, `json` `177.5`, `code` `169.4`, `math` `167.1`, `reasoning` `150.3`, `chat` `134.0`, `prose` `128.2`).
+- **Concurrency (`128/128 OK`):** `c = 1` **`150.0`** agg (`158.8`/stream, `78.0 ms` TTFT) · `c = 2` **`152.5`** agg (`78.3`/stream, `92.4 ms`) · `c = 4` **`200.9`** agg (`51.9`/stream, `111.9 ms`) · `c = 8` **`206.4 tok/s`** agg (`26.8`/stream, `165.4 ms`).
+- **Prefill Ladder (`2K → 204K`):** `3,434.9` (`2K`) → **`3,716.9`** (`8K`) → `3,668.1` (`16K`) → `3,535.3` (`32K`) → `3,231.6` (`64K`) → `3,230.5` (`128K`) → **`3,214.8 tok/s`** at **`204,108`** actual tokens (`63.49 s` TTFT).
+
