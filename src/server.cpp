@@ -3011,7 +3011,7 @@ private:
         if (!job->has_images) {
             const int total = (int)job->prompt_toks.size();
             const int rem = total - job->prefill_offset;
-            const int chunk = std::min(MAX_UBATCH, rem);
+            const int chunk = std::min(eng_.prefill_ubatch(), rem);
             const bool is_last = (job->prefill_offset + chunk == total);
             const int32_t needed_pos = eng_.slot_pos(c) + chunk;
             if (needed_pos > span_ctx_limit(c, job->span)) {
@@ -3071,7 +3071,7 @@ private:
                     job->live_prompt_toks.store(job->sched_prompt_tokens, std::memory_order_relaxed);
                 }
                 const int rem = (int)job->cur_seg_toks.size() - job->seg_offset;
-                const int chunk = std::min(MAX_UBATCH, rem);
+                const int chunk = std::min(eng_.prefill_ubatch(), rem);
                 const int32_t needed_pos = eng_.slot_pos(c) + chunk;
                 if (needed_pos > span_ctx_limit(c, job->span)) {
                     if (!try_expand_slot(job, needed_pos)) {
@@ -3143,7 +3143,7 @@ private:
                     }
                 }
                 const int rem = job->cur_vis.n_tokens - job->seg_offset;
-                const int chunk = std::min(MAX_UBATCH, rem);
+                const int chunk = std::min(eng_.prefill_ubatch(), rem);
                 const int32_t needed_pos = eng_.slot_pos(c) + chunk;
                 if (needed_pos > span_ctx_limit(c, job->span)) {
                     if (!try_expand_slot(job, needed_pos)) {

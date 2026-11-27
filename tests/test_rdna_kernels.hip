@@ -14,17 +14,21 @@
 //   7. Vision Patch Embed Conv2D WMMA + Vision FA d=64 WMMA
 //   8. Cross-Workgroup Cache Coherence Stress Test (nib_flush_stores + nib_inv_l0_l1)
 //   9. Cooperative Spin-Barrier Co-Residency Safety Test (MTP mrows + decode)
+//  10. RDNA4 only: raw FP8 WMMA, NVFP4 -> E4M3 decode, FP8 row quantiser (test_rdna4_fp8.hip)
+//  11. RDNA4 only: grouped NVFP4 MoE prefill on FP8 WMMA (test_rdna4_fp8.hip)
 // ============================================================================
 
 #include "inkling_engine.h"
 #include "kernels_decode_fused.h"
 #include "kernels_step7h_fused.h"
 #include "kernels_step7j_fdot2.h"
+#include "kernels_wmma_fp8.h"
 #include "nib_arch.h"
 #include "sparse_global.h"
 #include "vision_encoder.hpp"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1303,6 +1307,9 @@ bool run_test_coresident_safety(hipStream_t stream) {
     return ok;
 }
 
+// Suites 10-11 (RDNA4 FP8 WMMA); absent from gfx11 device passes.
+#include "test_rdna4_fp8.hip"
+
 } // namespace
 
 int main() {
@@ -1329,11 +1336,20 @@ int main() {
     if (!run_test_vision_wmma(stream))        ++fails;
     if (!run_test_coherence(stream))          ++fails;
     if (!run_test_coresident_safety(stream))  ++fails;
+    int n_suites = 9;
+#if NIB_FP8_CODEGEN   // host pass (main() is host code; gfx11 device passes never see the suites)
+    if (rdna4_fp8_prefill_supported()) {
+        fails += run_rdna4_fp8_suites(stream, &n_suites);
+    } else {
+        std::printf("[SKIP] 10-11. RDNA4 FP8 WMMA suites (%s)\n",
+                    rdna4_fp8_prefill_built() ? "device is not RDNA4" : "built without gfx1200/gfx1201");
+    }
+#endif
 
     HIP_CHECK(hipStreamDestroy(stream));
     std::printf("=================================================\n");
     if (fails == 0) {
-        std::printf("ALL 9 RDNA KERNEL SUITES PASSED (%s / %s)\n", info.gcn_arch, info.arch_family);
+        std::printf("ALL %d RDNA KERNEL SUITES PASSED (%s / %s)\n", n_suites, info.gcn_arch, info.arch_family);
         return 0;
     }
     std::printf("FAILED: %d suite(s) failed\n", fails);

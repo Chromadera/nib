@@ -31,6 +31,18 @@ endif()
 string(JOIN "," NIB_GPU_TARGET_STR ${_NIB_GPU_TARGETS_CLEAN})
 message(STATUS "Nib GPU target(s): ${NIB_GPU_TARGET_STR}")
 
+# RDNA4 FP8 WMMA prefill kernels (src/kernels_wmma_fp8_rdna4.hip) are built only when a gfx12
+# target is requested; otherwise the host-only src/kernels_wmma_fp8_stub.cpp provides the same API
+# and reports the kernels as not built (host code checks rdna4_fp8_prefill_supported() at runtime).
+# Deliberately no compile definition: the existing HIP objects keep byte-identical commands.
+set(NIB_HAVE_RDNA4_FP8 0)
+foreach(_tgt IN LISTS _NIB_GPU_TARGETS_CLEAN)
+    if(_tgt STREQUAL "gfx1200" OR _tgt STREQUAL "gfx1201")
+        set(NIB_HAVE_RDNA4_FP8 1)
+    endif()
+endforeach()
+message(STATUS "Nib RDNA4 FP8 WMMA prefill kernels: ${NIB_HAVE_RDNA4_FP8}")
+
 set(NIB_GIT_SHA "unknown")
 find_package(Git QUIET)
 if(GIT_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
@@ -103,6 +115,12 @@ add_hip_object(kernels_dspark_mtp    "src/kernels_dspark_mtp.hip"
 add_hip_object(kernels_verify_batch  "src/kernels_verify_batch.hip"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_verify_batch.h")
 
+if(NIB_HAVE_RDNA4_FP8)
+    add_hip_object(kernels_wmma_fp8  "src/kernels_wmma_fp8_rdna4.hip"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nib_arch_fp8.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_wmma_fp8.h")
+endif()
+
 set(NIB_HIP_OBJECTS
     ${repack_soa_OBJ}
     ${kernels_core_OBJ}
@@ -123,6 +141,12 @@ set(NIB_HIP_OBJECTS
     ${kernels_dspark_mtp_OBJ}
     ${kernels_verify_batch_OBJ}
 )
+set(NIB_FP8_HOST_SOURCES "")
+if(NIB_HAVE_RDNA4_FP8)
+    list(APPEND NIB_HIP_OBJECTS ${kernels_wmma_fp8_OBJ})
+else()
+    set(NIB_FP8_HOST_SOURCES src/kernels_wmma_fp8_stub.cpp)
+endif()
 
 add_custom_target(nib_hip_objs DEPENDS ${NIB_HIP_OBJECTS})
 
@@ -133,6 +157,7 @@ add_executable(nib
     src/vision_encoder.cpp
     src/server.cpp
     src/main.cpp
+    ${NIB_FP8_HOST_SOURCES}
     ${NIB_HIP_OBJECTS}
 )
 add_dependencies(nib nib_hip_objs)
@@ -160,13 +185,22 @@ set_target_properties(nib PROPERTIES
 )
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rdna_kernels.hip")
-    add_hip_object(test_rdna_kernels "tests/test_rdna_kernels.hip")
+    # tests/test_rdna4_fp8.hip (RDNA4 FP8 suites 10-11) is included by test_rdna_kernels.hip.
+    add_hip_object(test_rdna_kernels "tests/test_rdna_kernels.hip"
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rdna4_fp8.hip"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nib_arch_fp8.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_wmma_fp8.h")
     add_executable(nib_kernel_test
         ${test_rdna_kernels_OBJ}
+        ${NIB_FP8_HOST_SOURCES}
         ${NIB_HIP_OBJECTS}
     )
     add_dependencies(nib_kernel_test nib_hip_objs)
     set_target_properties(nib_kernel_test PROPERTIES LINKER_LANGUAGE CXX)
+    # Only used by NIB_FP8_HOST_SOURCES (the host stub); the HIP objects carry their own flags.
+    target_include_directories(nib_kernel_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src" "${ROCM_PATH}/include")
+    target_compile_definitions(nib_kernel_test PRIVATE __HIP_PLATFORM_AMD__)
     target_link_directories(nib_kernel_test PRIVATE "${ROCM_PATH}/lib")
     target_link_libraries(nib_kernel_test PRIVATE amdhip64 pthread dl)
     set_target_properties(nib_kernel_test PROPERTIES

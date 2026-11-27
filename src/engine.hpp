@@ -1,6 +1,7 @@
 #pragma once
 
 #include "inkling_engine.h"
+#include "kernels_wmma_fp8.h"
 #include "sparse_global.h"
 
 #include <cstdint>
@@ -114,6 +115,17 @@ struct EngineConfig {
     // Host-side tight-VRAM profile was applied (main.cpp): only switches on the
     // estimated-vs-actual state-bytes report at the end of init().
     bool    report_state_estimate = false;
+
+    // RDNA4 FP8 WMMA prefill (src/kernels_wmma_fp8_rdna4.hip).  FP8_PREFILL_MOE runs the NVFP4
+    // expert GEMMs of every prefill micro-batch with more than fp8_min_m tokens on FP8 WMMA (E4M3
+    // operands, FP32 accumulation); everything else stays on FP16 WMMA.  Default off.  RDNA4
+    // only: on another GPU, or in a binary built without a gfx12 target, init() warns once and
+    // forces it off.
+    int32_t fp8_prefill    = FP8_PREFILL_OFF;
+    int32_t fp8_min_m      = FP8_PREFILL_DEFAULT_MIN_M;
+    // Runtime prefill micro-batch size (512 default; up to FP8_MAX_UBATCH=1024).
+    // When raised to 1024, init() automatically ensures swa_cap >= SWA_WINDOW + prefill_ubatch.
+    int32_t prefill_ubatch = MAX_UBATCH;
 };
 
 class InklingEngine {
@@ -124,7 +136,7 @@ public:
     bool init(const std::string & model_path, const EngineConfig & cfg, bool verify_repack = false);
     void reset_state(); // resets pos=0, clears KV k_pos to -1 and sconv hist to 0
 
-    // Prefill a batch of tokens (chunked automatically by MAX_UBATCH=512).
+    // Prefill a batch of tokens (chunked automatically by cfg_.prefill_ubatch).
     // If compute_all_logits == true, copies [n_tokens, VOCAB_UNPADDED] logits into out_logits (for PPL).
     // If compute_all_logits == false, computes logits ONLY for the last token (writes [VOCAB_UNPADDED] if out_logits != nullptr).
     bool prefill(const std::vector<int32_t> & tokens, bool compute_all_logits, std::vector<float> * out_logits = nullptr);
@@ -143,10 +155,11 @@ public:
     // Fast decode loop benchmark (stays on GPU except 4-byte argmax or StepMeta update)
     double benchmark_decode_steps(int32_t start_token, int n_steps, std::vector<int32_t> * out_tokens = nullptr);
 
-    int32_t current_pos() const { return cur_pos_; }
-    int32_t max_ctx()     const { return cfg_.max_ctx; }
-    int32_t num_slots()   const { return cfg_.n_slots; }
-    int32_t slot_ctx()    const { return slot_ctx_; }
+    int32_t current_pos()    const { return cur_pos_; }
+    int32_t max_ctx()        const { return cfg_.max_ctx; }
+    int32_t prefill_ubatch() const { return cfg_.prefill_ubatch; }
+    int32_t num_slots()      const { return cfg_.n_slots; }
+    int32_t slot_ctx()       const { return slot_ctx_; }
     int32_t slot_pos(int slot) const {
         return (slot >= 0 && slot < cfg_.n_slots) ? slot_pos_[slot] : 0;
     }
@@ -165,6 +178,12 @@ public:
     // --cpu-embd: bytes of token_embd held in pinned, GPU-mapped host RAM (not in total_vram_bytes()).
     size_t host_pinned_bytes() const { return weights_.host_pinned_bytes; }
     bool   cpu_embd() const { return weights_.tok_embd_on_host; }
+
+    // FP8 WMMA prefill (EngineConfig::fp8_prefill).  set_fp8_prefill() switches it at runtime
+    // (selftest / A-B measurements); it returns false, leaving FP8 off, when this binary or GPU
+    // cannot run the FP8 kernels.
+    bool fp8_prefill_active() const { return fp8_moe_prefill_; }
+    bool set_fp8_prefill(int32_t mode);
 
     // Host-only mirror of alloc_state_and_scratch() (+ alloc_batch_scratch() and
     // enable_mtp_io() when with_mtp_io): VRAM bytes the engine allocates on top of
@@ -292,6 +311,7 @@ private:
     void capture_decode_graph();
 
     EngineConfig  cfg_;
+    bool          fp8_moe_prefill_ = false; // resolved EngineConfig::fp8_prefill == FP8_PREFILL_MOE
     ModelWeights  weights_;
     TokenizerData tok_;
     hipStream_t   stream_ = nullptr;

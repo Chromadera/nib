@@ -49,6 +49,32 @@ static bool parse_meta_fmt(const std::string & v, int32_t * out) {
     return false;
 }
 
+// --fp8-prefill / INKLING_FP8_PREFILL: off|0 = FP16 WMMA prefill, moe|1 = NVFP4 MoE on FP8 WMMA.
+static bool parse_fp8_prefill(const std::string & v, int32_t * out) {
+    if (v == "off" || v == "0") { *out = FP8_PREFILL_OFF; return true; }
+    if (v == "moe" || v == "1") { *out = FP8_PREFILL_MOE; return true; }
+    return false;
+}
+
+// INKLING_FP8_MIN_M: FP8 prefill engages for micro-batches with M > min_m (0 .. FP8_MAX_UBATCH).
+static bool parse_fp8_min_m(const char * v, int32_t * out) {
+    char * end = nullptr;
+    const long x = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0' || x < 0 || x > FP8_MAX_UBATCH) return false;
+    *out = (int32_t)x;
+    return true;
+}
+
+// --ubatch / INKLING_UBATCH: prefill micro-batch size (512 default, 1024 opt-in).
+static bool parse_ubatch(const char * v, int32_t * out) {
+    char * end = nullptr;
+    const long x = std::strtol(v, &end, 10);
+    if (end == v || *end != '\0') return false;
+    if (x != MAX_UBATCH && x != FP8_MAX_UBATCH) return false;
+    *out = (int32_t)x;
+    return true;
+}
+
 static std::vector<int32_t> load_token_ids_file(const std::string & path) {
     std::ifstream f(path);
     std::vector<int32_t> ids;
@@ -101,14 +127,23 @@ static void print_usage(const char * argv0) {
         "  vision   -m <gguf> --mmproj <mmproj.gguf> --image <img.png> [--prompt <text>] [-c 262144] [-d 0] [-n 256] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--bench-vision 5] [--dump-embeds <path>] [--no-graph]\n"
         "  serve    -m <gguf> [--host 127.0.0.1] [--port 4444] [--model-name inkling-2-mini] [--slots 4] [-c 262848] [--strict-slot-ctx] [--max-slot-ctx N] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4]\n"
         "           [--default-temp 1.0] [--default-top-p 1.0] [--default-top-k 0] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
-        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp] [--cpu-embd]\n"
+        "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp] [--cpu-embd] [--fp8-prefill]\n"
         "  --version  Print Nib version and target GPU architecture\n"
         "VRAM options (bench / gen / vision / serve):\n"
         "  --cpu-embd | --no-cpu-embd   token_embd.weight (~469 MiB) in pinned GPU-mapped host RAM instead of VRAM\n"
-        "                               (off by default; on < 22 GiB GPUs it is auto-enabled with --mtp + vision)\n"
+        "                               (off by default; on < 22 GiB GPUs it is auto-enabled with --mtp + vision;\n"
+        "                               selftest / ppl / oracle honour it only when given explicitly)\n"
         "  --vision-keep-scratch        keep the ViT workspace resident between images (default: freed after each encode)\n"
         "  On GPUs with < 22 GiB VRAM, an unset --kv-type defaults to q4_1 and an unset -c is capped to keep\n"
-        "  >= 768 MiB (>= ~1 GiB with vision) VRAM free; explicit flags are always respected.\n",
+        "  >= 768 MiB (>= ~1 GiB with vision) VRAM free; explicit flags are always respected.\n"
+        "FP8 prefill & ubatch (every mode):\n"
+        "  --ubatch <512|1024>          prefill micro-batch size (default 512; env INKLING_UBATCH=512|1024;\n"
+        "                               1024 raises arithmetic intensity on RDNA4 FP8 at +~239 MiB VRAM)\n"
+        "  --fp8-prefill [off|moe] | --no-fp8-prefill\n"
+        "                               RDNA4 gfx1200/gfx1201 only: NVFP4 MoE GEMMs of prefill micro-batches\n"
+        "                               with M > 256 tokens on FP8 WMMA (default off; env INKLING_FP8_PREFILL,\n"
+        "                               INKLING_FP8_MIN_M=0..1024; CLI wins).  selftest --fp8-prefill gates\n"
+        "                               a ubatch-sized FP8 vs FP16 prefill.\n",
         NIB_VERSION, NIB_GPU_TARGET, argv0);
 }
 
@@ -618,6 +653,131 @@ int run_selftest_sampler(InklingEngine & eng, const std::vector<float> & logits)
     return failures;
 }
 
+// FP8 prefill gate (selftest --fp8-prefill): one ubatch-sized text prompt prefilled with every GEMM on
+// FP16 WMMA and with the NVFP4 MoE on FP8 WMMA; the last-row logits must agree (cos >= 0.997,
+// identical argmax, all finite — E4M3's 3-bit mantissa across 24 MoE layers yields cos ~0.9985 on
+// NVFP4-All, matching Test 11's single-layer 0.9984 budget while catching any scale/layout defect).
+// Leaves the engine with FP8 prefill enabled.
+int run_selftest_fp8_prefill(InklingEngine & eng, int32_t min_m) {
+    const int M = eng.prefill_ubatch();
+    if (!rdna4_fp8_prefill_supported()) {
+        std::printf("[selftest] FP8 prefill gate: SKIP (needs an RDNA4 GPU and a gfx1200/gfx1201 build)\n");
+        return 0;
+    }
+    if (min_m >= M) {
+        std::printf("[selftest] FP8 prefill gate: SKIP (INKLING_FP8_MIN_M=%d: FP8 never engages at M=%d)\n", min_m, M);
+        return 0;
+    }
+    static const char * kText =
+        "The lighthouse keeper climbed the spiral stairs at dusk, counting the iron steps as his father had "
+        "taught him. Below, the harbour emptied of fishing boats one by one, their lanterns swinging like "
+        "slow pendulums. He trimmed the wick, polished the great lens, and wrote the weather in the log: wind "
+        "from the north-east, falling barometer, a long swell rolling in from the open sea.\n\n"
+        "In the coastal observatory across the bay, three surveyors compared tide tables from the previous "
+        "decade against the copper gauge bolted to the granite jetty. Autumn storms had shifted the sandbar "
+        "forty yards south, narrowing the eastern channel that merchant steamers relied on before winter fogs "
+        "settled over the estuary. Every Tuesday a clerk sent updated soundings to the harbour master by "
+        "telegraph, along with notes on driftwood, buoys that had slipped their moorings, and the migration "
+        "of grey seals onto the outer skerries.\n\n"
+        "Farther inland, the railway line followed an old Roman road through limestone valleys where apple "
+        "orchards bordered terraced pastures. The morning freight carried crates of cider, slate tiles from "
+        "the quarry near Penrith, and sacks of winter wheat bound for the granaries in Bristol. At each small "
+        "station the fireman stepped down with a long-spouted oil can while the guard exchanged mail pouches "
+        "with the postmaster and checked the brass pressure gauge on the brake van.\n\n"
+        "During the late nineteenth century, advances in marine chronometers transformed navigation across "
+        "open oceans. Watchmakers balanced brass and steel rims to cancel thermal expansion, while jewel "
+        "bearings cut friction in the escapement so that a ship six weeks out of port could still determine "
+        "its longitude within a couple of nautical miles. Naval hydrographers paired those instruments with "
+        "sextant observations at local noon, compiling charts whose depth contours remained accurate for "
+        "generations of captains.\n\n"
+        "Meanwhile, botanists cataloguing alpine meadows documented how snowmelt timing governs the sequence "
+        "of spring blooms. Saxifrages and gentians emerge within days of bare ground appearing along south-"
+        "facing ridges, whereas north-facing hollows hold packed drifts well into July. Pollinators track "
+        "that moving wave of nectar up the mountainside, linking lowland orchards to high scree slopes in a "
+        "seasonal circuit that depends heavily on night-time frost frequency.\n\n"
+        "In the municipal archive, librarians restored nineteenth-century architectural drawings on linen "
+        "paper using wheat-starch paste and fine Japanese tissue. The folios showed proposed bridges, water "
+        "pumping stations, public markets, and cast-iron conservatories—half of them built and still standing, "
+        "the other half abandoned after council debates over municipal bonds. Marginalia in faint graphite "
+        "recorded the engineers' second thoughts about masonry foundations on clay riverbanks.\n\n"
+        "Modern radio telescopes detect faint hydrogen emission lines from galaxies billions of light-years "
+        "away by linking dozens of parabolic dishes across continents into a single virtual aperture. Atomic "
+        "clocks stamp every waveform with picosecond precision so correlators can align signals recorded in "
+        "Chile, South Africa, and northern Europe. When astronomers reconstruct the interference pattern, they "
+        "obtain angular resolution fine enough to map cold gas clouds orbiting active galactic nuclei.\n\n"
+        "Back in the kitchen of the dockside bakery, the night shift weighed rye flour, warm water, and "
+        "sourdough starter into oak troughs before midnight. By four in the morning the brick ovens had been "
+        "raked clear of ash, and loaves scored with diagonal slashes went in on long wooden peels. Steam "
+        "hissed through the damper vents, turning the crusts mahogany brown just as the first ferry whistle "
+        "echoed across the water.\n\n"
+        "Geologists drilling sediment cores from the floor of an ancient glacial lake read past climates in "
+        "millimetre-thin varves: pale silt layers deposited during summer meltwater surges alternating with "
+        "dark organic bands laid down under winter ice. Trapped pollen grains reveal when birch and pine gave "
+        "way to oak woodland, and microscopic volcanic glass shards pin down exact eruption dates across "
+        "distant basins. Each core tube is split lengthwise, photographed under polarized light, and sampled "
+        "at intervals corresponding to single decades.\n\n"
+        "Along the shipyard slipway, apprentices steamed oak planks in a long cedar box until the timber "
+        "bent smoothly around the curved frames of a thirty-foot cutter. Copper rivets were driven through "
+        "pre-drilled holes and peened over roves while the wood was still hot, locking the strakes tight "
+        "before the caulking mallet drove spun cotton and pine pitch into the seams. When the hull finally "
+        "slid down tallowed timbers into the tide, not a drop seeped into the bilge.\n\n"
+        "In computational fluid dynamics, simulating turbulent flow over an airfoil requires balancing mesh "
+        "resolution against memory bandwidth. Boundary layers near the leading edge demand thin prismatic "
+        "cells to capture shear stress accurately, while the wake far downstream can use coarser hexahedral "
+        "blocks. Adaptive refinement schemes monitor vorticity gradients between timesteps, subdividing cells "
+        "only where eddies form and coarsening regions where the flow returns to laminar equilibrium.\n\n"
+        "By sunrise the wind had veered west and the clouds broke into silver bands above the headland. The "
+        "keeper extinguished the lamp, drew the linen curtains across the glass to shield the Fresnel prisms "
+        "from direct sun, and descended to the stone courtyard where the supply boat was already tying up "
+        "beside the crane with fresh coal, salt pork, and a bundle of newspapers from the mainland.\n";
+    BpeTokenizer bpe;
+    bpe.init(eng.tokenizer());
+    const std::vector<int32_t> para = bpe.encode(kText, /*parse_special=*/false);
+    if (para.empty()) {
+        std::printf("[selftest] FP8 prefill gate: FAIL (tokenizer produced no tokens)\n");
+        return 1;
+    }
+    std::vector<int32_t> prompt;
+    prompt.reserve(M);
+    while ((int)prompt.size() < M) {
+        prompt.insert(prompt.end(), para.begin(), para.end());
+    }
+    prompt.resize(M);
+
+    std::vector<float> l16, l8;
+    eng.set_fp8_prefill(FP8_PREFILL_OFF);
+    eng.reset_state();
+    const bool ok16 = eng.prefill(prompt, false, &l16);
+    eng.set_fp8_prefill(FP8_PREFILL_MOE);
+    eng.reset_state();
+    const bool ok8 = eng.prefill(prompt, false, &l8);
+    eng.reset_state();
+    if (!ok16 || !ok8 || (int)l16.size() < VOCAB_UNPADDED || (int)l8.size() < VOCAB_UNPADDED) {
+        std::printf("[selftest] FP8 prefill gate: FAIL (prefill failed)\n");
+        return 1;
+    }
+    int nonfinite = 0;
+    double dot = 0.0, n16 = 0.0, n8 = 0.0, max_diff = 0.0;
+    for (int v = 0; v < VOCAB_UNPADDED; ++v) {
+        if (!std::isfinite(l16[v]) || !std::isfinite(l8[v])) {
+            ++nonfinite;
+            continue;
+        }
+        dot += (double)l16[v] * l8[v];
+        n16 += (double)l16[v] * l16[v];
+        n8  += (double)l8[v] * l8[v];
+        max_diff = std::max(max_diff, std::fabs((double)l16[v] - (double)l8[v]));
+    }
+    const double cos_sim = dot / (std::sqrt(n16 * n8) + 1e-12);
+    const int32_t a16 = st_argmax(l16.data(), VOCAB_UNPADDED);
+    const int32_t a8  = st_argmax(l8.data(), VOCAB_UNPADDED);
+    const bool pass = nonfinite == 0 && cos_sim >= 0.997 && a16 == a8;
+    std::printf("[SELFTEST] FP8 vs FP16 prefill (M=%d, min_m=%d): argmax fp16=%d fp8=%d | max_diff=%.5f | "
+                "cos_sim=%.7f | non-finite=%d -> %s\n",
+                M, min_m, a16, a8, max_diff, cos_sim, nonfinite, pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 SelftestResult run_selftest_mtp(InklingEngine & eng, DSparkDrafter & dr, float threshold, bool bench) {
     SelftestResult res;
     const std::vector<int32_t> prompt = { 1, 100, 200, 300, 400 };
@@ -941,6 +1101,26 @@ int main(int argc, char ** argv) {
     int  cpu_embd_flag = -1;          // -1 unset, 0 --no-cpu-embd, 1 --cpu-embd
     bool vision_keep_scratch = false;
 
+    // FP8 prefill & ubatch: the environment sets the default, the command line overrides it.
+    if (const char * ev = std::getenv("INKLING_FP8_PREFILL"); ev != nullptr && ev[0] != '\0') {
+        if (!parse_fp8_prefill(ev, &cfg.fp8_prefill)) {
+            std::fprintf(stderr, "Invalid INKLING_FP8_PREFILL='%s' (expected 0, 1, off or moe)\n", ev);
+            return 1;
+        }
+    }
+    if (const char * ev = std::getenv("INKLING_FP8_MIN_M"); ev != nullptr && ev[0] != '\0') {
+        if (!parse_fp8_min_m(ev, &cfg.fp8_min_m)) {
+            std::fprintf(stderr, "Invalid INKLING_FP8_MIN_M='%s' (expected an integer in 0..%d)\n", ev, FP8_MAX_UBATCH);
+            return 1;
+        }
+    }
+    if (const char * ev = std::getenv("INKLING_UBATCH"); ev != nullptr && ev[0] != '\0') {
+        if (!parse_ubatch(ev, &cfg.prefill_ubatch)) {
+            std::fprintf(stderr, "Invalid INKLING_UBATCH='%s' (expected %d or %d)\n", ev, MAX_UBATCH, FP8_MAX_UBATCH);
+            return 1;
+        }
+    }
+
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-m" && i + 1 < argc) model_path = argv[++i];
@@ -971,6 +1151,26 @@ int main(int argc, char ** argv) {
         else if (a == "--cpu-embd") cpu_embd_flag = 1;
         else if (a == "--no-cpu-embd") cpu_embd_flag = 0;
         else if (a == "--vision-keep-scratch") vision_keep_scratch = true;
+        else if (a == "--ubatch") {
+            if (i + 1 >= argc || !parse_ubatch(argv[i + 1], &cfg.prefill_ubatch)) {
+                std::fprintf(stderr, "Invalid --ubatch '%s' (expected %d or %d)\n",
+                             (i + 1 < argc) ? argv[i + 1] : "", MAX_UBATCH, FP8_MAX_UBATCH);
+                return 1;
+            }
+            ++i;
+        }
+        else if (a == "--fp8-prefill") {
+            // Optional value: a bare --fp8-prefill means moe; a non-flag argument must parse cleanly.
+            cfg.fp8_prefill = FP8_PREFILL_MOE;
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (!parse_fp8_prefill(argv[i + 1], &cfg.fp8_prefill)) {
+                    std::fprintf(stderr, "Invalid --fp8-prefill '%s' (expected 0, 1, off or moe)\n", argv[i + 1]);
+                    return 1;
+                }
+                ++i;
+            }
+        }
+        else if (a == "--no-fp8-prefill") cfg.fp8_prefill = FP8_PREFILL_OFF;
         else if (a == "--kv-type" && i + 1 < argc) {
             explicit_kv = true;
             std::string kt = argv[++i];
@@ -1109,6 +1309,8 @@ int main(int argc, char ** argv) {
         else if (a == "--no-vision") no_vision = true;
     }
 
+    cfg.swa_cap = std::max(cfg.swa_cap, SWA_WINDOW + cfg.prefill_ubatch);
+
     if (mode == "serve" && !explicit_slots) {
         cfg.n_slots = 4; // Default: 4 concurrent slots (65,536 ctx/slot when concurrent, 262k solo)
     }
@@ -1117,8 +1319,9 @@ int main(int argc, char ** argv) {
         cfg.verify_batch = 1;   // Step 8C: batched m-token verify is the default for MTP
     }
 
-    if (mode == "selftest") {
-        if (cpu_embd_flag >= 0) cfg.cpu_embd = (cpu_embd_flag == 1);   // explicit only (repack check)
+    if (mode == "selftest" || mode == "ppl" || mode == "oracle") {
+        // explicit only: selftest checks the repack, ppl / oracle need the VRAM for all-row logits
+        if (cpu_embd_flag >= 0) cfg.cpu_embd = (cpu_embd_flag == 1);
     } else if (mode == "serve" || mode == "gen" || mode == "bench" || mode == "vision") {
         VramProfileIn vin;
         vin.mode          = mode;
@@ -1162,6 +1365,9 @@ int main(int argc, char ** argv) {
                     next_pf, next_dec, max_diff, cos_sim);
         int failures = (cos_sim > 0.999) ? 0 : 1;
         failures += run_selftest_sampler(eng, logits_dec);
+        if (cfg.fp8_prefill != FP8_PREFILL_OFF) {
+            failures += run_selftest_fp8_prefill(eng, cfg.fp8_min_m);
+        }
         if (!mtp_path.empty()) {
             DSparkDrafter dr;
             if (!eng.enable_mtp_io()) { std::fprintf(stderr, "enable_mtp_io failed\n"); return 1; }
@@ -1360,7 +1566,7 @@ int main(int argc, char ** argv) {
     }
 
     if (mode == "ppl" || mode == "oracle") {
-        cfg.need_all_logits_buf = true; // every row's logits are scored here
+        cfg.need_all_logits_buf = (mode == "ppl"); // oracle only scores the last row
         auto toks = load_token_ids_file(tokens_path);
         if (toks.size() < 2) {
             std::fprintf(stderr, "Need >=2 token IDs in '%s'\n", tokens_path.c_str());

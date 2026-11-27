@@ -159,8 +159,35 @@ static T * alloc_gpu(size_t count, std::vector<void *> & track, size_t & total_b
     return reinterpret_cast<T *>(ptr);
 }
 
+static inline size_t moe_perm_x_floats(size_t ub) {
+    // FP16 MoE (kernels_wmma_prefill.hip) chunks in MAX_UBATCH=512: needs FP16 [512, N_EMBD] + tok_slots [512*TOP_K].
+    // FP8  MoE (kernels_wmma_fp8_rdna4.hip) chunks in ub <= 1024:   needs E4M3 [ub,  N_EMBD] + align16(xs[ub]) + tok_slots [ub*TOP_K].
+    const size_t fp16_b = (size_t)MAX_UBATCH * N_EMBD * sizeof(_Float16)
+                        + (size_t)MAX_UBATCH * TOP_K * sizeof(int32_t);
+    const size_t fp8_b  = ub * N_EMBD
+                        + ((ub * sizeof(float) + 15u) & ~size_t(15))
+                        + ub * TOP_K * sizeof(int32_t);
+    return (std::max(fp16_b, fp8_b) + sizeof(float) - 1) / sizeof(float);
+}
+
+static inline size_t moe_perm_act_floats(size_t ub) {
+    // FP16 MoE writes _Float16 [<=MAX_UBATCH*TOP_K, N_FF_EXP] (9.0 MiB);
+    // FP8  MoE writes uint8_t  [<=ub*TOP_K, N_FF_EXP] (4.5 MiB at 512, 9.0 MiB at 1024).
+    const size_t fp16_b = (size_t)MAX_UBATCH * TOP_K * N_FF_EXP * sizeof(_Float16);
+    const size_t fp8_b  = ub * TOP_K * N_FF_EXP * sizeof(uint8_t);
+    return (std::max(fp16_b, fp8_b) + sizeof(float) - 1) / sizeof(float);
+}
+
 bool InklingEngine::init(const std::string & model_path, const EngineConfig & cfg, bool verify_repack) {
     cfg_ = cfg;
+    if (cfg_.prefill_ubatch < 1 || cfg_.prefill_ubatch > FP8_MAX_UBATCH) {
+        std::fprintf(stderr, "InklingEngine: invalid prefill_ubatch=%d (expected 1..%d)\n",
+                     cfg_.prefill_ubatch, FP8_MAX_UBATCH);
+        return false;
+    }
+    if (cfg_.swa_cap < SWA_WINDOW + cfg_.prefill_ubatch) {
+        cfg_.swa_cap = SWA_WINDOW + cfg_.prefill_ubatch;
+    }
     if (cfg_.n_slots < 1) cfg_.n_slots = 1;
     if (cfg_.n_slots > MAX_CONCURRENT_SLOTS) cfg_.n_slots = MAX_CONCURRENT_SLOTS;
     const int32_t pool_ctx = (cfg_.sparse_pages > 0)
@@ -218,8 +245,8 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
 
     const char * kv_name = (cfg_.kv_type == KV_Q4_1) ? "q4_1"
                          : (cfg_.kv_type == KV_Q4_0) ? "q4_0" : "q8_0";
-    std::printf("[InklingEngine] Ready! max_ctx=%d slots=%d slot_ctx=%d swa_cap=%d kv=%s sparse_pages=%d total_vram=%.2f GiB (weights=%.2f GiB, kv+scratch=%.2f GiB)\n",
-                cfg_.max_ctx, cfg_.n_slots, slot_ctx_, cfg_.swa_cap, kv_name, cfg_.sparse_pages,
+    std::printf("[InklingEngine] Ready! max_ctx=%d slots=%d slot_ctx=%d ubatch=%d swa_cap=%d kv=%s sparse_pages=%d total_vram=%.2f GiB (weights=%.2f GiB, kv+scratch=%.2f GiB)\n",
+                cfg_.max_ctx, cfg_.n_slots, slot_ctx_, cfg_.prefill_ubatch, cfg_.swa_cap, kv_name, cfg_.sparse_pages,
                 (double)total_vram_bytes_ / (1024.0 * 1024.0 * 1024.0),
                 (double)weights_.total_vram_bytes / (1024.0 * 1024.0 * 1024.0),
                 (double)(total_vram_bytes_ - weights_.total_vram_bytes) / (1024.0 * 1024.0 * 1024.0));
@@ -233,6 +260,15 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
         std::printf("[InklingEngine] kv+scratch estimate %.1f MiB vs actual %.1f MiB (diff %+.1f MiB)\n",
                     (double)est / 1048576.0, (double)act / 1048576.0,
                     ((double)act - (double)est) / 1048576.0);
+    }
+    if (cfg_.fp8_prefill != FP8_PREFILL_OFF && set_fp8_prefill(cfg_.fp8_prefill)) {
+        bool any_nvfp4 = false;
+        for (int il = 0; il < N_LAYER_PHYS; ++il) {
+            any_nvfp4 |= weights_.layers[il].is_nvfp4;
+        }
+        std::printf("[nib] prefill: FP8 WMMA NVFP4 MoE (%s, M>%d, ubatch=%d)%s\n", nib_device_info().gcn_arch,
+                    cfg_.fp8_min_m, cfg_.prefill_ubatch,
+                    any_nvfp4 ? "" : " -- this model has no NVFP4 expert layers: no effect");
     }
     std::fflush(stdout);
     // Step 7K: the fa_*_v4 defaults reorder the split-K combine by <= 1 ulp and
@@ -254,8 +290,9 @@ size_t InklingEngine::estimate_state_bytes(const EngineConfig & cfg_in, bool wit
     // Keep in lock-step with alloc_state_and_scratch(), alloc_batch_scratch() and
     // enable_mtp_io(): every alloc_gpu() rounds up to 256 bytes.
     const int n_slots = std::max(1, std::min(cfg_in.n_slots, (int)MAX_CONCURRENT_SLOTS));
+    const size_t ub = (size_t)std::max(1, std::min(cfg_in.prefill_ubatch, FP8_MAX_UBATCH));
     const size_t max_ctx = (size_t)std::max(0, cfg_in.max_ctx);
-    const size_t swa_cap = (size_t)std::max(0, cfg_in.swa_cap);
+    const size_t swa_cap = (size_t)std::max<int32_t>(std::max(0, cfg_in.swa_cap), SWA_WINDOW + (int32_t)ub);
     auto A = [](size_t bytes) { return (bytes + 255) & ~(size_t)255; };
     const size_t qs_bytes_per_head = (cfg_in.kv_type == KV_Q8_0) ? (size_t)HEAD_DIM : (size_t)(HEAD_DIM / 2);
     const size_t d_halves_per_head = (cfg_in.kv_type == KV_Q4_1) ? (size_t)(HEAD_DIM / 16) : (size_t)(HEAD_DIM / 32);
@@ -278,21 +315,21 @@ size_t InklingEngine::estimate_state_bytes(const EngineConfig & cfg_in, bool wit
         }
     }
     // 2. meta / ids
-    t += A(sizeof(StepMeta)) + A(sizeof(int32_t)) + A((size_t)MAX_UBATCH * sizeof(int32_t));
+    t += A(sizeof(StepMeta)) + A(sizeof(int32_t)) + A(ub * sizeof(int32_t));
     // 3. residual buffers (5 + 2*3 + 2 + 1 = 14 x embd_buf)
-    const size_t embd = A((size_t)MAX_UBATCH * N_EMBD * sizeof(float));
+    const size_t embd = A(ub * N_EMBD * sizeof(float));
     t += 14 * embd;
     // 4. layer workspace
-    t += 2 * A(4 * (size_t)MAX_UBATCH * N_EMBD * sizeof(float));        // mixed, messages
+    t += 2 * A(4 * ub * N_EMBD * sizeof(float));                         // mixed, messages
     t += 6 * embd;                                                       // ctrl[3], norm[3]
-    t += A(3 * (size_t)MAX_UBATCH * LOOP_GATE_RANK * sizeof(float));
-    t += A((size_t)MAX_UBATCH * 8600 * sizeof(float));
-    t += 2 * A((size_t)MAX_UBATCH * 1056 * sizeof(float));
-    t += A((size_t)MAX_UBATCH * N_Q * sizeof(float));                    // q_prep
-    t += A((size_t)MAX_UBATCH * N_HEAD * N_REL_EXTENT * sizeof(float));  // rel_table
-    t += A((size_t)MAX_UBATCH * N_Q * sizeof(float));                    // fa_out
+    t += A(3 * ub * LOOP_GATE_RANK * sizeof(float));
+    t += A(ub * 8600 * sizeof(float));
+    t += 2 * A(ub * 1056 * sizeof(float));
+    t += A(ub * N_Q * sizeof(float));                                    // q_prep
+    t += A(ub * N_HEAD * N_REL_EXTENT * sizeof(float));                  // rel_table
+    t += A(ub * N_Q * sizeof(float));                                    // fa_out
     t += 2 * embd;                                                       // wo_out, x_norm
-    t += A((size_t)MAX_UBATCH * TOP_K * sizeof(int32_t)) + A((size_t)MAX_UBATCH * TOP_K * sizeof(float));
+    t += A(ub * TOP_K * sizeof(int32_t)) + A(ub * TOP_K * sizeof(float));
     t += A((size_t)MAX_VERIFY_TOKENS * 512 * sizeof(float));
     t += A(16384 * sizeof(float));
     t += A((size_t)TOP_K * N_FF_EXP * sizeof(float));
@@ -300,13 +337,14 @@ size_t InklingEngine::estimate_state_bytes(const EngineConfig & cfg_in, bool wit
     const size_t fa_tmp_rows = (size_t)std::max(64, 8 * MAX_UBATCH);
     t += A(fa_tmp_rows * N_HEAD * HEAD_DIM * sizeof(float)) + A(fa_tmp_rows * N_HEAD * sizeof(float2));
     t += A(128 * sizeof(int32_t));
-    const int logits_rows = cfg_in.need_all_logits_buf ? MAX_UBATCH : MAX_VERIFY_TOKENS;
-    t += A((size_t)logits_rows * VOCAB_UNPADDED * sizeof(float));
+    const size_t logits_rows = cfg_in.need_all_logits_buf ? ub : (size_t)MAX_VERIFY_TOKENS;
+    t += A(logits_rows * VOCAB_UNPADDED * sizeof(float));
     // 5. grouped MoE prefill scratch
-    const size_t max_slots = (size_t)MAX_UBATCH * TOP_K;
+    const size_t max_slots = ub * TOP_K;
     t += 2 * A((size_t)N_EXPERT * sizeof(int32_t)) + A(((size_t)N_EXPERT + 1) * sizeof(int32_t)); // counts, cursors, offsets
     t += A(max_slots * sizeof(int32_t)) + A(max_slots * sizeof(float));
-    t += A(max_slots * N_EMBD * sizeof(float)) + A(max_slots * N_FF_EXP * sizeof(float)) + A(max_slots * N_EMBD * sizeof(float));
+    t += A(moe_perm_x_floats(ub) * sizeof(float)) + A(moe_perm_act_floats(ub) * sizeof(float))
+       + A(max_slots * N_EMBD * sizeof(float));
     t += 2 * A((max_slots + N_EXPERT) * sizeof(int32_t)) + A(sizeof(int32_t));
     // 6. token history + tau table
     t += A((max_ctx + 2048) * sizeof(int32_t)) + A((max_ctx + 2048) * sizeof(float));
@@ -335,7 +373,7 @@ size_t InklingEngine::estimate_state_bytes(const EngineConfig & cfg_in, bool wit
         t += A((size_t)MAX_VERIFY_TOKENS * 3 * LOOP_GATE_RANK * sizeof(float));
     }
     if (with_mtp_io) {
-        t += A((size_t)MAX_UBATCH * 4 * N_EMBD * sizeof(uint16_t));
+        t += A(ub * 4 * N_EMBD * sizeof(uint16_t));
         t += A((size_t)N_LAYER_SLOTS * MAX_VERIFY_TOKENS * N_SCONV_CHANNELS * sizeof(float));
         t += A((size_t)N_LAYER_SLOTS * N_SCONV_CHANNELS * N_CONV_HIST * sizeof(float));
         t += A((size_t)N_LAYER_SLOTS * sizeof(float *));
@@ -388,13 +426,15 @@ void InklingEngine::alloc_state_and_scratch() {
         }
     }
 
+    const size_t ub = (size_t)cfg_.prefill_ubatch;
+
     // 2. Device metadata & token IDs
     d_meta_      = alloc_gpu<StepMeta>(1,          state_allocs_, total_vram_bytes_, stream_);
     d_argmax_id_ = alloc_gpu<int32_t>(1,           state_allocs_, total_vram_bytes_, stream_);
-    d_token_ids_ = alloc_gpu<int32_t>(MAX_UBATCH,  state_allocs_, total_vram_bytes_, stream_);
+    d_token_ids_ = alloc_gpu<int32_t>(ub,          state_allocs_, total_vram_bytes_, stream_);
 
-    // 3. Dedicated non-aliasing residual stream buffers ([MAX_UBATCH, N_EMBD])
-    const size_t embd_buf = (size_t)MAX_UBATCH * N_EMBD;
+    // 3. Dedicated non-aliasing residual stream buffers ([prefill_ubatch, N_EMBD])
+    const size_t embd_buf = ub * N_EMBD;
     buf_a_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
     buf_b_       = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
     buf_ffn_inp_ = alloc_gpu<float>(embd_buf, state_allocs_, total_vram_bytes_, stream_);
@@ -416,23 +456,24 @@ void InklingEngine::alloc_state_and_scratch() {
         buf_ctrl_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
         buf_norm_[j] = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
     }
-    buf_ctrl_gate_   = alloc_gpu<float>(3 * (size_t)MAX_UBATCH * LOOP_GATE_RANK, state_allocs_, total_vram_bytes_, stream_);
-    buf_proj_qkv_    = alloc_gpu<float>((size_t)MAX_UBATCH * 8600,          state_allocs_, total_vram_bytes_, stream_);
-    buf_proj_k_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_, stream_);
-    buf_proj_v_      = alloc_gpu<float>((size_t)MAX_UBATCH * 1056,          state_allocs_, total_vram_bytes_, stream_);
-    buf_q_prep_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_, stream_);
-    buf_rel_table_   = alloc_gpu<float>((size_t)MAX_UBATCH * N_HEAD * N_REL_EXTENT, state_allocs_, total_vram_bytes_, stream_);
-    buf_fa_out_      = alloc_gpu<float>((size_t)MAX_UBATCH * N_Q,           state_allocs_, total_vram_bytes_, stream_);
+    buf_ctrl_gate_   = alloc_gpu<float>(3 * ub * LOOP_GATE_RANK,            state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_qkv_    = alloc_gpu<float>(ub * 8600,                          state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_k_      = alloc_gpu<float>(ub * 1056,                          state_allocs_, total_vram_bytes_, stream_);
+    buf_proj_v_      = alloc_gpu<float>(ub * 1056,                          state_allocs_, total_vram_bytes_, stream_);
+    buf_q_prep_      = alloc_gpu<float>(ub * N_Q,                           state_allocs_, total_vram_bytes_, stream_);
+    buf_rel_table_   = alloc_gpu<float>(ub * N_HEAD * N_REL_EXTENT,         state_allocs_, total_vram_bytes_, stream_);
+    buf_fa_out_      = alloc_gpu<float>(ub * N_Q,                           state_allocs_, total_vram_bytes_, stream_);
     buf_wo_out_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
     buf_x_norm_      = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
-    buf_topk_ids_    = alloc_gpu<int32_t>((size_t)MAX_UBATCH * TOP_K,       state_allocs_, total_vram_bytes_, stream_);
-    buf_topk_w_      = alloc_gpu<float>((size_t)MAX_UBATCH * TOP_K,         state_allocs_, total_vram_bytes_, stream_);
+    buf_topk_ids_    = alloc_gpu<int32_t>(ub * TOP_K,                       state_allocs_, total_vram_bytes_, stream_);
+    buf_topk_w_      = alloc_gpu<float>(ub * TOP_K,                         state_allocs_, total_vram_bytes_, stream_);
     // 512 floats per verify row (Step 8C runs the A/B/C kernels with grid.y = row,
     // each row owning its own self-resetting barrier sector).
     buf_router_scratch_ = alloc_gpu<float>((size_t)MAX_VERIFY_TOKENS * 512,  state_allocs_, total_vram_bytes_, stream_);
     buf_mix_scratch_    = alloc_gpu<float>(16384,                           state_allocs_, total_vram_bytes_, stream_);
     buf_moe_act_dec_ = alloc_gpu<float>((size_t)TOP_K * N_FF_EXP,           state_allocs_, total_vram_bytes_, stream_);
     buf_moe_out_     = alloc_gpu<float>(embd_buf,                           state_allocs_, total_vram_bytes_, stream_);
+    // kernels_fa_relbias.hip only enables split-K for n_tokens <= MAX_UBATCH, so 8*MAX_UBATCH suffices.
     const size_t fa_tmp_rows = (size_t)std::max(64, 8 * MAX_UBATCH);
     buf_fa_tmp_o_    = alloc_gpu<float>(fa_tmp_rows * N_HEAD * HEAD_DIM,    state_allocs_, total_vram_bytes_, stream_);
     buf_fa_tmp_m_    = alloc_gpu<float2>(fa_tmp_rows * N_HEAD,              state_allocs_, total_vram_bytes_, stream_);
@@ -440,19 +481,19 @@ void InklingEngine::alloc_state_and_scratch() {
     // Step 8A: only ppl / oracle read every row's logits.  gen / bench / vision /
     // selftest read the last row (prefill) or a single decode row plus the 8
     // speculative verify rows, so 8 * VOCAB_UNPADDED (6.1 MiB) instead of
-    // MAX_UBATCH * VOCAB_UNPADDED (391 MiB) frees ~385 MiB of VRAM.
-    const int logits_rows = cfg_.need_all_logits_buf ? MAX_UBATCH : MAX_VERIFY_TOKENS;
-    buf_logits_      = alloc_gpu<float>((size_t)logits_rows * VOCAB_UNPADDED, state_allocs_, total_vram_bytes_, stream_);
+    // prefill_ubatch * VOCAB_UNPADDED frees >= 385 MiB of VRAM.
+    const size_t logits_rows = cfg_.need_all_logits_buf ? ub : (size_t)MAX_VERIFY_TOKENS;
+    buf_logits_      = alloc_gpu<float>(logits_rows * VOCAB_UNPADDED,       state_allocs_, total_vram_bytes_, stream_);
 
-    // 5. Grouped MoE prefill scratchpad
-    const size_t max_slots = (size_t)MAX_UBATCH * TOP_K;
+    // 5. Grouped MoE prefill scratchpad (reclaimed perm_x ~2.3 MiB, perm_act 9.0 MiB)
+    const size_t max_slots = ub * TOP_K;
     moe_scratch_.exp_counts  = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.exp_offsets = alloc_gpu<int32_t>(N_EXPERT + 1,             state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.exp_cursors = alloc_gpu<int32_t>(N_EXPERT,                 state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.perm_tok    = alloc_gpu<int32_t>(max_slots,                state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.perm_w      = alloc_gpu<float>(max_slots,                  state_allocs_, total_vram_bytes_, stream_);
-    moe_scratch_.perm_x      = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_, stream_);
-    moe_scratch_.perm_act    = alloc_gpu<float>(max_slots * N_FF_EXP,       state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_x      = alloc_gpu<float>(moe_perm_x_floats(ub),      state_allocs_, total_vram_bytes_, stream_);
+    moe_scratch_.perm_act    = alloc_gpu<float>(moe_perm_act_floats(ub),    state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.perm_down   = alloc_gpu<float>(max_slots * N_EMBD,         state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.tile_exp    = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_, stream_);
     moe_scratch_.tile_m0     = alloc_gpu<int32_t>(max_slots + N_EXPERT,     state_allocs_, total_vram_bytes_, stream_);
@@ -1685,16 +1726,36 @@ void InklingEngine::record_layer(
                     (n_tokens == 1) ? buf_fa_done_ : nullptr);
             } else {
                 const int prefill_pages = std::max(cfg_.sparse_pages, SPARSE_PREFILL_MIN_PAGES);
-                launch_sparse_global_select_pages_prefill(
-                    q_prep_, cur_sm, sparse_scratch_,
-                    n_tokens, pos_start, prefill_pages, stream_);
-                launch_fa_sparse_global_prefill(
-                    q_prep_, cur_kv,
-                    sinks, q_stride, rel_table_,
-                    /*r_prep=*/nullptr, /*attn_rel_bias=*/nullptr,
-                    qgate, q_stride, fa_out_,
-                    sparse_scratch_.selected_pages, sparse_scratch_.n_selected,
-                    n_tokens, pos_start, kv_end, stream_);
+                // SparseGlobalScratch holds SPARSE_MAX_QB = MAX_UBATCH / 64 query blocks;
+                // slice into <= MAX_UBATCH sub-chunks when prefill_ubatch > MAX_UBATCH.
+                for (int off = 0; off < n_tokens; off += MAX_UBATCH) {
+                    const int sn = std::min(MAX_UBATCH, n_tokens - off);
+                    const int sub_pos = pos_start + off;
+                    const int sub_kv_end = sub_pos + sn;
+                    const float * qv = q_prep_ + (size_t)off * N_Q;
+                    const float * sinkv = (sinks != nullptr) ? (sinks + (size_t)off * q_stride) : nullptr;
+                    const float * relv = rel_table_ + (size_t)off * N_HEAD * N_REL_EXTENT;
+                    const float * gatev = (qgate != nullptr) ? (qgate + (size_t)off * q_stride) : nullptr;
+                    float * outv = fa_out_ + (size_t)off * N_Q;
+                    if (sub_kv_end <= SPARSE_DENSE_PREFILL_LIMIT) {
+                        launch_fa_relbias(
+                            qv, cur_kv,
+                            sinkv, q_stride, relv, gatev, q_stride,
+                            outv, buf_fa_tmp_o_, buf_fa_tmp_m_,
+                            sn, sub_pos, d_meta, stream_, nullptr);
+                    } else {
+                        launch_sparse_global_select_pages_prefill(
+                            qv, cur_sm, sparse_scratch_,
+                            sn, sub_pos, prefill_pages, stream_);
+                        launch_fa_sparse_global_prefill(
+                            qv, cur_kv,
+                            sinkv, q_stride, relv,
+                            /*r_prep=*/nullptr, /*attn_rel_bias=*/nullptr,
+                            gatev, q_stride, outv,
+                            sparse_scratch_.selected_pages, sparse_scratch_.n_selected,
+                            sn, sub_pos, sub_kv_end, stream_);
+                    }
+                }
             }
         }
     } else {
@@ -2271,7 +2332,12 @@ void InklingEngine::record_layer(
             }
         }
     } else {
-        if (L.is_nvfp4) {
+        if (L.is_nvfp4 && fp8_moe_prefill_ && n_tokens > cfg_.fp8_min_m) {
+            launch_moe_nvfp4_prefill_fp8_wmma(
+                L.gate_up_nvfp4, L.down_nvfp4, x_norm_,
+                topk_ids_, topk_w_, moe_scratch_, cur_out, n_tokens, stream_,
+                L.ffn_post_conv, ffn_hist, buf_ffn_inp_, cfg_.prefill_ubatch);
+        } else if (L.is_nvfp4) {
             launch_moe_nvfp4_prefill_wmma(
                 L.gate_up_nvfp4, L.down_nvfp4, x_norm_,
                 topk_ids_, topk_w_, moe_scratch_, cur_out, n_tokens, stream_,
@@ -2283,6 +2349,35 @@ void InklingEngine::record_layer(
                 L.ffn_post_conv, ffn_hist, buf_ffn_inp_);
         }
     }
+}
+
+bool InklingEngine::set_fp8_prefill(int32_t mode) {
+    fp8_moe_prefill_ = false;
+    cfg_.fp8_prefill = FP8_PREFILL_OFF;
+    if (mode == FP8_PREFILL_OFF) {
+        return true;
+    }
+    if (mode != FP8_PREFILL_MOE) {
+        std::fprintf(stderr, "[nib] WARNING: unknown FP8 prefill mode %d; FP8 prefill disabled\n", (int)mode);
+        return false;
+    }
+    if (!rdna4_fp8_prefill_supported()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            if (rdna4_fp8_prefill_built()) {
+                std::fprintf(stderr, "[nib] WARNING: FP8 prefill needs an RDNA4 (gfx1200/gfx1201) GPU, this one is %s; "
+                                     "FP8 prefill disabled\n", nib_device_info().gcn_arch);
+            } else {
+                std::fprintf(stderr, "[nib] WARNING: this binary was built without a gfx1200/gfx1201 target; "
+                                     "FP8 prefill disabled\n");
+            }
+        }
+        return false;
+    }
+    cfg_.fp8_prefill = mode;
+    fp8_moe_prefill_ = true;
+    return true;
 }
 
 void InklingEngine::record_forward_pass(
@@ -2499,7 +2594,7 @@ static inline StepMeta make_step_meta(int32_t token_id, int32_t pos, int32_t swa
 // ============================================================================
 bool InklingEngine::enable_mtp_io() {
     if (mtp_io_) return true;
-    d_taps_        = alloc_gpu<uint16_t>((size_t)MAX_UBATCH * 4 * N_EMBD,           state_allocs_, total_vram_bytes_, stream_);
+    d_taps_        = alloc_gpu<uint16_t>((size_t)cfg_.prefill_ubatch * 4 * N_EMBD,  state_allocs_, total_vram_bytes_, stream_);
     d_verify_raw_  = alloc_gpu<float>((size_t)N_LAYER_SLOTS * MAX_VERIFY_TOKENS * N_SCONV_CHANNELS,
                                       state_allocs_, total_vram_bytes_, stream_);
     d_hist_bak_    = alloc_gpu<float>((size_t)N_LAYER_SLOTS * N_SCONV_CHANNELS * N_CONV_HIST,
@@ -2522,7 +2617,7 @@ bool InklingEngine::enable_mtp_io() {
     HIP_CHECK(hipStreamSynchronize(stream_));
     mtp_io_ = true;
     std::printf("[InklingEngine] MTP I/O enabled: taps=%.1f MiB verify_raw=%.1f MiB hist_bak=%.1f MiB\n",
-                (double)((size_t)MAX_UBATCH * 4 * N_EMBD * 2) / 1048576.0,
+                (double)((size_t)cfg_.prefill_ubatch * 4 * N_EMBD * 2) / 1048576.0,
                 (double)((size_t)N_LAYER_SLOTS * MAX_VERIFY_TOKENS * N_SCONV_CHANNELS * 4) / 1048576.0,
                 (double)((size_t)N_LAYER_SLOTS * N_SCONV_CHANNELS * N_CONV_HIST * 4) / 1048576.0);
     std::fflush(stdout);
@@ -2870,7 +2965,7 @@ bool InklingEngine::prefill(
     active_slot_ = 0;
     int offset = 0;
     while (offset < total) {
-        const int chunk = std::min(MAX_UBATCH, total - offset);
+        const int chunk = std::min(cfg_.prefill_ubatch, total - offset);
         const bool is_last_chunk = (offset + chunk == total);
         if (chunk == 1) {
             // Single-token chunk: use fast decode path (eager while MTP taps are on,
@@ -2939,7 +3034,7 @@ bool InklingEngine::prefill_embeds(
     active_slot_ = 0;
     int offset = 0;
     while (offset < n_tokens) {
-        const int chunk = std::min(MAX_UBATCH, n_tokens - offset);
+        const int chunk = std::min(cfg_.prefill_ubatch, n_tokens - offset);
         const bool is_last_chunk = (offset + chunk == n_tokens);
         const float * chunk_ptr = d_embeds + (size_t)offset * N_EMBD;
         if (chunk == 1) {
@@ -2979,17 +3074,46 @@ bool InklingEngine::prefill_embeds(
 
 double InklingEngine::benchmark_prefill_chunk(const std::vector<int32_t> & tokens) {
     active_slot_ = 0;
-    const int chunk = (int)tokens.size();
-    HIP_CHECK(hipMemcpyAsync(d_token_ids_, tokens.data(), (size_t)chunk * sizeof(int32_t), hipMemcpyHostToDevice, stream_));
-    HIP_CHECK(hipStreamSynchronize(stream_));
+    const int total = (int)tokens.size();
+    if (total <= 0) return 0.0;
+    if (total <= cfg_.prefill_ubatch) {
+        HIP_CHECK(hipMemcpyAsync(d_token_ids_, tokens.data(), (size_t)total * sizeof(int32_t), hipMemcpyHostToDevice, stream_));
+        HIP_CHECK(hipStreamSynchronize(stream_));
 
+        auto t0 = std::chrono::steady_clock::now();
+        record_forward_pass(total, cur_pos_, nullptr, /*compute_all_logits=*/false);
+        HIP_CHECK(hipStreamSynchronize(stream_));
+        auto t1 = std::chrono::steady_clock::now();
+
+        cur_pos_ += total;
+        slot_pos_[0] = cur_pos_;
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    }
+
+    // Multi-ubatch prefill benchmark (e.g. -p 1024/2048/4096): drain prior work,
+    // then run all chunks back-to-back on stream_ up to the final sync.
+    HIP_CHECK(hipStreamSynchronize(stream_));
     auto t0 = std::chrono::steady_clock::now();
-    record_forward_pass(chunk, cur_pos_, nullptr, /*compute_all_logits=*/false);
+    int offset = 0;
+    while (offset < total) {
+        const int chunk = std::min(cfg_.prefill_ubatch, total - offset);
+        const bool is_last = (offset + chunk == total);
+        if (chunk == 1) {
+            StepMeta meta = make_step_meta(tokens[offset], cur_pos_, cfg_.swa_cap);
+            HIP_CHECK(hipMemcpyAsync(d_meta_, &meta, sizeof(StepMeta), hipMemcpyHostToDevice, stream_));
+            record_forward_pass(1, cur_pos_, d_meta_, /*compute_all_logits=*/false,
+                                /*d_raw_embeds=*/nullptr, /*row_slot=*/0, /*skip_head=*/!is_last);
+        } else {
+            HIP_CHECK(hipMemcpyAsync(d_token_ids_, tokens.data() + offset, (size_t)chunk * sizeof(int32_t), hipMemcpyHostToDevice, stream_));
+            record_forward_pass(chunk, cur_pos_, nullptr, /*compute_all_logits=*/false,
+                                /*d_raw_embeds=*/nullptr, /*row_slot=*/0, /*skip_head=*/!is_last);
+        }
+        cur_pos_ += chunk;
+        slot_pos_[0] = cur_pos_;
+        offset   += chunk;
+    }
     HIP_CHECK(hipStreamSynchronize(stream_));
     auto t1 = std::chrono::steady_clock::now();
-
-    cur_pos_ += chunk;
-    slot_pos_[0] = cur_pos_;
     return std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
@@ -3091,7 +3215,7 @@ double InklingEngine::benchmark_decode_steps(int32_t start_token, int n_steps, s
 bool InklingEngine::prefill_slot_chunk(
         int slot, const int32_t * tokens, int n_tokens,
         bool want_logits, std::vector<float> * out_logits) {
-    if (slot < 0 || slot >= cfg_.n_slots || tokens == nullptr || n_tokens <= 0 || n_tokens > MAX_UBATCH) {
+    if (slot < 0 || slot >= cfg_.n_slots || tokens == nullptr || n_tokens <= 0 || n_tokens > cfg_.prefill_ubatch) {
         return false;
     }
     const int32_t limit = slot_ctx_limit(slot);
@@ -3140,7 +3264,7 @@ bool InklingEngine::prefill_slot_chunk(
 bool InklingEngine::prefill_embeds_slot_chunk(
         int slot, const float * d_embeds, int n_tokens,
         bool want_logits, std::vector<float> * out_logits) {
-    if (slot < 0 || slot >= cfg_.n_slots || d_embeds == nullptr || n_tokens <= 0 || n_tokens > MAX_UBATCH) {
+    if (slot < 0 || slot >= cfg_.n_slots || d_embeds == nullptr || n_tokens <= 0 || n_tokens > cfg_.prefill_ubatch) {
         return false;
     }
     const int32_t limit = slot_ctx_limit(slot);
