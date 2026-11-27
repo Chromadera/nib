@@ -1680,7 +1680,8 @@ void launch_moe_nvfp4_ship_fused(
         std::fprintf(stderr, "[kernels_step7h] nvfp4 MoE shape mismatch\n");
         std::abort();
     }
-    if (g_wgp_7h < 48) {
+    if (g_wgp_7h < 48 ||
+        !nib_grid_coresident((const void *)moe_nvfp4_ship_fused288_kernel, 256, 288, 6)) {
         launch_moe_nvfp4_ship_fused192(gate_up, down, x_norm, topk_ids, topk_w,
                                        tmp_act, out, stream, post_conv_w, post_sconv_h,
                                        post_res_add, scratch, raw_out);
@@ -1713,7 +1714,8 @@ void launch_moe_nvfp4_ship_fused192(
     float * scratch, float * raw_out) {
     // 192-block 256-thread MoE kernel (121 VGPRs, 20.6 KB LDS) fits <=5 blocks/WGP:
     // requires >=40 WGPs (7900 GRE/XT/XTX/W7900); W7800 (35 WGPs) falls back cleanly.
-    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40) {
+    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40 ||
+        !nib_grid_coresident((const void *)moe_nvfp4_ship_fused192_kernel, 256, 192, 5)) {
         extern void launch_moe_nvfp4_decode(const SoaNVFP4Experts &, const SoaNVFP4Experts &,
                                             const float *, const int32_t *, const float *,
                                             float *, float *, hipStream_t,
@@ -1743,7 +1745,8 @@ void launch_moe_q8_ship_fused(
         std::fprintf(stderr, "[kernels_step7h] q8 MoE shape mismatch\n");
         std::abort();
     }
-    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40) {
+    if (scratch == nullptr || post_conv_w == nullptr || post_sconv_h == nullptr || g_wgp_7h < 40 ||
+        !nib_grid_coresident((const void *)moe_q8_ship_fused_kernel, 256, 192, 5)) {
         launch_moe_q8_decode(gate_up, down, x_norm, topk_ids, topk_w,
                              tmp_act, out, stream, post_conv_w, post_sconv_h, post_res_add);
         return;
@@ -1869,8 +1872,9 @@ void launch_mix_rms_norm_2304_fast(
 }
 
 void step7h_prime_occupancy() {
-    // Query device WGP count once outside capture so 288/192-block grid-barrier
-    // MoE kernels automatically downgrade on smaller gfx1100 GPUs (7900 XT/GRE, W7800).
+    // Query device WGP count and prime co-residency cache once outside capture so
+    // 288/192-block grid-barrier MoE kernels automatically downgrade on smaller GPUs
+    // (7900 XT/GRE, W7800, 7800 XT, 9070 XT, 9060 XT) or if occupancy drops.
     int dev = 0, wgp = 48;
     if (hipGetDevice(&dev) == hipSuccess &&
         hipDeviceGetAttribute(&wgp, hipDeviceAttributeMultiprocessorCount, dev) == hipSuccess &&
@@ -1879,6 +1883,9 @@ void step7h_prime_occupancy() {
     } else {
         g_wgp_7h = 48;
     }
+    (void)nib_grid_coresident((const void *)moe_nvfp4_ship_fused288_kernel, 256, 288, 6);
+    (void)nib_grid_coresident((const void *)moe_nvfp4_ship_fused192_kernel, 256, 192, 5);
+    (void)nib_grid_coresident((const void *)moe_q8_ship_fused_kernel, 256, 192, 5);
 }
 
 } // namespace inkling

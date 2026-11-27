@@ -2476,6 +2476,7 @@ int g_occ_wo_c = -1;
 int g_occ_wo_c_h2 = -1;
 int g_occ_mixqkv = -1;
 int g_occ_aqkv = -1;
+int g_occ_a_v3 = -1;
 int g_wgp_7i = 48;
 
 // RDNA3 288-thread (9-wave) blocks can achieve at most 4 blocks/WGP in hardware
@@ -2663,8 +2664,11 @@ void launch_a_v3_decode(
         out1 + (size_t)(n_q1 >= 3 ? 1 : 0) * N_EMBD,
         out1 + (size_t)(n_q1 >= 3 ? 2 : 0) * N_EMBD
     };
-    if (n_states0 <= 0 || n_states0 > 5 || n_states1 > 5 || n_states0 > 5 || n_q0 > 4 ||
-        n_q1 > 4 || mix_scratch == nullptr || query0 == nullptr || query1 == nullptr) {
+    // a_v3_kernel<<<96, 288>>> uses an in-kernel grid barrier: all 96 blocks must be
+    // co-resident (on 16-WGP GPUs such as RX 9060 XT / RX 7600, 4 x 16 = 64 < 96 deadlocks).
+    if (n_states0 <= 0 || n_states0 > 5 || n_states1 > 5 || n_q0 > 4 ||
+        n_q1 > 4 || mix_scratch == nullptr || query0 == nullptr || query1 == nullptr ||
+        !s7i_coresident(g_occ_a_v3, 4, 96)) {
         launch_mix_dual_ctrl_qkv3_norm_decode(
             query0, n_q0, states0, n_states0, out0,
             query1, n_q1, states1, n_states1, out1,
@@ -2793,14 +2797,16 @@ void step7i_prime_occupancy() {
     g_occ_wo_c_h2 = 1;
     g_occ_mixqkv = 1;
     g_occ_aqkv   = 1;
+    g_occ_a_v3   = 1;
     int n = 0;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)wo_b_fused_kernel, 288, 0) == hipSuccess) g_occ_wo_b = n;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)wo_c_fused_kernel<false>, 288, 0) == hipSuccess) g_occ_wo_c = n;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)wo_c_fused_kernel<true>, 288, 0) == hipSuccess) g_occ_wo_c_h2 = n;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)mix_rms_qkv_fused_kernel<192>, 192, 0) == hipSuccess) g_occ_mixqkv = n;
     if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)a_qkv_fused_kernel, 288, 0) == hipSuccess) g_occ_aqkv = n;
-    std::fprintf(stderr, "[step7i] occupancy blocks/WGP (wgp=%d): wo_b=%d wo_c=%d wo_c_h2=%d mix_rms_qkv=%d a_qkv=%d\n",
-                 g_wgp_7i, g_occ_wo_b, g_occ_wo_c, g_occ_wo_c_h2, g_occ_mixqkv, g_occ_aqkv);
+    if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&n, (const void *)a_v3_kernel, 288, 0) == hipSuccess) g_occ_a_v3 = n;
+    std::fprintf(stderr, "[step7i] occupancy blocks/WGP (wgp=%d): wo_b=%d wo_c=%d wo_c_h2=%d mix_rms_qkv=%d a_qkv=%d a_v3=%d\n",
+                 g_wgp_7i, g_occ_wo_b, g_occ_wo_c, g_occ_wo_c_h2, g_occ_mixqkv, g_occ_aqkv, g_occ_a_v3);
 }
 
 } // namespace inkling
