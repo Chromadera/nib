@@ -678,9 +678,9 @@ static bool resolve_safe_save_dir(const std::string & requested,
 // ============================================================================
 struct SampleParams {
     float temperature = 0.0f;
-    float top_p       = 0.95f;
+    float top_p       = 1.0f;
     float min_p       = 0.0f;
-    int   top_k       = 40;
+    int   top_k       = 0;
     uint64_t seed     = 0;
     bool  has_seed    = false;
 };
@@ -972,7 +972,7 @@ static void image_content_hash(const std::vector<uint8_t> & b, uint64_t & h1, ui
 }
 
 static std::string format_effort_str(const JsonVal * v) {
-    double num = 0.7; // default: medium
+    double num = 0.9; // default: high (matches official Inkling 2 Mini template)
     if (v != nullptr) {
         if (v->is_str()) {
             std::string s = to_lower(v->str);
@@ -1565,6 +1565,9 @@ public:
                 << ",\"draft_ctx\":" << (drafter_ ? drafter_->ctx() : 0)
                 << ",\"spec_threshold\":" << cfg_.spec_threshold
                 << ",\"default_temperature\":" << cfg_.default_temperature
+                << ",\"default_top_p\":" << cfg_.default_top_p
+                << ",\"default_top_k\":" << cfg_.default_top_k
+                << ",\"default_min_p\":" << cfg_.default_min_p
                 << ",\"vision\":" << (vision_ ? "true" : "false")
                 << ",\"vram_gib\":" << vram
                 << ",\"llm_vram_gib\":" << llm_vram
@@ -4175,9 +4178,10 @@ int run_http_server(
                 NIB_VERSION, cfg.host.c_str(), cfg.port);
     std::printf("[nib] Web UI: http://%s:%d/  |  OpenAI API: http://%s:%d/v1/chat/completions\n",
                 cfg.host.c_str(), cfg.port, cfg.host.c_str(), cfg.port);
-    std::printf("[nib] Config: ctx=%d slots=%d(%d/slot, req_max=%d, %s) kv=%s sparse_pages=%d temp=%.2f mtp=%s vision=%s vram=%.2f GiB\n",
+    std::printf("[nib] Config: ctx=%d slots=%d(%d/slot, req_max=%d, %s) kv=%s sparse_pages=%d temp=%.2f top_p=%.2f top_k=%d min_p=%.2f mtp=%s vision=%s vram=%.2f GiB\n",
                 eng.max_ctx(), eng.num_slots(), eng.slot_ctx(), req_max, ctx_mode,
                 cfg.kv_type_name.c_str(), cfg.sparse_pages, cfg.default_temperature,
+                cfg.default_top_p, cfg.default_top_k, cfg.default_min_p,
                 drafter ? "ON" : "OFF", vision ? "ON" : "OFF", vram);
     size_t dev_free_b = 0, dev_total_b = 0;
     if (hipMemGetInfo(&dev_free_b, &dev_total_b) == hipSuccess && dev_total_b > 0) {

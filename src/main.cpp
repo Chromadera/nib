@@ -2,6 +2,7 @@
 #include "dspark_mtp.h"
 #include "engine.hpp"
 #include "server.hpp"
+#include "sparse_global.h"
 #include "vision_encoder.hpp"
 
 #include <algorithm>
@@ -99,7 +100,7 @@ static void print_usage(const char * argv0) {
         "           [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--no-verify-batch]\n"
         "  vision   -m <gguf> --mmproj <mmproj.gguf> --image <img.png> [--prompt <text>] [-c 262144] [-d 0] [-n 256] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--bench-vision 5] [--dump-embeds <path>] [--no-graph]\n"
         "  serve    -m <gguf> [--host 127.0.0.1] [--port 4444] [--model-name inkling-2-mini] [--slots 4] [-c 262848] [--strict-slot-ctx] [--max-slot-ctx N] [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4]\n"
-        "           [--default-temp 0.6] [--default-top-p 0.95] [--default-top-k 40] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
+        "           [--default-temp 1.0] [--default-top-p 1.0] [--default-top-k 0] [--default-min-p 0.0] [--mtp models/mtp.safetensors] [--spec-threshold 0.8] [--draft-ctx 8192] [--mmproj <mmproj.gguf> | --no-vision] [--no-graph]\n"
         "  selftest -m <gguf> [--kv-type q8_0|q4_1|q4_0] [--sparse-pages 0|112|192|224] [--sparse-meta q8|q4] [--mtp models/mtp.safetensors] [--bench-mtp] [--cpu-embd]\n"
         "  --version  Print Nib version and target GPU architecture\n"
         "VRAM options (bench / gen / vision / serve):\n"
@@ -919,10 +920,10 @@ int main(int argc, char ** argv) {
     bool no_vision = false;
     bool serve_strict_slot_ctx = false;
     int32_t serve_max_slot_ctx = 0;
-    float serve_default_temp = 0.6f;
-    float serve_default_top_p = 0.95f;
+    float serve_default_temp = 1.0f;
+    float serve_default_top_p = 1.0f;
     float serve_default_min_p = 0.0f;
-    int serve_default_top_k = 40;
+    int serve_default_top_k = 0;
     float spec_threshold = 0.8f;
     int draft_ctx = DSparkDrafter::DEFAULT_DRAFT_CTX;
     bool bench_mtp = false;
@@ -947,7 +948,21 @@ int main(int argc, char ** argv) {
         else if (a == "--image" && i + 1 < argc) image_path = argv[++i];
         else if (a == "--prompt" && i + 1 < argc) prompt_text = argv[++i];
         else if (a == "--prompt-file" && i + 1 < argc) prompt_file = argv[++i];
-        else if (a == "--sparse-pages" && i + 1 < argc) cfg.sparse_pages = std::atoi(argv[++i]);
+        else if (a == "--sparse-pages" && i + 1 < argc) {
+            const char * raw = argv[++i];
+            char * endp = nullptr;
+            const long v = std::strtol(raw, &endp, 10);
+            constexpr int kMaxSparsePages = SPARSE_MAX_SELECTED - 2; // 254 (matches sparse_clamp_pages)
+            if (endp == raw || *endp != '\0' || v < 0 ||
+                (v > 0 && (v < SPARSE_MIN_PAGES || v > kMaxSparsePages))) {
+                std::fprintf(stderr,
+                    "Invalid --sparse-pages '%s': must be 0 (dense) or between %d and %d "
+                    "(SPARSE_MAX_SELECTED=%d reserves 2 sentinel slots)\n",
+                    raw, SPARSE_MIN_PAGES, kMaxSparsePages, SPARSE_MAX_SELECTED);
+                return 1;
+            }
+            cfg.sparse_pages = (int32_t)v;
+        }
         else if (a == "--dump-embeds" && i + 1 < argc) dump_embeds_path = argv[++i];
         else if (a == "--bench-vision" && i + 1 < argc) bench_vision = std::atoi(argv[++i]);
         else if (a == "-t" && i + 1 < argc) tokens_path = argv[++i];

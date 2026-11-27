@@ -21,10 +21,10 @@ struct ServerConfig {
     int         n_slots = 4;
     bool        strict_slot_ctx = false;
     int32_t     max_slot_ctx = 0;
-    float       default_temperature = 0.6f;
-    float       default_top_p = 0.95f;
+    float       default_temperature = 1.0f;
+    float       default_top_p = 1.0f;
     float       default_min_p = 0.0f;
-    int         default_top_k = 40;
+    int         default_top_k = 0;
     std::string output_dir = "outputs";
 };
 
