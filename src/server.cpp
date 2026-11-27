@@ -950,7 +950,6 @@ static int32_t sample_speculative_row(
 // ============================================================================
 struct PromptSegment {
     bool is_image = false;
-    std::string text;
     std::vector<uint8_t> image_bytes;
     std::vector<int32_t> toks;   // text: pre-tokenized ids (HTTP thread)
     uint64_t hash1 = 0;          // image: 128-bit content hash of image_bytes
@@ -998,6 +997,7 @@ static std::string format_effort_str(const JsonVal * v) {
 
 static bool build_inkling_chat_segments(
         const JsonVal & req_json,
+        const BpeTokenizer & bpe,
         std::vector<PromptSegment> & segs,
         bool & has_images,
         bool & primed_text,
@@ -1024,19 +1024,28 @@ static bool build_inkling_chat_segments(
         }
     }
     const std::string effort_str = enable_thinking_off ? "0" : format_effort_str(eff_val);
-    const std::string effort_block =
-        "<|message_system|><|content_text|>Thinking effort level: " + effort_str + "<|end_message|>";
 
-    auto push_text = [&](const std::string & t) {
-        if (t.empty()) return;
-        if (!segs.empty() && !segs.back().is_image) {
-            segs.back().text += t;
-        } else {
+    auto ensure_text_seg = [&]() -> std::vector<int32_t> & {
+        if (segs.empty() || segs.back().is_image) {
             PromptSegment ps;
             ps.is_image = false;
-            ps.text = t;
             segs.push_back(std::move(ps));
         }
+        return segs.back().toks;
+    };
+    auto push_special = [&](const std::string & tok) {
+        if (tok.empty()) return;
+        bpe.append_special(tok, ensure_text_seg());
+    };
+    auto push_plain = [&](const std::string & t) {
+        if (t.empty()) return;
+        bpe.append_plain(t, ensure_text_seg());
+    };
+    auto emit_effort_block = [&]() {
+        push_special("<|message_system|>");
+        push_special("<|content_text|>");
+        push_plain("Thinking effort level: " + effort_str);
+        push_special("<|end_message|>");
     };
 
     // Native Inkling 2 Mini tool declaration block (exact match to GGUF tokenizer.chat_template)
@@ -1068,7 +1077,11 @@ static bool build_inkling_chat_segments(
             specs.arr.push_back(std::move(spec));
         }
         if (!specs.arr.empty()) {
-            push_text("<|message_system|>tool_declare<|content_xml|>" + json_serialize(specs) + "<|end_message|>");
+            push_special("<|message_system|>");
+            push_plain("tool_declare");
+            push_special("<|content_xml|>");
+            push_plain(json_serialize(specs));
+            push_special("<|end_message|>");
         }
     }
 
@@ -1110,43 +1123,60 @@ static bool build_inkling_chat_segments(
             return false;
         }
         if (!effort_emitted && role != "system") {
-            push_text(effort_block);
+            emit_effort_block();
             effort_emitted = true;
         }
         std::string name = m.get_str("name");
+        std::string role_name;
         if (role == "tool") {
             if (name.empty()) {
                 std::string tcid = m.get_str("tool_call_id");
                 auto it = tc_id_to_name.find(tcid);
                 if (it != tc_id_to_name.end()) name = it->second;
             }
-            if (!name.empty()) rtok += name;
+            role_name = name;
         } else if (role == "assistant" && !name.empty()) {
-            rtok += name;
+            role_name = name;
         }
+        auto emit_role_header = [&]() {
+            push_special(rtok);
+            if (!role_name.empty()) push_plain(role_name);
+        };
 
         const std::string rc = (role == "assistant") ? m.get_str("reasoning_content") : "";
         const JsonVal * tcs = (role == "assistant") ? m.get("tool_calls") : nullptr;
         const bool has_tcs = (tcs && tcs->is_arr() && !tcs->arr.empty());
         if (role == "assistant" && !rc.empty()) {
-            push_text(rtok + "<|content_thinking|>" + rc + "<|end_message|>");
+            emit_role_header();
+            push_special("<|content_thinking|>");
+            push_plain(rc);
+            push_special("<|end_message|>");
         }
 
         const JsonVal * content = m.get("content");
         if (content && content->is_str()) {
             if (!content->str.empty() || !(role == "assistant" && (has_tcs || !rc.empty()))) {
-                push_text(rtok + "<|content_text|>" + content->str + "<|end_message|>");
+                emit_role_header();
+                push_special("<|content_text|>");
+                push_plain(content->str);
+                push_special("<|end_message|>");
             }
         } else if (content && content->is_arr()) {
             for (const JsonVal & part : content->arr) {
                 if (part.is_str()) {
-                    push_text(rtok + "<|content_text|>" + part.str + "<|end_message|>");
+                    emit_role_header();
+                    push_special("<|content_text|>");
+                    push_plain(part.str);
+                    push_special("<|end_message|>");
                     continue;
                 }
                 if (!part.is_obj()) continue;
                 std::string ptype = part.get_str("type", "text");
                 if (ptype == "text" || ptype == "input_text") {
-                    push_text(rtok + "<|content_text|>" + part.get_str("text") + "<|end_message|>");
+                    emit_role_header();
+                    push_special("<|content_text|>");
+                    push_plain(part.get_str("text"));
+                    push_special("<|end_message|>");
                 } else if (ptype == "image_url" || ptype == "image" || ptype == "input_image") {
                     std::string url;
                     const JsonVal * iu = part.get("image_url");
@@ -1163,13 +1193,14 @@ static bool build_inkling_chat_segments(
                         err = "Invalid base64 image payload";
                         return false;
                     }
-                    push_text(rtok + "<|content_image|>");
+                    emit_role_header();
+                    push_special("<|content_image|>");
                     PromptSegment img;
                     img.is_image = true;
                     image_content_hash(bytes, img.hash1, img.hash2);
                     img.image_bytes = std::move(bytes);
                     segs.push_back(std::move(img));
-                    push_text("<|end_message|>");
+                    push_special("<|end_message|>");
                     has_images = true;
                 }
             }
@@ -1196,24 +1227,27 @@ static bool build_inkling_chat_segments(
                         }
                     }
                 }
-                push_text("<|message_model|>" + fname + "<|content_invoke_tool_json|>"
-                          "{\"name\":" + json_str(fname) + ",\"args\":" + json_serialize(args_obj) +
-                          "}<|end_message|>");
+                push_special("<|message_model|>");
+                push_plain(fname);
+                push_special("<|content_invoke_tool_json|>");
+                push_plain("{\"name\":" + json_str(fname) + ",\"args\":" + json_serialize(args_obj) + "}");
+                push_special("<|end_message|>");
             }
         }
 
         if (role == "assistant") {
-            push_text("<|content_model_end_sampling|>");
+            push_special("<|content_model_end_sampling|>");
         }
     }
     if (!effort_emitted) {
-        push_text(effort_block);
+        emit_effort_block();
     }
     // When reasoning_effort is "none" / 0 and no tools are declared, prime direct text output
     const JsonVal * tools = req_json.get("tools");
     const bool has_tools = (tools && tools->is_arr() && !tools->arr.empty());
     if (effort_str == "0" && !has_tools) {
-        push_text("<|message_model|><|content_text|>");
+        push_special("<|message_model|>");
+        push_special("<|content_text|>");
         primed_text = true;
     }
     return true;
@@ -3498,7 +3532,7 @@ private:
         bool primed_text = false;
         std::string err;
         if (is_chat) {
-            if (!build_inkling_chat_segments(j, segs, has_images, primed_text, err)) {
+            if (!build_inkling_chat_segments(j, bpe_, segs, has_images, primed_text, err)) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
                                    "{\"error\":{\"message\":" + json_str(err) + "}}");
                 return;
@@ -3515,9 +3549,10 @@ private:
                                    "{\"error\":{\"message\":\"Missing 'prompt' string\"}}");
                 return;
             }
+            const bool parse_special = j.get_bool("parse_special", true);
             PromptSegment ps;
             ps.is_image = false;
-            ps.text = std::move(prompt);
+            ps.toks = bpe_.encode(prompt, parse_special);
             segs.push_back(std::move(ps));
         }
 
@@ -3535,9 +3570,12 @@ private:
         job->t_enqueued  = std::chrono::steady_clock::now();
 
         if (!has_images) {
-            std::string full_prompt;
-            for (const auto & sg : segs) full_prompt += sg.text;
-            job->prompt_toks = bpe_.encode(full_prompt);
+            size_t total_toks = 0;
+            for (const auto & sg : segs) total_toks += sg.toks.size();
+            job->prompt_toks.reserve(total_toks);
+            for (const auto & sg : segs) {
+                job->prompt_toks.insert(job->prompt_toks.end(), sg.toks.begin(), sg.toks.end());
+            }
             if (job->prompt_toks.empty()) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
                                    "{\"error\":{\"message\":\"Prompt encoded to 0 tokens\"}}");
@@ -3551,14 +3589,13 @@ private:
             job->est_prompt_toks = (int)job->prompt_toks.size();
             job->live_prompt_toks.store((int)job->prompt_toks.size(), std::memory_order_relaxed);
         } else {
-            // Pre-tokenize every text segment on the HTTP thread (exact ids; shared by the
-            // scheduler's prefix matcher and the multimodal prefill loop).
+            // Text segments are already pre-tokenized on the HTTP thread (exact ids; shared by
+            // the scheduler's prefix matcher and the multimodal prefill loop).
             int est = 0;
-            for (auto & sg : segs) {
+            for (const auto & sg : segs) {
                 if (sg.is_image) {
                     est += 1024; // conservative per-image token estimate for initial span sizing
-                } else if (!sg.text.empty()) {
-                    sg.toks = bpe_.encode(sg.text);
+                } else {
                     est += (int)sg.toks.size();
                 }
             }
