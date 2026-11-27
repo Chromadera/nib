@@ -2501,19 +2501,20 @@ void launch_wo_b_fused(
         const float * ffn_norm_w,
         const __half * router_w, const float * exp_probs_b,
         float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-        float * mix_scratch, hipStream_t stream) {
+        float * mix_scratch, hipStream_t stream, float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     if (W.K != N_Q || conv_w == nullptr || sconv_hist == nullptr || res_query == nullptr) {
         launch_soa_q8_gemv_wo_v2(W, x, conv_w, sconv_hist, res, out, stream);
         launch_mix_ffn_norm_router_topk_decode_v2(res_query, states, n_states, ffn_norm_w,
                                                   router_w, exp_probs_b, x_norm_out,
-                                                  topk_ids_out, topk_w_out, mix_scratch, stream);
+                                                  topk_ids_out, topk_w_out, fb_scratch, stream);
         return;
     }
     if (n_states <= 0 || n_states > 5 || mix_scratch == nullptr || !s7i_coresident(g_occ_wo_b, 4, 192)) {
         launch_soa_q8_gemv_wo_v2(W, x, conv_w, sconv_hist, res, out, stream);
         launch_mix_ffn_norm_router_topk_decode_v2(res_query, states, n_states, ffn_norm_w,
                                                   router_w, exp_probs_b, x_norm_out,
-                                                  topk_ids_out, topk_w_out, mix_scratch, stream);
+                                                  topk_ids_out, topk_w_out, fb_scratch, stream);
         return;
     }
     S7IStatePtrs st;
@@ -2535,14 +2536,15 @@ void launch_wo_c_fused_fdot2(
         const __half * router_w, const float * exp_probs_b,
         float * out_mixed, float * out_gate,
         float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-        float * mix_scratch, hipStream_t stream) {
+        float * mix_scratch, hipStream_t stream, float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     if (W.K != N_Q || conv_w == nullptr || sconv_hist == nullptr || res_query == nullptr ||
         n_states <= 0 || n_states > 5 || mix_scratch == nullptr || !s7i_coresident(g_occ_wo_c_h2, 4, 192)) {
         launch_soa_q8_gemv_wo_v2(W, x, conv_w, sconv_hist, res, out, stream);
         launch_mix_ctrl_ffn_norm_router_topk_decode_v2(
             res_query, states, n_states, msg, w_down, w_gain, w_forget,
             ffn_norm_w, router_w, exp_probs_b, out_mixed, out_gate,
-            x_norm_out, topk_ids_out, topk_w_out, mix_scratch, stream);
+            x_norm_out, topk_ids_out, topk_w_out, fb_scratch, stream);
         return;
     }
     S7IStatePtrs st;
@@ -2565,14 +2567,16 @@ void launch_wo_c_fused(
         const __half * router_w, const float * exp_probs_b,
         float * out_mixed, float * out_gate,
         float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-        float * mix_scratch, hipStream_t stream, float * raw_out) {
+        float * mix_scratch, hipStream_t stream, float * raw_out,
+        float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     if (W.K != N_Q || conv_w == nullptr || sconv_hist == nullptr || res_query == nullptr ||
         n_states <= 0 || n_states > 5 || mix_scratch == nullptr || !s7i_coresident(g_occ_wo_c, 4, 192)) {
         launch_soa_q8_gemv_wo_v2(W, x, conv_w, sconv_hist, res, out, stream, raw_out);
         launch_mix_ctrl_ffn_norm_router_topk_decode_v2(
             res_query, states, n_states, msg, w_down, w_gain, w_forget,
             ffn_norm_w, router_w, exp_probs_b, out_mixed, out_gate,
-            x_norm_out, topk_ids_out, topk_w_out, mix_scratch, stream);
+            x_norm_out, topk_ids_out, topk_w_out, fb_scratch, stream);
         return;
     }
     S7IStatePtrs st;
@@ -2606,7 +2610,9 @@ void launch_mix_rms_qkv_qkvr_prep_fused(
         bool fuse_minmax,
         SparseGlobalPageMeta sparse_meta,
         float * mix_scratch,
-        hipStream_t stream) {
+        hipStream_t stream,
+        float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     QkvSeg s[3];
     int nseg = 0;
     if (W0.rows > 0) s[nseg++] = s7i_make_seg(W0, x0, y0);
@@ -2630,7 +2636,7 @@ void launch_mix_rms_qkv_qkvr_prep_fused(
             q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
             k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
             sconv_hist_kv, kv_slot, q_out, rel_table_out, apply_tau, d_meta,
-            mix_scratch, stream, 288);
+            fb_scratch, stream, 288);
         return;
     }
     constexpr int GRID = 192;
@@ -2658,7 +2664,9 @@ void launch_a_v3_decode(
         const float * const w_norm[3],
         float * tmp_gate,
         float * const out_norm[3],
-        float eps, hipStream_t stream, float * mix_scratch) {
+        float eps, hipStream_t stream, float * mix_scratch,
+        float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     const float * cur[3] = {
         out1,
         out1 + (size_t)(n_q1 >= 3 ? 1 : 0) * N_EMBD,
@@ -2672,7 +2680,7 @@ void launch_a_v3_decode(
         launch_mix_dual_ctrl_qkv3_norm_decode(
             query0, n_q0, states0, n_states0, out0,
             query1, n_q1, states1, n_states1, out1,
-            w_down, w_gain, w_forget, w_norm, tmp_gate, out_norm, 1, eps, stream, mix_scratch);
+            w_down, w_gain, w_forget, w_norm, tmp_gate, out_norm, 1, eps, stream, fb_scratch);
         return;
     }
     S7IStatePtrs s0, s1;
@@ -2722,7 +2730,9 @@ void launch_a_qkv_qkvr_prep_fused(
         bool fuse_minmax,
         SparseGlobalPageMeta sparse_meta,
         float * mix_scratch,
-        hipStream_t stream) {
+        hipStream_t stream,
+        float * router_scratch) {
+    float * const fb_scratch = router_scratch ? router_scratch : mix_scratch;
     const float * cur[3] = {
         out1,
         out1 + (size_t)(n_q1 >= 3 ? 1 : 0) * N_EMBD,
@@ -2742,13 +2752,13 @@ void launch_a_qkv_qkvr_prep_fused(
         launch_a_v3_decode(query0, n_q0, states0, n_states0, out0,
                            query1, n_q1, states1, n_states1, out1,
                            w_down, w_gain, w_forget, w_norm, tmp_gate, out_norm,
-                           eps, stream, mix_scratch);
+                           eps, stream, mix_scratch, router_scratch);
         launch_qkv_qkvr_prep_fused_decode_g(
             W0, x0, y0, W1, x1, y1, W2, x2, y2,
             q_in, q_clip_w, r_in, r_clip_w, rel_bias_w,
             k_raw, k_conv_w, k_dyn, v_raw, v_conv_w, v_dyn,
             sconv_hist_kv, kv_slot, q_out, rel_table_out, apply_tau, d_meta,
-            mix_scratch, stream, 288);
+            fb_scratch, stream, 288);
         return;
     }
     constexpr int GRID = 192;

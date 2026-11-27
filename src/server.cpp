@@ -47,7 +47,10 @@ static std::atomic<int>  g_listen_fd{-1};
 static void handle_sig(int) {
     g_stop_server.store(true);
     int fd = g_listen_fd.exchange(-1);
-    if (fd >= 0) ::close(fd);
+    if (fd >= 0) {
+        ::shutdown(fd, SHUT_RDWR);
+        ::close(fd);
+    }
 }
 
 // ============================================================================
@@ -691,58 +694,142 @@ static int32_t sample_logits_ptr(const float * logits, int V, const SampleParams
         return (int32_t)(std::max_element(logits, logits + V) - logits);
     }
 
-    int k = (sp.top_k > 0 && sp.top_k < V) ? sp.top_k : V;
-    std::vector<int32_t> idx((size_t)V);
-    std::iota(idx.begin(), idx.end(), 0);
+    struct Cand {
+        float   val;
+        int32_t id;
+    };
+
+    const float inv_t = 1.0f / sp.temperature;
+    const int k = (sp.top_k > 0 && sp.top_k < V) ? sp.top_k : V;
+
     if (k < V) {
+        std::vector<int32_t> idx((size_t)V);
+        std::iota(idx.begin(), idx.end(), 0);
         std::nth_element(idx.begin(), idx.begin() + k, idx.end(),
                          [&](int32_t a, int32_t b) { return logits[(size_t)a] > logits[(size_t)b]; });
         idx.resize((size_t)k);
-    }
-    std::sort(idx.begin(), idx.end(),
-              [&](int32_t a, int32_t b) { return logits[(size_t)a] > logits[(size_t)b]; });
+        std::sort(idx.begin(), idx.end(),
+                  [&](int32_t a, int32_t b) { return logits[(size_t)a] > logits[(size_t)b]; });
 
-    const float inv_t = 1.0f / sp.temperature;
-    const float max_l = logits[(size_t)idx[0]];
-    std::vector<float> probs(idx.size());
-    float sum = 0.0f;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        float p = std::exp((logits[(size_t)idx[i]] - max_l) * inv_t);
-        probs[i] = p;
-        sum += p;
-    }
-    if (!(sum > 0.0f)) return idx[0];
-    const float inv_s = 1.0f / sum;
-    for (float & p : probs) p *= inv_s;
+        const float max_l = logits[(size_t)idx[0]];
+        std::vector<float> probs(idx.size());
+        float sum = 0.0f;
+        for (size_t i = 0; i < idx.size(); ++i) {
+            float p = std::exp((logits[(size_t)idx[i]] - max_l) * inv_t);
+            probs[i] = p;
+            sum += p;
+        }
+        if (!(sum > 0.0f) || !std::isfinite(sum)) return idx[0];
+        const float inv_s = 1.0f / sum;
+        for (float & p : probs) p *= inv_s;
 
-    // Min-P filter
-    size_t keep = probs.size();
-    if (sp.min_p > 0.0f) {
-        const float thresh = probs[0] * sp.min_p;
-        size_t cnt = 1;
-        while (cnt < keep && probs[cnt] >= thresh) ++cnt;
-        keep = cnt;
+        size_t keep = probs.size();
+        if (sp.min_p > 0.0f) {
+            const float thresh = probs[0] * sp.min_p;
+            size_t cnt = 1;
+            while (cnt < keep && probs[cnt] >= thresh) ++cnt;
+            keep = cnt;
+        }
+        if (sp.top_p > 0.0f && sp.top_p < 1.0f) {
+            float cum = 0.0f;
+            size_t cnt = 0;
+            while (cnt < keep) {
+                cum += probs[cnt++];
+                if (cum >= sp.top_p) break;
+            }
+            keep = std::max<size_t>(1, cnt);
+        }
+        float total = 0.0f;
+        for (size_t i = 0; i < keep; ++i) total += probs[i];
+        std::uniform_real_distribution<float> dist(0.0f, total);
+        float r = dist(rng);
+        float acc = 0.0f;
+        for (size_t i = 0; i < keep; ++i) {
+            acc += probs[i];
+            if (r <= acc) return idx[i];
+        }
+        return idx[keep - 1];
     }
-    // Top-P (nucleus) filter
-    if (sp.top_p > 0.0f && sp.top_p < 1.0f) {
-        float cum = 0.0f;
+
+    // Full-vocab path (top_k == 0): avoid O(V log V) full-vocab sort + 200k exp()
+    // when top_p < 1.0 or min_p > 0.0 by computing the exact partition function Z
+    // and pre-filtering candidates above a high-probability logit cutoff.
+    int32_t argmax = 0;
+    float max_l = logits[0];
+    for (int i = 1; i < V; ++i) {
+        if (logits[i] > max_l) {
+            max_l = logits[i];
+            argmax = i;
+        }
+    }
+    if (!std::isfinite(max_l)) return argmax;
+
+    const bool has_min_p = (sp.min_p > 0.0f);
+    const bool has_top_p = (sp.top_p > 0.0f && sp.top_p < 1.0f);
+    const float min_cut  = has_min_p ? std::log(sp.min_p) : -INFINITY;
+    const float hi_cut   = std::max(min_cut, -12.0f); // exp(-12) ~= 6.1e-6 of p_max
+
+    std::vector<Cand> cands;
+    cands.reserve(512);
+    double sum = 0.0;
+    double hi_sum = 0.0;
+    for (int i = 0; i < V; ++i) {
+        const float scaled = (logits[i] - max_l) * inv_t;
+        if (scaled > -30.0f) { // exp(-30) < 1e-13; negligible relative to exp(0)=1
+            const float e = std::exp(scaled);
+            sum += (double)e;
+            if (scaled >= hi_cut) {
+                cands.push_back(Cand{e, i});
+                hi_sum += (double)e;
+            }
+        }
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum)) return argmax;
+
+    // Exactness check: cands holds every token with scaled >= hi_cut.
+    // It is guaranteed sufficient if min_cut >= -12.0f (all min_p survivors are in cands)
+    // OR if top_p is active and cands already holds >= top_p of the total mass.
+    const bool cands_complete = (min_cut >= -12.0f) || (has_top_p && hi_sum >= (double)sp.top_p * sum);
+    if (!cands_complete) {
+        cands.clear();
+        cands.reserve((size_t)V);
+        for (int i = 0; i < V; ++i) {
+            const float scaled = (logits[i] - max_l) * inv_t;
+            if (scaled >= min_cut) {
+                const float e = (scaled > -88.0f) ? std::exp(scaled) : 0.0f;
+                cands.push_back(Cand{e, i});
+            }
+        }
+    }
+    if (cands.empty()) return argmax;
+
+    size_t keep = cands.size();
+    if (has_top_p) {
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand & a, const Cand & b) {
+                      return (a.val != b.val) ? (a.val > b.val) : (a.id < b.id);
+                  });
+        const double target_mass = (double)sp.top_p * sum;
+        double cum = 0.0;
         size_t cnt = 0;
         while (cnt < keep) {
-            cum += probs[cnt++];
-            if (cum >= sp.top_p) break;
+            cum += (double)cands[cnt++].val;
+            if (cum >= target_mass) break;
         }
         keep = std::max<size_t>(1, cnt);
     }
-    float total = 0.0f;
-    for (size_t i = 0; i < keep; ++i) total += probs[i];
-    std::uniform_real_distribution<float> dist(0.0f, total);
-    float r = dist(rng);
-    float acc = 0.0f;
+
+    double total = 0.0;
+    for (size_t i = 0; i < keep; ++i) total += (double)cands[i].val;
+    if (!(total > 0.0) || !std::isfinite(total)) return cands[0].id;
+    std::uniform_real_distribution<double> dist(0.0, total);
+    double r = dist(rng);
+    double acc = 0.0;
     for (size_t i = 0; i < keep; ++i) {
-        acc += probs[i];
-        if (r <= acc) return idx[i];
+        acc += (double)cands[i].val;
+        if (r <= acc) return cands[i].id;
     }
-    return idx[keep - 1];
+    return cands[keep - 1].id;
 }
 
 static int32_t sample_logits(const std::vector<float> & logits, const SampleParams & sp, std::mt19937_64 & rng) {
@@ -1568,7 +1655,7 @@ public:
             }
 
 #ifndef NIB_VERSION
-#define NIB_VERSION "0.2.1"
+#define NIB_VERSION "0.2.2"
 #endif
             const NibDeviceInfo & dev_info = nib_device_info(0);
             const auto now = std::chrono::steady_clock::now();
@@ -3448,16 +3535,19 @@ private:
                 continue;
             }
 
-            // 6. SOLO FAST PATH (active == 1 on slot 0, DECODING, no pending queue):
-            //    0% overhead — runs exact lossless DSpark MTP (temp==0 or temp>0) or static HIP Graph.
+            // 6. SOLO FAST PATH (active == 1 on slot 0, DECODING):
+            //    Step 4 already admitted any queued request that fits free segments; if
+            //    n_active is still 1 (e.g. --slots 1, full-span elastic slot 0, or a queued
+            //    job waiting for more contiguous segments), keep running lossless DSpark MTP
+            //    instead of falling through to Step 8 and needlessly desyncing the drafter.
             if (n_active == 1 && n_decode == 1 && decode_slots[0] == 0 &&
-                pending_count_.load(std::memory_order_relaxed) == 0 &&
                 !reset_requested_.load(std::memory_order_relaxed)) {
                 auto job = active_slots_[0];
                 if (drafter_ != nullptr && job->allow_mtp && drafter_in_sync_) {
                     run_solo_mtp_round(job);
                     continue;
                 }
+                job->live_mtp.store(false, std::memory_order_relaxed);
                 if (eng_.current_pos() + 2 >= span_ctx_limit(0, job->span)) {
                     if (!try_expand_slot(job, eng_.current_pos() + 3)) {
                         finish_job(job, "length");
@@ -3507,11 +3597,11 @@ private:
                     advance_prefill_chunk(job);
                 }
                 // If that was a solo slot-0 request that just finished prefilling,
-                // loop straight back to Step 6 so it enters lossless DSpark MTP
-                // instead of falling through to Step 8 (which would desync drafter).
+                // loop straight back to the top (Step 4 admits any newly-eligible
+                // queued request; otherwise Step 6 enters lossless DSpark MTP
+                // instead of falling through to Step 8 and desyncing the drafter).
                 if (n_active == 1 && pick == 0 && active_slots_[0] != nullptr &&
-                    active_slots_[0]->state == JOB_DECODING &&
-                    pending_count_.load(std::memory_order_relaxed) == 0) {
+                    active_slots_[0]->state == JOB_DECODING) {
                     continue;
                 }
             }
@@ -3549,6 +3639,7 @@ private:
             if (B == 1) {
                 const int c = b_slots[0];
                 auto & job = b_jobs[0];
+                job->live_mtp.store(false, std::memory_order_relaxed);
                 const bool gpu_samp = job->need_logits && use_gpu_full_sampler(job->sp);
                 int32_t next = eng_.decode_slot_single(c, b_toks[0],
                                                        (job->need_logits && !gpu_samp) ? &single_logits : nullptr);
@@ -3609,6 +3700,7 @@ private:
                 for (int r = 0; r < B; ++r) {
                     const int c = b_slots[r];
                     auto & job = b_jobs[r];
+                    job->live_mtp.store(false, std::memory_order_relaxed);
                     if (c == 0 && drafter_ != nullptr) drafter_in_sync_ = false;
                     if (!ok) {
                         clear_slot_cache(c);
@@ -4330,8 +4422,14 @@ int run_http_server(
     const ServerConfig & cfg)
 {
     ::signal(SIGPIPE, SIG_IGN);
-    ::signal(SIGINT, handle_sig);
-    ::signal(SIGTERM, handle_sig);
+    {
+        struct sigaction sa {};
+        sa.sa_handler = handle_sig;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0; // no SA_RESTART so accept() wakes immediately with EINTR
+        ::sigaction(SIGINT, &sa, nullptr);
+        ::sigaction(SIGTERM, &sa, nullptr);
+    }
     g_stop_server.store(false);
 
     InklingServer srv(eng, bpe, drafter, vision, cfg);

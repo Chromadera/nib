@@ -1007,7 +1007,8 @@ void InklingEngine::record_layer(
                                 a_q0, a_nq0, a_s0, a_ns0, a_o0,
                                 a_q1, a_nq1, a_s1, a_ns1, a_o1,
                                 a_wd, a_wg, a_wf, a_wn3,
-                                ctrl_gate_, a_on, RMS_EPS, stream_, buf_mix_scratch_);
+                                ctrl_gate_, a_on, RMS_EPS, stream_, buf_mix_scratch_,
+                                buf_router_scratch_);
                         } else {
                             // A: dual depth mix + 3-way ctrl QKV + RMSNorm in ONE launch.
                             launch_mix_dual_ctrl_qkv3_norm_decode(
@@ -1228,7 +1229,7 @@ void InklingEngine::record_layer(
             hist_base, cur_kv,
             q_prep_, rel_table_, /*apply_tau=*/!is_swa,
             d_meta, cfg_.fuse_minmax != 0, cur_sm,
-            buf_mix_scratch_, stream_);
+            buf_mix_scratch_, stream_, buf_router_scratch_);
         minmax_folded = cfg_.fuse_minmax != 0 && std::getenv("INKLING_NO_MINMAX_FOLD") == nullptr;
     } else if (s7i_aqkv2) {
         launch_a_qkv_qkvr_prep_fused(
@@ -1246,7 +1247,7 @@ void InklingEngine::record_layer(
             hist_base, cur_kv,
             q_prep_, rel_table_, /*apply_tau=*/!is_swa,
             d_meta, cfg_.fuse_minmax != 0, cur_sm,
-            buf_mix_scratch_, stream_);
+            buf_mix_scratch_, stream_, buf_router_scratch_);
         minmax_folded = cfg_.fuse_minmax != 0;
     } else if (fuse_e) {
         const SoaQ8Matrix none{};
@@ -1825,7 +1826,8 @@ void InklingEngine::record_layer(
                 attn_res_add, buf_ffn_inp_,
                 L.ffn_res_query, b_states, b_n_states, L.ffn_norm,
                 L.ffn_gate_inp, L.ffn_exp_probs_b,
-                x_norm_, topk_ids_, topk_w_, buf_mix_scratch_, stream_);
+                x_norm_, topk_ids_, topk_w_, buf_mix_scratch_, stream_,
+                buf_router_scratch_);
             if (const char * dp = std::getenv("INKLING_DUMP_XNORM")) {
                 HIP_CHECK(hipStreamSynchronize(stream_));
                 std::vector<float> tmp(N_EMBD);
@@ -1850,7 +1852,8 @@ void InklingEngine::record_layer(
                 loop->ctrl_forget[LOOP_CTRL_FFN], L.ffn_norm,
                 L.ffn_gate_inp, L.ffn_exp_probs_b,
                 mixed_, ctrl_gate_, x_norm_,
-                topk_ids_, topk_w_, buf_mix_scratch_, stream_);
+                topk_ids_, topk_w_, buf_mix_scratch_, stream_,
+                buf_router_scratch_);
             norm_router_done = true;
         } else if (s7i_woc) {
             const float * msg_ffn = messages + (size_t)LOOP_CTRL_FFN * tok_embd_stride;
@@ -1863,7 +1866,8 @@ void InklingEngine::record_layer(
                 loop->ctrl_forget[LOOP_CTRL_FFN], L.ffn_norm,
                 L.ffn_gate_inp, L.ffn_exp_probs_b,
                 mixed_, ctrl_gate_, x_norm_,
-                topk_ids_, topk_w_, buf_mix_scratch_, stream_, wo_raw);
+                topk_ids_, topk_w_, buf_mix_scratch_, stream_, wo_raw,
+                buf_router_scratch_);
             norm_router_done = true;
         } else if (cfg_.fdot2_wo >= 1) {
             launch_soa_q8_gemv_wo_fdot2(

@@ -62,7 +62,7 @@ void launch_wo_b_fused(
     const float * ffn_norm_w,
     const __half * router_w, const float * exp_probs_b,
     float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-    float * mix_scratch, hipStream_t stream);
+    float * mix_scratch, hipStream_t stream, float * router_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // 2. wo + C (Pass-1/2 pre-MoE) in ONE launch: 192 blocks x 288 threads.
@@ -80,7 +80,8 @@ void launch_wo_c_fused(
     const __half * router_w, const float * exp_probs_b,
     float * out_mixed, float * out_gate,
     float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-    float * mix_scratch, hipStream_t stream, float * raw_out = nullptr);
+    float * mix_scratch, hipStream_t stream, float * raw_out = nullptr,
+    float * router_scratch = nullptr);
 
 // Step 7J: identical kernel with the wo phase on `v_dot2_f32_f16` + `__half2`
 // LDS (s_x 13.8 KB -> 7.7 KB, whole launch 24.9 KB -> 18.3 KB).  Same weight
@@ -95,7 +96,7 @@ void launch_wo_c_fused_fdot2(
     const __half * router_w, const float * exp_probs_b,
     float * out_mixed, float * out_gate,
     float * x_norm_out, int32_t * topk_ids_out, float * topk_w_out,
-    float * mix_scratch, hipStream_t stream);
+    float * mix_scratch, hipStream_t stream, float * router_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // 3. Pass-0 attention input norm + qkv_qkvr_prep (+ page_minmax) in ONE launch:
@@ -126,7 +127,8 @@ void launch_mix_rms_qkv_qkvr_prep_fused(
     bool fuse_minmax,
     SparseGlobalPageMeta sparse_meta,
     float * mix_scratch,
-    hipStream_t stream);
+    hipStream_t stream,
+    float * router_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // 4a. Standalone distributed A (`--fuse-a-qkv 1`): 96 x 288, bit-identical to
@@ -141,7 +143,8 @@ void launch_a_v3_decode(
     const float * const w_norm[3],
     float * tmp_gate,
     float * const out_norm[3],
-    float eps, hipStream_t stream, float * mix_scratch);
+    float eps, hipStream_t stream, float * mix_scratch,
+    float * router_scratch = nullptr);
 
 // ---------------------------------------------------------------------------
 // 4b. Super-fused A + qkv_qkvr_prep (`--fuse-a-qkv 2`): 192 x 288.
@@ -174,7 +177,8 @@ void launch_a_qkv_qkvr_prep_fused(
     bool fuse_minmax,
     SparseGlobalPageMeta sparse_meta,
     float * mix_scratch,
-    hipStream_t stream);
+    hipStream_t stream,
+    float * router_scratch = nullptr);
 
 // No runtime occupancy query is needed (statically co-resident grids); kept so
 // the call site mirrors the Step 7F/7H hooks.
