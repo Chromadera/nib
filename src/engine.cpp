@@ -700,6 +700,121 @@ void InklingEngine::rewind_pos_for_bench(int32_t target_pos) {
     HIP_CHECK(hipStreamSynchronize(stream_));
 }
 
+bool InklingEngine::save_slot0_checkpoint(Slot0Checkpoint & out) const {
+    const int32_t pos = slot_pos_[0];
+    if (pos <= 0 || cur_pos_ != pos) return false;
+
+    const size_t qs_bytes_per_head = (cfg_.kv_type == KV_Q8_0) ? (size_t)HEAD_DIM : (size_t)(HEAD_DIM / 2);
+    const size_t d_halves_per_head = (cfg_.kv_type == KV_Q4_1) ? (size_t)(HEAD_DIM / 16) : (size_t)(HEAD_DIM / 32);
+    const size_t qs_bytes   = (size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head;
+    const size_t d_bytes    = (size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head * sizeof(__half);
+    const size_t kpos_bytes = (size_t)cfg_.swa_cap * sizeof(int32_t);
+    const size_t per_swa    = 2 * qs_bytes + 2 * d_bytes + kpos_bytes;
+    const size_t sconv_elems = (size_t)N_SCONV_CHANNELS * N_CONV_HIST;
+
+    size_t n_swa = 0;
+    for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+        if (is_swa_slot(s)) ++n_swa;
+    }
+    out.swa_blob.resize(n_swa * per_swa);
+    out.sconv_blob.resize((size_t)N_LAYER_SLOTS * sconv_elems);
+
+    size_t swa_off = 0;
+    for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+        if (is_swa_slot(s)) {
+            const KVCacheSlot & kv = kv_slots_[s];
+            uint8_t * dst = out.swa_blob.data() + swa_off;
+            HIP_CHECK(hipMemcpyAsync(dst, kv.k_qs, qs_bytes, hipMemcpyDeviceToHost, stream_));
+            dst += qs_bytes;
+            HIP_CHECK(hipMemcpyAsync(dst, kv.k_d, d_bytes, hipMemcpyDeviceToHost, stream_));
+            dst += d_bytes;
+            HIP_CHECK(hipMemcpyAsync(dst, kv.v_qs, qs_bytes, hipMemcpyDeviceToHost, stream_));
+            dst += qs_bytes;
+            HIP_CHECK(hipMemcpyAsync(dst, kv.v_d, d_bytes, hipMemcpyDeviceToHost, stream_));
+            dst += d_bytes;
+            HIP_CHECK(hipMemcpyAsync(dst, kv.k_pos, kpos_bytes, hipMemcpyDeviceToHost, stream_));
+            swa_off += per_swa;
+        }
+        HIP_CHECK(hipMemcpyAsync(out.sconv_blob.data() + (size_t)s * sconv_elems,
+                                 sconv_slots_[s].hist,
+                                 sconv_elems * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream_));
+    }
+    HIP_CHECK(hipStreamSynchronize(stream_));
+    out.pos     = pos;
+    out.swa_cap = cfg_.swa_cap;
+    out.kv_type = cfg_.kv_type;
+    return true;
+}
+
+bool InklingEngine::restore_slot0_checkpoint(const Slot0Checkpoint & ckpt) {
+    if (ckpt.pos <= 0 || ckpt.swa_cap != cfg_.swa_cap || ckpt.kv_type != cfg_.kv_type) {
+        return false;
+    }
+    const int32_t old_pos = slot_pos_[0];
+    if (old_pos < ckpt.pos || cur_pos_ != old_pos) {
+        return false;
+    }
+
+    const size_t qs_bytes_per_head = (cfg_.kv_type == KV_Q8_0) ? (size_t)HEAD_DIM : (size_t)(HEAD_DIM / 2);
+    const size_t d_halves_per_head = (cfg_.kv_type == KV_Q4_1) ? (size_t)(HEAD_DIM / 16) : (size_t)(HEAD_DIM / 32);
+    const size_t qs_bytes   = (size_t)cfg_.swa_cap * N_HEAD_KV * qs_bytes_per_head;
+    const size_t d_bytes    = (size_t)cfg_.swa_cap * N_HEAD_KV * d_halves_per_head * sizeof(__half);
+    const size_t kpos_bytes = (size_t)cfg_.swa_cap * sizeof(int32_t);
+    const size_t per_swa    = 2 * qs_bytes + 2 * d_bytes + kpos_bytes;
+    const size_t sconv_elems = (size_t)N_SCONV_CHANNELS * N_CONV_HIST;
+
+    size_t n_swa = 0;
+    for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+        if (is_swa_slot(s)) ++n_swa;
+    }
+    if (ckpt.swa_blob.size() != n_swa * per_swa ||
+        ckpt.sconv_blob.size() != (size_t)N_LAYER_SLOTS * sconv_elems) {
+        return false;
+    }
+
+    const int32_t clear_n = old_pos - ckpt.pos;
+    const bool fix_boundary_page = (cfg_.sparse_pages > 0 && clear_n > 0 && (ckpt.pos % SPARSE_PAGE_SIZE) != 0);
+    const int boundary_page_start = (ckpt.pos / SPARSE_PAGE_SIZE) * SPARSE_PAGE_SIZE;
+    const int boundary_page_len   = ckpt.pos - boundary_page_start;
+
+    size_t swa_off = 0;
+    for (int s = 0; s < N_LAYER_SLOTS; ++s) {
+        if (is_swa_slot(s)) {
+            const KVCacheSlot & kv = kv_slots_[s];
+            const uint8_t * src = ckpt.swa_blob.data() + swa_off;
+            HIP_CHECK(hipMemcpyAsync(kv.k_qs, src, qs_bytes, hipMemcpyHostToDevice, stream_));
+            src += qs_bytes;
+            HIP_CHECK(hipMemcpyAsync(kv.k_d, src, d_bytes, hipMemcpyHostToDevice, stream_));
+            src += d_bytes;
+            HIP_CHECK(hipMemcpyAsync(kv.v_qs, src, qs_bytes, hipMemcpyHostToDevice, stream_));
+            src += qs_bytes;
+            HIP_CHECK(hipMemcpyAsync(kv.v_d, src, d_bytes, hipMemcpyHostToDevice, stream_));
+            src += d_bytes;
+            HIP_CHECK(hipMemcpyAsync(kv.k_pos, src, kpos_bytes, hipMemcpyHostToDevice, stream_));
+            swa_off += per_swa;
+        } else {
+            if (clear_n > 0) {
+                HIP_CHECK(hipMemsetAsync(kv_slots_[s].k_pos + ckpt.pos, 0xFF,
+                                         (size_t)clear_n * sizeof(int32_t), stream_));
+            }
+            if (fix_boundary_page) {
+                launch_kv_update_page_minmax_prefill(
+                    kv_slots_[s], sparse_meta_[s],
+                    boundary_page_start, boundary_page_len, stream_);
+            }
+        }
+        HIP_CHECK(hipMemcpyAsync(sconv_slots_[s].hist,
+                                 ckpt.sconv_blob.data() + (size_t)s * sconv_elems,
+                                 sconv_elems * sizeof(float),
+                                 hipMemcpyHostToDevice, stream_));
+    }
+    HIP_CHECK(hipStreamSynchronize(stream_));
+    cur_pos_ = ckpt.pos;
+    slot_pos_[0] = ckpt.pos;
+    return true;
+}
+
 void InklingEngine::record_layer(
         int slot, int ip,
         const float * cur_in, float * cur_out,

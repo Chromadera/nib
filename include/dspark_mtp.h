@@ -81,6 +81,18 @@ public:
     size_t vram_bytes() const { return vram_bytes_; }
     int short_rows() const { return short_K_ + short_E_; }
 
+    // Host-RAM snapshot of mutable drafter state at a prompt boundary (0 extra VRAM).
+    struct Checkpoint {
+        int length = 0;
+        int ctx = 0;
+        int short_E = 0;
+        std::vector<int32_t>  short_extra;
+        std::vector<uint8_t>  layers_blob;
+        std::vector<uint16_t> f_rnn;
+    };
+    bool save_checkpoint(Checkpoint & out) const;
+    bool restore_checkpoint(const Checkpoint & ckpt);
+
 private:
     struct Layer {
         const uint16_t * in_norm = nullptr;

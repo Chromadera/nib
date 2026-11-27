@@ -2037,6 +2037,7 @@ private:
         eng_.reset_state();
         if (drafter_) drafter_->reset();
         drafter_in_sync_ = (drafter_ != nullptr);
+        clear_slot0_checkpoint();
         for (int c = 0; c < MAX_CONCURRENT_SLOTS; ++c) {
             clear_slot_cache(c);
             slot_last_used_[c] = 0;
@@ -2109,12 +2110,17 @@ private:
         return sp;
     }
 
-    int64_t slot_cached_total(int c) const {
-        int64_t n = (int64_t)slot_cached_toks_[c].size();
-        for (const auto & s : slot_mm_prologue_[c]) {
+    static int64_t prefix_total_tokens(const std::vector<SlotCacheSeg> & pro,
+                                       const std::vector<int32_t> & tail) {
+        int64_t n = (int64_t)tail.size();
+        for (const auto & s : pro) {
             n += s.is_image ? (int64_t)s.ntok : (int64_t)s.toks.size();
         }
         return n;
+    }
+
+    int64_t slot_cached_total(int c) const {
+        return prefix_total_tokens(slot_mm_prologue_[c], slot_cached_toks_[c]);
     }
 
     void clear_slot_cache(int c) {
@@ -2124,38 +2130,38 @@ private:
         slot_cache_span_[c] = 0;
     }
 
-    void update_cache_span(int c) {
-        if (!slot_cache_valid_[c] || slot_cached_total(c) <= 0) {
-            slot_cache_span_[c] = 0;
-            return;
-        }
-        const int n_slots = eng_.num_slots();
-        if (n_slots <= 1) {
-            slot_cache_span_[c] = 1;
-            return;
-        }
-        const int32_t sz = (int32_t)slot_cached_total(c);
-        int sp = (sz + eng_.slot_ctx() - 1) / eng_.slot_ctx();
-        if (sp < 1) sp = 1;
-        if (sp > n_slots - c) sp = n_slots - c;
-        slot_cache_span_[c] = sp;
+    void clear_slot0_checkpoint() {
+        slot0_ckpt_valid_ = false;
+        slot0_ckpt_drafter_valid_ = false;
+        slot0_ckpt_span_ = 0;
+        slot0_ckpt_mm_prologue_.clear();
+        slot0_ckpt_toks_.clear();
     }
 
-    // Longest prefix of `cand` that is already resident in slot c's KV (scheduler thread).
-    // Returns the token count (0 = miss). On a hit, *resume_seg / *resume_off give the
-    // candidate segment + intra-segment token offset where prefill must continue.
-    //   text-only candidate : prologue must be empty; slot_cached_toks_ must equal prompt_toks[0:n].
-    //   multimodal candidate : prologue segments must match one-to-one (text ids exact, images by
-    //                          128-bit hash), then slot_cached_toks_ must be a prefix of the
-    //                          remaining text. Read-only (call apply_mm_prefix_ntokens on commit).
-    int match_slot_prefix(int c, const StreamJob & cand, int * resume_seg, int * resume_off) const {
+    void save_slot0_checkpoint() {
+        if (!slot_cache_valid_[0]) return;
+        const int64_t n = slot_cached_total(0);
+        if (n < SLOT0_CKPT_MIN_TOKENS || (int64_t)eng_.slot_pos(0) != n) return;
+        if (!eng_.save_slot0_checkpoint(slot0_ckpt_eng_)) return;
+        slot0_ckpt_mm_prologue_ = slot_mm_prologue_[0];
+        slot0_ckpt_toks_ = slot_cached_toks_[0];
+        slot0_ckpt_span_ = std::max(1, slot_cache_span_[0]);
+        slot0_ckpt_drafter_valid_ = false;
+        if (drafter_ != nullptr && drafter_in_sync_ && drafter_->length() == (int)n) {
+            slot0_ckpt_drafter_valid_ = drafter_->save_checkpoint(slot0_ckpt_drafter_);
+        }
+        slot0_ckpt_valid_ = true;
+    }
+
+    static int match_prefix_against(const std::vector<SlotCacheSeg> & pro,
+                                    const std::vector<int32_t> & tail,
+                                    int64_t total,
+                                    const StreamJob & cand,
+                                    int * resume_seg,
+                                    int * resume_off) {
         *resume_seg = 0;
         *resume_off = 0;
-        if (!slot_cache_valid_[c]) return 0;
-        const auto & pro = slot_mm_prologue_[c];
-        const auto & tail = slot_cached_toks_[c];
-        const int64_t total = slot_cached_total(c);
-        if (total <= 0 || (int64_t)eng_.slot_pos(c) != total) return 0;
+        if (total <= 0) return 0;
 
         if (!cand.has_images) {
             if (!pro.empty()) return 0;
@@ -2205,6 +2211,50 @@ private:
         return (int)total;
     }
 
+    int match_slot0_checkpoint(const StreamJob & cand, int * resume_seg, int * resume_off) const {
+        *resume_seg = 0;
+        *resume_off = 0;
+        if (!slot0_ckpt_valid_) return 0;
+        const int64_t total = prefix_total_tokens(slot0_ckpt_mm_prologue_, slot0_ckpt_toks_);
+        if (total <= 0 || (int64_t)eng_.slot_pos(0) < total) return 0;
+        return match_prefix_against(slot0_ckpt_mm_prologue_, slot0_ckpt_toks_, total,
+                                    cand, resume_seg, resume_off);
+    }
+
+    void update_cache_span(int c) {
+        if (!slot_cache_valid_[c] || slot_cached_total(c) <= 0) {
+            slot_cache_span_[c] = 0;
+            return;
+        }
+        const int n_slots = eng_.num_slots();
+        if (n_slots <= 1) {
+            slot_cache_span_[c] = 1;
+            return;
+        }
+        const int32_t sz = (int32_t)slot_cached_total(c);
+        int sp = (sz + eng_.slot_ctx() - 1) / eng_.slot_ctx();
+        if (sp < 1) sp = 1;
+        if (sp > n_slots - c) sp = n_slots - c;
+        slot_cache_span_[c] = sp;
+    }
+
+    // Longest prefix of `cand` that is already resident in slot c's KV (scheduler thread).
+    // Returns the token count (0 = miss). On a hit, *resume_seg / *resume_off give the
+    // candidate segment + intra-segment token offset where prefill must continue.
+    //   text-only candidate : prologue must be empty; slot_cached_toks_ must equal prompt_toks[0:n].
+    //   multimodal candidate : prologue segments must match one-to-one (text ids exact, images by
+    //                          128-bit hash), then slot_cached_toks_ must be a prefix of the
+    //                          remaining text. Read-only (call apply_mm_prefix_ntokens on commit).
+    int match_slot_prefix(int c, const StreamJob & cand, int * resume_seg, int * resume_off) const {
+        *resume_seg = 0;
+        *resume_off = 0;
+        if (!slot_cache_valid_[c]) return 0;
+        const int64_t total = slot_cached_total(c);
+        if (total <= 0 || (int64_t)eng_.slot_pos(c) != total) return 0;
+        return match_prefix_against(slot_mm_prologue_[c], slot_cached_toks_[c], total,
+                                    cand, resume_seg, resume_off);
+    }
+
     // Populate matched image token counts from slot c's cached prologue once a hit is chosen.
     void apply_mm_prefix_ntokens(int c, StreamJob & job) const {
         auto & segs = job.segs;
@@ -2234,6 +2284,12 @@ private:
                 if (k == 0 && drafter_ != nullptr) {
                     drafter_in_sync_ = false;
                 }
+            }
+        }
+        if (slot0_ckpt_valid_ && except_slot != 0) {
+            const int ckpt_end = std::max(1, slot0_ckpt_span_);
+            if (start_seg < ckpt_end) {
+                clear_slot0_checkpoint();
             }
         }
     }
@@ -2402,6 +2458,7 @@ private:
             int chosen_slot = -1;
             int chosen_span = 1;
             bool chosen_prefix_hit = false;
+            bool chosen_ckpt_rollback = false;
             int chosen_prefix_len = 0;
             int chosen_resume_seg = 0;
             int chosen_resume_off = 0;
@@ -2463,6 +2520,7 @@ private:
                     int best_hit_span = min_span;
                     int best_hit_seg  = 0;
                     int best_hit_off  = 0;
+                    bool best_hit_ckpt = false;
                     int best_free_slot = -1;
                     int64_t best_free_score = INT64_MIN;
 
@@ -2503,6 +2561,32 @@ private:
                                     best_hit_span = hit_span;
                                     best_hit_seg  = rseg;
                                     best_hit_off  = roff;
+                                    best_hit_ckpt = false;
+                                }
+                            } else if (c == 0) {
+                                // Fallback: exact match against slot 0's prompt-end checkpoint
+                                // (text or multimodal — recovers from 1-token BPE/JSON drift or
+                                // branching turns without cold-prefilling history or re-running ViT).
+                                int crseg = 0, croff = 0;
+                                const int ckpt_len = match_slot0_checkpoint(*cand, &crseg, &croff);
+                                if (ckpt_len > 0) {
+                                    const int hit_span = std::max(min_span, std::max(1, slot0_ckpt_span_));
+                                    bool hit_span_ok = (hit_span <= n_slots);
+                                    for (int s = min_span; hit_span_ok && s < hit_span; ++s) {
+                                        if (seg_owner_[s] != -1 || queue_reserved[s]) hit_span_ok = false;
+                                    }
+                                    const bool skip_for_mtp =
+                                        (strictly_solo && drafter_ != nullptr && cand->allow_mtp &&
+                                         !slot0_ckpt_drafter_valid_ && slot0_ckpt_mm_prologue_.empty() &&
+                                         ckpt_len < 2048);
+                                    if (hit_span_ok && !skip_for_mtp && ckpt_len > best_hit_len) {
+                                        best_hit_len  = ckpt_len;
+                                        best_hit_slot = 0;
+                                        best_hit_span = hit_span;
+                                        best_hit_seg  = crseg;
+                                        best_hit_off  = croff;
+                                        best_hit_ckpt = true;
+                                    }
                                 }
                             }
                         }
@@ -2586,6 +2670,7 @@ private:
                         chosen_slot = best_hit_slot;
                         chosen_span = best_hit_span;
                         chosen_prefix_hit = true;
+                        chosen_ckpt_rollback = best_hit_ckpt;
                         chosen_prefix_len = best_hit_len;
                         chosen_resume_seg = best_hit_seg;
                         chosen_resume_off = best_hit_off;
@@ -2596,6 +2681,7 @@ private:
                         chosen_slot = best_free_slot;
                         chosen_span = min_span;
                         chosen_prefix_hit = false;
+                        chosen_ckpt_rollback = false;
                         chosen_prefix_len = 0;
                         chosen_idx = idx;
                         break;
@@ -2621,8 +2707,11 @@ private:
                                 if (w % align == 0) wscore += 50;
                             }
                             {
-                                int rseg = 0, roff = 0;
-                                if (match_slot_prefix(w, *cand, &rseg, &roff) > 0) wscore += 200;
+                                int rseg = 0, roff = 0, crseg = 0, croff = 0;
+                                if (match_slot_prefix(w, *cand, &rseg, &roff) > 0 ||
+                                    (w == 0 && match_slot0_checkpoint(*cand, &crseg, &croff) > 0)) {
+                                    wscore += 200;
+                                }
                             }
                             if (wscore > best_w_score) {
                                 best_w_score = wscore;
@@ -2686,13 +2775,42 @@ private:
                 if (next_job->max_tokens > max_avail) next_job->max_tokens = max_avail;
 
                 if (chosen_prefix_hit) {
-                    bool span_ok = true;
-                    if (eng_.slot_span(chosen_slot) < chosen_span) {
-                        span_ok = eng_.expand_slot_span(chosen_slot, chosen_span);
-                    } else if (eng_.slot_span(chosen_slot) > chosen_span) {
-                        span_ok = eng_.shrink_slot_span(chosen_slot, chosen_span);
+                    bool hit_ok = true;
+                    if (chosen_ckpt_rollback) {
+                        const int32_t old_pos = eng_.slot_pos(0);
+                        auto t_rb0 = std::chrono::steady_clock::now();
+                        hit_ok = eng_.restore_slot0_checkpoint(slot0_ckpt_eng_);
+                        if (hit_ok) {
+                            if (drafter_ != nullptr) {
+                                if (slot0_ckpt_drafter_valid_ &&
+                                    drafter_->restore_checkpoint(slot0_ckpt_drafter_)) {
+                                    drafter_in_sync_ = true;
+                                } else {
+                                    drafter_in_sync_ = false;
+                                }
+                            }
+                            slot_mm_prologue_[0].clear();
+                            slot_cached_toks_[0] = slot0_ckpt_toks_;
+                            slot_cache_valid_[0] = true;
+                            update_cache_span(0);
+                            const double rb_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_rb0).count();
+                            char buf[192];
+                            std::snprintf(buf, sizeof(buf),
+                                          "Slot s0 prompt-end checkpoint hit: rewound %d -> %d tok in %.1f ms (mtp=%s)",
+                                          old_pos, chosen_prefix_len, rb_ms,
+                                          (drafter_ != nullptr && drafter_in_sync_) ? "sync" : "off");
+                            add_log("INFO", buf);
+                        }
                     }
-                    if (span_ok) {
+                    if (hit_ok) {
+                        if (eng_.slot_span(chosen_slot) < chosen_span) {
+                            hit_ok = eng_.expand_slot_span(chosen_slot, chosen_span);
+                        } else if (eng_.slot_span(chosen_slot) > chosen_span) {
+                            hit_ok = eng_.shrink_slot_span(chosen_slot, chosen_span);
+                        }
+                    }
+                    if (hit_ok) {
                         next_job->sched_cache_hit_tokens = chosen_prefix_len;
                         next_job->prefill_offset = chosen_prefix_len;
                     } else {
@@ -2702,9 +2820,12 @@ private:
                 if (!chosen_prefix_hit) {
                     eng_.reset_slot(chosen_slot, chosen_span);
                     clear_slot_cache(chosen_slot);
-                    if (chosen_slot == 0 && drafter_ != nullptr) {
-                        drafter_->reset();
-                        drafter_in_sync_ = true;
+                    if (chosen_slot == 0) {
+                        clear_slot0_checkpoint();
+                        if (drafter_ != nullptr) {
+                            drafter_->reset();
+                            drafter_in_sync_ = true;
+                        }
                     }
                     next_job->prefill_offset = 0;
                 }
@@ -2714,13 +2835,42 @@ private:
                 // otherwise reset the slot with its allocated span.
                 next_job->live_prompt_toks.store(next_job->est_prompt_toks, std::memory_order_relaxed);
                 if (chosen_prefix_hit) {
-                    bool span_ok = true;
-                    if (eng_.slot_span(chosen_slot) < chosen_span) {
-                        span_ok = eng_.expand_slot_span(chosen_slot, chosen_span);
-                    } else if (eng_.slot_span(chosen_slot) > chosen_span) {
-                        span_ok = eng_.shrink_slot_span(chosen_slot, chosen_span);
+                    bool hit_ok = true;
+                    if (chosen_ckpt_rollback) {
+                        const int32_t old_pos = eng_.slot_pos(0);
+                        auto t_rb0 = std::chrono::steady_clock::now();
+                        hit_ok = eng_.restore_slot0_checkpoint(slot0_ckpt_eng_);
+                        if (hit_ok) {
+                            if (drafter_ != nullptr) {
+                                if (slot0_ckpt_drafter_valid_ &&
+                                    drafter_->restore_checkpoint(slot0_ckpt_drafter_)) {
+                                    drafter_in_sync_ = true;
+                                } else {
+                                    drafter_in_sync_ = false;
+                                }
+                            }
+                            slot_mm_prologue_[0] = slot0_ckpt_mm_prologue_;
+                            slot_cached_toks_[0] = slot0_ckpt_toks_;
+                            slot_cache_valid_[0] = true;
+                            update_cache_span(0);
+                            const double rb_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_rb0).count();
+                            char buf[192];
+                            std::snprintf(buf, sizeof(buf),
+                                          "Slot s0 prompt-end checkpoint hit (mm): rewound %d -> %d tok in %.1f ms (mtp=%s)",
+                                          old_pos, chosen_prefix_len, rb_ms,
+                                          (drafter_ != nullptr && drafter_in_sync_) ? "sync" : "off");
+                            add_log("INFO", buf);
+                        }
                     }
-                    if (!span_ok) {
+                    if (hit_ok) {
+                        if (eng_.slot_span(chosen_slot) < chosen_span) {
+                            hit_ok = eng_.expand_slot_span(chosen_slot, chosen_span);
+                        } else if (eng_.slot_span(chosen_slot) > chosen_span) {
+                            hit_ok = eng_.shrink_slot_span(chosen_slot, chosen_span);
+                        }
+                    }
+                    if (!hit_ok) {
                         chosen_prefix_hit = false;
                     }
                 }
@@ -2746,9 +2896,12 @@ private:
                     next_job->sched_prompt_tokens = 0; // accumulated as segments are encoded
                     eng_.reset_slot(chosen_slot, chosen_span);
                     clear_slot_cache(chosen_slot);
-                    if (chosen_slot == 0 && drafter_ != nullptr) {
-                        drafter_->reset();
-                        drafter_in_sync_ = true;
+                    if (chosen_slot == 0) {
+                        clear_slot0_checkpoint();
+                        if (drafter_ != nullptr) {
+                            drafter_->reset();
+                            drafter_in_sync_ = true;
+                        }
                     }
                     next_job->seg_idx = 0;
                     next_job->seg_offset = 0;
@@ -2779,7 +2932,7 @@ private:
                     if (job->waiting_expand) return; // paused until neighbor drains
                     eng_.reset_slot(c, 1);
                     clear_slot_cache(c);
-                    if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                    if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                     finish_job(job, "stop", true, 400, "Prompt exceeds context window",
                                context_overflow_error_json(request_max_ctx(), total));
                     return;
@@ -2791,7 +2944,7 @@ private:
                                          is_last, is_last ? &logits : nullptr)) {
                 eng_.reset_slot(c, 1);
                 clear_slot_cache(c);
-                if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                 finish_job(job, "stop", true, 500, "Engine prefill failed");
                 return;
             }
@@ -2803,6 +2956,9 @@ private:
             if (is_last) {
                 slot_cache_valid_[c] = true;
                 update_cache_span(c);
+                if (c == 0 && total >= SLOT0_CKPT_MIN_TOKENS) {
+                    save_slot0_checkpoint();
+                }
                 job->sched_prompt_ms = std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - job->t_prefill_start).count();
                 job->t_decode_start = std::chrono::steady_clock::now();
@@ -2835,7 +2991,7 @@ private:
                         if (job->waiting_expand) return;
                         eng_.reset_slot(c, 1);
                         clear_slot_cache(c);
-                        if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                        if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                         finish_job(job, "stop", true, 400, "Multimodal prompt exceeds context window",
                                    context_overflow_error_json(request_max_ctx(), job->sched_prompt_tokens));
                         return;
@@ -2857,7 +3013,7 @@ private:
                                              is_last_overall, is_last_overall ? &logits : nullptr)) {
                     eng_.reset_slot(c, 1);
                     clear_slot_cache(c);
-                    if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                    if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                     finish_job(job, "stop", true, 500, "Text prefill failed");
                     return;
                 }
@@ -2886,7 +3042,7 @@ private:
                         job->cur_vis_gen = 0;
                         eng_.reset_slot(c, 1);
                         clear_slot_cache(c);
-                        if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                        if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                         finish_job(job, "stop", true, 400, "Failed to decode/encode image");
                         return;
                     }
@@ -2909,7 +3065,7 @@ private:
                         job->cur_vis_gen = 0;
                         eng_.reset_slot(c, 1);
                         clear_slot_cache(c);
-                        if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                        if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                         finish_job(job, "stop", true, 400, "Multimodal prompt exceeds context window",
                                    context_overflow_error_json(request_max_ctx(), job->sched_prompt_tokens));
                         return;
@@ -2933,7 +3089,7 @@ private:
                     job->cur_vis_gen = 0;
                     eng_.reset_slot(c, 1);
                     clear_slot_cache(c);
-                    if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+                    if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
                     finish_job(job, "stop", true, 500, "Vision embed prefill failed");
                     return;
                 }
@@ -2952,7 +3108,7 @@ private:
         }
         eng_.reset_slot(c, 1);
         clear_slot_cache(c);
-        if (c == 0 && drafter_) { drafter_->reset(); drafter_in_sync_ = true; }
+        if (c == 0) { clear_slot0_checkpoint(); if (drafter_) { drafter_->reset(); drafter_in_sync_ = true; } }
         finish_job(job, "stop", true, 500, "No logits produced after multimodal prefill");
     }
 
@@ -2999,6 +3155,9 @@ private:
         }
         slot_cache_valid_[c] = true;
         update_cache_span(c);
+        if (c == 0 && slot_cached_total(0) >= SLOT0_CKPT_MIN_TOKENS) {
+            save_slot0_checkpoint();
+        }
     }
 
     void finish_multimodal_prefill(const std::shared_ptr<StreamJob> & job, const std::vector<float> & logits) {
@@ -4127,6 +4286,15 @@ private:
     std::vector<int32_t> slot_cached_toks_[MAX_CONCURRENT_SLOTS];
     bool slot_cache_valid_[MAX_CONCURRENT_SLOTS] = {};
     int slot_cache_span_[MAX_CONCURRENT_SLOTS] = {};
+    // Host-RAM prompt-end checkpoint fallback for slot 0 (0 extra VRAM, text + multimodal).
+    static constexpr int SLOT0_CKPT_MIN_TOKENS = 512;
+    std::vector<SlotCacheSeg> slot0_ckpt_mm_prologue_;
+    std::vector<int32_t> slot0_ckpt_toks_;
+    InklingEngine::Slot0Checkpoint slot0_ckpt_eng_;
+    DSparkDrafter::Checkpoint slot0_ckpt_drafter_;
+    bool slot0_ckpt_valid_ = false;
+    bool slot0_ckpt_drafter_valid_ = false;
+    int  slot0_ckpt_span_ = 0;
     uint64_t slot_last_used_[MAX_CONCURRENT_SLOTS] = {};
     uint64_t sched_lru_seq_ = 0;
     uint64_t vis_encode_gen_ = 0;

@@ -545,6 +545,114 @@ void DSparkDrafter::set_context_rows(int rows) {
     }
 }
 
+bool DSparkDrafter::save_checkpoint(Checkpoint & out) const {
+    if (length_ <= 0 || ctx_ <= 0 || f_rnn_ == nullptr) return false;
+
+    size_t total_bytes = 0;
+    for (int l = 0; l < 3; ++l) {
+        const Layer & L = layers_[l];
+        if (L.local) {
+            const size_t slots = (size_t)WINDOW + BLOCK;
+            total_bytes += 2 * slots * N_KV * 2 + (size_t)WINDOW * 4;
+        } else {
+            const size_t slots = (size_t)ctx_;
+            total_bytes += 2 * slots * N_KV + 2 * slots * N_HEAD_KV * 4 * 2;
+        }
+    }
+    out.layers_blob.resize(total_bytes);
+    out.f_rnn.resize((size_t)N_EMBD);
+
+    size_t off = 0;
+    for (int l = 0; l < 3; ++l) {
+        const Layer & L = layers_[l];
+        if (L.local) {
+            const size_t kv_bytes = ((size_t)WINDOW + BLOCK) * N_KV * 2;
+            const size_t pos_bytes = (size_t)WINDOW * 4;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.k_ctx, kv_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.v_ctx, kv_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.ctx_pos, pos_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += pos_bytes;
+        } else {
+            const size_t kv_bytes = (size_t)ctx_ * N_KV;
+            const size_t d_bytes  = (size_t)ctx_ * N_HEAD_KV * 4 * 2;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.k_ctx, kv_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.d_ctx, d_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += d_bytes;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.v_ctx, kv_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(out.layers_blob.data() + off, L.vd_ctx, d_bytes, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+            off += d_bytes;
+        }
+    }
+    if (hipMemcpyAsync(out.f_rnn.data(), f_rnn_, (size_t)N_EMBD * 2, hipMemcpyDeviceToHost, stream_) != hipSuccess) return false;
+    if (hipStreamSynchronize(stream_) != hipSuccess) return false;
+
+    out.length = length_;
+    out.ctx = ctx_;
+    out.short_E = short_E_;
+    out.short_extra = short_extra_;
+    return true;
+}
+
+bool DSparkDrafter::restore_checkpoint(const Checkpoint & ckpt) {
+    if (ckpt.length <= 0 || ckpt.ctx != ctx_ || f_rnn_ == nullptr) return false;
+    if (ckpt.short_E < 0 || ckpt.short_E > short_E_ ||
+        (int)ckpt.short_extra.size() != ckpt.short_E ||
+        (int)short_extra_.size() < ckpt.short_E ||
+        !std::equal(ckpt.short_extra.begin(), ckpt.short_extra.end(), short_extra_.begin())) {
+        return false;
+    }
+
+    size_t total_bytes = 0;
+    for (int l = 0; l < 3; ++l) {
+        const Layer & L = layers_[l];
+        if (L.local) {
+            const size_t slots = (size_t)WINDOW + BLOCK;
+            total_bytes += 2 * slots * N_KV * 2 + (size_t)WINDOW * 4;
+        } else {
+            const size_t slots = (size_t)ctx_;
+            total_bytes += 2 * slots * N_KV + 2 * slots * N_HEAD_KV * 4 * 2;
+        }
+    }
+    if (ckpt.layers_blob.size() != total_bytes || ckpt.f_rnn.size() != (size_t)N_EMBD) {
+        return false;
+    }
+
+    size_t off = 0;
+    for (int l = 0; l < 3; ++l) {
+        const Layer & L = layers_[l];
+        if (L.local) {
+            const size_t kv_bytes = ((size_t)WINDOW + BLOCK) * N_KV * 2;
+            const size_t pos_bytes = (size_t)WINDOW * 4;
+            if (hipMemcpyAsync(L.k_ctx, ckpt.layers_blob.data() + off, kv_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(L.v_ctx, ckpt.layers_blob.data() + off, kv_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(L.ctx_pos, ckpt.layers_blob.data() + off, pos_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += pos_bytes;
+        } else {
+            const size_t kv_bytes = (size_t)ctx_ * N_KV;
+            const size_t d_bytes  = (size_t)ctx_ * N_HEAD_KV * 4 * 2;
+            if (hipMemcpyAsync(L.k_ctx, ckpt.layers_blob.data() + off, kv_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(L.d_ctx, ckpt.layers_blob.data() + off, d_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += d_bytes;
+            if (hipMemcpyAsync(L.v_ctx, ckpt.layers_blob.data() + off, kv_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += kv_bytes;
+            if (hipMemcpyAsync(L.vd_ctx, ckpt.layers_blob.data() + off, d_bytes, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+            off += d_bytes;
+        }
+    }
+    if (hipMemcpyAsync(f_rnn_, ckpt.f_rnn.data(), (size_t)N_EMBD * 2, hipMemcpyHostToDevice, stream_) != hipSuccess) return false;
+    set_context_rows(ckpt.short_E);
+    if (hipStreamSynchronize(stream_) != hipSuccess) return false;
+    length_ = ckpt.length;
+    return true;
+}
+
 void DSparkDrafter::note_tokens(const int32_t * ids, int n) {
     if (n <= 0) return;
     std::vector<int32_t> add;

@@ -189,6 +189,21 @@ public:
     bool decode_batch(const int32_t * slots, const int32_t * token_ids, int batch_size,
                       int32_t * out_argmax, float * out_logits_buf = nullptr);
 
+    // Host-RAM snapshot of slot 0's mutable non-Global state (40 SWA rings +
+    // 48 short-conv histories) at a prompt boundary. Zero extra VRAM.
+    // Global KV [0..pos) is immutable during subsequent slot-0 decode, so
+    // restore rewinds Global k_pos to `pos`, recomputes the partial Quest
+    // boundary page (if sparse_pages > 0), and uploads SWA + short-conv.
+    struct Slot0Checkpoint {
+        int32_t pos = 0;
+        int32_t swa_cap = 0;
+        KVType  kv_type = KV_Q8_0;
+        std::vector<uint8_t> swa_blob;   // packed SWA slots: k_qs, k_d, v_qs, v_d, k_pos
+        std::vector<float>   sconv_blob; // packed sconv_slots_[0..N_LAYER_SLOTS-1].hist
+    };
+    bool save_slot0_checkpoint(Slot0Checkpoint & out) const;
+    bool restore_slot0_checkpoint(const Slot0Checkpoint & ckpt);
+
     // ========================================================================
     // Step 8A: DSpark MTP speculative decoding support
     // ========================================================================
