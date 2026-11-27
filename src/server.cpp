@@ -1655,7 +1655,7 @@ public:
             }
 
 #ifndef NIB_VERSION
-#define NIB_VERSION "0.2.2"
+#define NIB_VERSION "0.3.0"
 #endif
             const NibDeviceInfo & dev_info = nib_device_info(0);
             const auto now = std::chrono::steady_clock::now();
