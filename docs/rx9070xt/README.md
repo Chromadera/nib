@@ -46,6 +46,32 @@ Re-verified on commit `9de6314` (`-DGPU_TARGET=gfx1201`, ROCm `7.2.4`, Windows/W
   - **`--slots 4 -c 49152 q4_0`:** Single-stream **`96.9 tok/s`** (`74.7 ms` TTFT); aggregate **`95.2` / `128.2` / `163.8 tok/s`** (`c = 1 / 2 / 4`, `42.5 tok/s`/stream & `121.6 ms` TTFT p50 at `c = 4`); prefill **`4,271.2 tok/s`** (`36,967` real tokens) — [`html`](v0.2.1_2026-11-27/bb_All_s4_q4_0_c49152.html) · [`json`](v0.2.1_2026-11-27/bb_All_s4_q4_0_c49152.json).
 - **Stability note:** Two intermittent hangs occurred early on this WSL2 node in `nib bench q4_0` right after graph capture; a 6-run alternating `v0.2.1` vs. `v0.2.0` A/B passed **6/6** cleanly at identical `95.4–95.5 tok/s`, and the full `nib bench` + BetterBench pipeline completed with zero further hangs.
 
+### Nib `v0.4.0` — Native GSQ-RCO, DFlash 2, DSpark & RDNA4 FP8 WMMA Prefill (`2026-11-28`)
+
+Measured natively on an **AMD Radeon RX 9070 XT (16 GB, `gfx1201`, ROCm `7.2.4` Linux)** with full BetterBench `0.6.1` (`corpus v1.0`, `--greedy`, 8 categories × 5 passes = 40 cold-nonce prompts, plus full prefill depth sweep up to each config's max **pure-VRAM** zero-GTT-spill context ceiling) using `--fp8-prefill --ubatch 1024 --sparse-pages 224 --slots 1 --no-vision --spec-threshold 0.8`. All 4 GSQ-RCO models ran with **100% weights in VRAM (`--no-cpu-embd`, `>= 1.0 GiB` free VRAM)**; `NVFP4-All` used `--cpu-embd`.
+
+| Model | KV | Mode | Max Pure-VRAM Ctx | Peak VRAM (`amd-smi`) | Weighted Decode (`tok/s`) | Speedup | Update p99 (`ms`) | TTFT p50 (`ms`) | Peak Prefill (`tok/s`) | Deepest Prefill (`tok/s` @ prompt tok) |
+|---|---|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| **GSQ-RCO-IQ2_S** | `q8_0` | Baseline | **262,144** | 14,890 MB | **97.7** | 1.00× | 10.5 | 99 | 5,289.9 @ 20K | **4,828.5** @ 203,806 tok (42.2 s) |
+| **GSQ-RCO-IQ2_S** | `q8_0` | **DSpark** | 237,568 | 15,277 MB | **140.5** | **1.44×** | 35.1 | 99 | 5,011.7 @ 20K | **4,602.3** @ 184,466 tok (40.1 s) |
+| **GSQ-RCO-IQ2_S** | `q8_0` | **DFlash 2** | 245,760 | 15,265 MB | **138.6** | 1.42× | 38.0 | 109 | 4,786.2 @ 20K | **4,428.8** @ 190,986 tok (43.1 s) |
+| **GSQ-RCO-Q2_K_XL** | `q8_0` | Baseline | **237,568** | 15,195 MB | **96.7** | 1.00× | 10.6 | 101 | 5,246.3 @ 20K | **4,808.1** @ 184,435 tok (38.4 s) |
+| **GSQ-RCO-Q2_K_XL** | `q8_0` | **DSpark** | 196,608 | 15,261 MB | **139.7** | **1.44×** | 35.6 | 100 | 4,964.6 @ 20K | **4,583.9** @ 152,347 tok (33.2 s) |
+| **GSQ-RCO-Q2_K_XL** | `q8_0` | **DFlash 2** | 204,800 | 15,283 MB | **139.4** | **1.44×** | 38.5 | 111 | 4,739.6 @ 20K | **4,414.2** @ 159,038 tok (36.0 s) |
+| **GSQ-RCO-IQ3_XXS** | `q8_0` | Baseline | **188,416** | 15,116 MB | **95.6** | 1.00× | 10.7 | 102 | 5,220.7 @ 20K | **4,777.5** @ 145,864 tok (30.5 s) |
+| **GSQ-RCO-IQ3_XXS** | `q8_0` | **DSpark** | 147,456 | 15,216 MB | **137.9** | 1.44× | 36.5 | 101 | 4,939.4 @ 20K | **4,550.9** @ 114,008 tok (25.1 s) |
+| **GSQ-RCO-IQ3_XXS** | `q8_0` | **DFlash 2** | 155,648 | 15,205 MB | **139.7** | **1.46×** | 39.3 | 112 | 4,753.3 @ 20K | **4,381.4** @ 120,400 tok (27.5 s) |
+| **GSQ-RCO-IQ3_S** | `q8_0` | Baseline | **147,456** | 15,170 MB | **95.3** | 1.00× | 10.8 | 104 | 5,221.3 @ 20K | **4,767.8** @ 113,954 tok (23.9 s) |
+| **GSQ-RCO-IQ3_S** | `q8_0` | **DSpark** | 106,496 | 15,233 MB | **134.6** | 1.41× | 36.5 | 105 | 4,939.3 @ 20K | **4,515.6** @ 81,622 tok (18.1 s) |
+| **GSQ-RCO-IQ3_S** | `q8_0` | **DFlash 2** | 114,688 | 15,226 MB | **136.2** | **1.43×** | 39.4 | 113 | 4,737.0 @ 20K | **4,351.2** @ 88,070 tok (20.2 s) |
+| **NVFP4-All** (`--cpu-embd`) | `q4_1` | Baseline | **45,056** | 15,977 MB | **98.0** | 1.00× | 10.5 | 77 | 5,981.1 @ 20K | **5,780.7** @ 33,638 tok (5.8 s) |
+| **NVFP4-All** (`--cpu-embd`) | `q4_1` | DSpark / DFlash 2 | `✗` OOM (<4K) | — | OOM | — | — | — | — | — |
+| **NVFP4-All** (`--cpu-embd`) | `q8_0` | Baseline | **20,480** | 15,929 MB | **97.4** | 1.00× | 10.5 | 77 | 5,923.0 @ 18K | **5,923.0** @ 14,501 tok (2.4 s) |
+
+**Key findings (`v0.4.0`):**
+- **GSQ-RCO unlocks deep `q8_0` + MTP on 16 GB:** Every ISTA-DASLab GSQ-RCO model holds **106K–262K `q8_0` KV** in pure VRAM (`--no-cpu-embd`) with either drafter online at **134.6–140.5 tok/s** (~**1.4×** faster than `NVFP4-All` Baseline, which cannot fit either drafter on 16 GB). Adding `--cpu-embd` frees another `469 MiB` (+24K–32K `q8_0` context).
+- **DFlash 2 vs. DSpark crossover:** DFlash 2 pulls ahead on higher-fidelity quants (`IQ3_XXS`: `139.7` vs `137.9`; `IQ3_S`: `136.2` vs `134.6`), leads `json` and `math` across all 4 models, and uses **148 MiB less VRAM** (`0.54 GiB` vs `0.68 GiB`) — yielding **+8,192 (+8K) deeper `q8_0` context** on every GSQ-RCO model. DSpark keeps a slight edge on `IQ2_S` (`140.5` vs `138.6`), tighter `update p99` (`35–36.5 ms` vs `38–39.4 ms`), and ~4% faster deep prefill due to its cheaper 3-layer + 32K shortlist draft step (`1.23 ms` vs `3.18 ms`).
+
 ---
 
 ## 2. Why 16 GB Cards Top Out Below 128K–262K (and How to Push Higher)
@@ -120,4 +146,4 @@ Anchored directly to our measured `gfx1201` (RX 9070 XT) bandwidth/WMMA rates an
 ### Caveats & Future RDNA 4 Upside
 1. **ECC overhead (Linux):** Turning GPU ECC **on** reduces usable VRAM slightly and costs roughly **`~5–8%`** effective memory bandwidth on decode-heavy workloads; the projections above assume ECC **off** (matching consumer cards).
 2. **Blower thermals:** Under multi-hour sustained prefill or `c = 4–8` batched serving, the dual-slot `300 W` blower may clock `~2–4%` below an open-air triple-fan RX 9070 XT.
-3. **Untapped native FP8 WMMA (`383 TFLOPS`):** Nib's current RDNA 4 prefill path uses **FP16 WMMA (`191 TFLOPS`)** via `include/nib_arch.h`. Because Navi 48 (`gfx1201`) supports native **`2×`-rate FP8 WMMA (`383 TFLOPS` dense)**, a future FP8 prefill kernel on RDNA 4 could push both RX 9070 XT and R9700 prefill substantially higher.
+3. **Native RDNA 4 FP8 WMMA (`383 TFLOPS`):** Nib `v0.3.0+` ships native RDNA 4 FP8 WMMA MoE prefill (`--fp8-prefill --ubatch 1024`, both NVFP4 and GSQ-RCO), lifting measured RX 9070 XT prefill to **`5,981 tok/s`** (`NVFP4-All`) and **`5,290 tok/s`** (`GSQ-RCO`). Real-hardware R9700 (32 GB) numbers are not yet measured because we have not had access to an R9700 card; the table above remains a theoretical projection until tested on physical hardware.

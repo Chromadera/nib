@@ -7,6 +7,7 @@
 // anyway is a programming error and aborts.
 // ============================================================================
 #include "kernels_wmma_fp8.h"
+#include "kernels_iq.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -35,6 +36,12 @@ void launch_moe_nvfp4_prefill_fp8_wmma(const SoaNVFP4Experts &, const SoaNVFP4Ex
                                        const int32_t *, const float *, MoePrefillScratch &, float *, int,
                                        hipStream_t, const float *, float *, const float *, int) {
     not_built("launch_moe_nvfp4_prefill_fp8_wmma");
+}
+
+void launch_moe_iq_prefill_fp8_wmma(const SoaIQExperts &, const SoaIQExperts &, const float *,
+                                    const int32_t *, const float *, MoePrefillScratch &, float *, int,
+                                    hipStream_t, const float *, float *, const float *, int) {
+    not_built("launch_moe_iq_prefill_fp8_wmma");
 }
 
 void launch_x_to_fp8_rowscale(const float *, uint8_t *, float *, int, hipStream_t) {

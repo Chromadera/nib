@@ -4,12 +4,12 @@
 
 # Nib
 
-**Nib** is a native, zero-framework C++17 / AMD RDNA3 & RDNA4 HIP inference engine for **Inkling 2 Mini** (26B looped hybrid-attention MoE + Vision + DSpark MTP), built from scratch for **AMD RDNA3 (`gfx1100`–`gfx1103`) and RDNA4 (`gfx1200`, `gfx1201`) GPUs**.
+**Nib** is a native, zero-framework C++17 / AMD RDNA3 & RDNA4 HIP inference engine for **Inkling 2 Mini** (26B looped hybrid-attention MoE + Vision + DSpark & DFlash 2 speculative decoding), built from scratch for **AMD RDNA3 (`gfx1100`–`gfx1103`) and RDNA4 (`gfx1200`, `gfx1201`) GPUs**.
 
-It runs end-to-end on **16 GB, 20 GB, and 24–48 GB AMD GPUs** via three native-NVFP4 GGUF tiers (`NVFP4-Mixed`, `NVFP4-23`, `NVFP4-All`) with **zero SGPR/VGPR/private-segment register spills and zero hollow stubs** across every kernel object:
-- **24–48 GB (`RX 7900 XTX`, `Radeon AI PRO R9700`, `W7900`, `W7800`):** Fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **22.18–23.08 GiB true VRAM** (`--slots 1..8`) with a transient single-arena ViT workspace (`~132 MiB` at `1080p`, `~416 MiB` max at `4K`, freed immediately after each encode).
-- **20 GB (`RX 7900 XT`):** With `NVFP4-23` (`14.99 GiB`, `0.00483` KLD), unlocks **full `262,848` `q4_1`/`q4_0` context + DSpark MTP across `--slots 1..8`** (`163.2` solo / `200.9` `c = 4` / `206.4 tok/s` `c = 8` agg) and **`4K` / `2560²` Vision + MTP at `262,848`** with `0 MB` GTT spill.
-- **16 GB (`RX 9070 XT` RDNA4, `RX 7800 XT` RDNA3, `RX 9060 XT` RDNA4):** With `NVFP4-All` (`14.52 GiB`, `0.00529` KLD), runs up to **`73,728`** (`RX 9070 XT`, `4,449–5,092 tok/s` FP16 WMMA prefill, `97.0 tok/s` decode, `163.8 tok/s` `c = 4` agg; `RX 9060 XT`, `56.1 tok/s` decode, `93.9 tok/s` `c = 4` agg) and **`69,632`** (`RX 7800 XT`, `97.9 tok/s` decode, `174.8 tok/s` `c = 8` agg) plus `1080p/1440p` Vision with `0 MB` excess GTT spill.
+It runs end-to-end on **16 GB, 20 GB, and 24–48 GB AMD GPUs** via three native-NVFP4 GGUF tiers (`NVFP4-Mixed`, `NVFP4-23`, `NVFP4-All`) and **ISTA-DASLab GSQ-RCO GGUFs** (`IQ3_S`, `IQ3_XXS`, `Q2_K_XL`, `IQ2_S`) with **zero SGPR/VGPR/private-segment register spills and zero hollow stubs** across every kernel object:
+- **24–48 GB (`RX 7900 XTX`, `Radeon AI PRO R9700`, `W7900`, `W7800`):** Fits **full `262,848` context**, **`Q8_0` KV + centroid-damped Quest sparse attention (`--sparse-pages 224`)**, **lossless DSpark or DFlash 2 Multi-Token Prediction (MTP)**, and the **23-layer Vision Encoder** simultaneously inside **22.18–23.08 GiB true VRAM** (`--slots 1..8`) with a transient single-arena ViT workspace (`~132 MiB` at `1080p`, `~416 MiB` max at `4K`, freed immediately after each encode).
+- **20 GB (`RX 7900 XT`):** With `NVFP4-23` (`14.99 GiB`, `0.00483` KLD), unlocks **full `262,848` `q4_1`/`q4_0` context + MTP across `--slots 1..8`** (`163.2` solo / `200.9` `c = 4` / `206.4 tok/s` `c = 8` agg) and **`4K` / `2560²` Vision + MTP at `262,848`** with `0 MB` GTT spill.
+- **16 GB (`RX 9070 XT` RDNA4, `RX 7800 XT` RDNA3, `RX 9060 XT` RDNA4):** With **ISTA-DASLab GSQ-RCO** (`8.36–10.49 GiB`), unlocks **106K–262K pure-VRAM `q8_0` KV context + DSpark or DFlash 2 MTP** (`134.6–140.5 tok/s` BetterBench weighted decode, `4,351–4,829 tok/s` RDNA4 FP8 WMMA prefill up to `204K` prompt tokens on RX 9070 XT). With **`NVFP4-All`** (`14.52 GiB`, `0.00529` KLD), runs up to `73,728` `q4_0` / `45,056` `q4_1` (`5,781–5,981 tok/s` RDNA4 FP8 prefill, `98.0 tok/s` decode, `163.8 tok/s` `c = 4` agg on RX 9070 XT) and `69,632` (`RX 7800 XT`) / `73,728` (`RX 9060 XT`) plus `1080p/1440p` Vision with `0 MB` excess GTT spill.
 
 ---
 
@@ -67,7 +67,8 @@ Full BetterBench report (RX 7900 XTX): [`docs/betterbench_slots8_262k.html`](doc
 |---|---|---|---:|---:|---:|---:|---|
 | **RX 7900 XTX** | `gfx1100` · 24 GB | `NVFP4-Mixed` · `s8 -c 262848 q8_0` + MTP | `~141 → 134 tok/s` | **`186.8 tok/s`** *(MTP)* | **`268.0 tok/s`** (`c = 8`) | `4,235 → 3,390 tok/s` (`261K`) | [`docs/rx7900xtx/`](docs/rx7900xtx/README.md) |
 | **RX 7900 XT** | `gfx1100` · 20 GB | **`NVFP4-23`** · `s8 -c 262848 q4_1` + MTP | `124.5 → 116.3 tok/s` (`256K`) | **`163.2 tok/s`** *(MTP)* | **`206.4 tok/s`** (`c = 8`) | `4,577 → 3,215 tok/s` (`204K`) | [`docs/rx7900xt/`](docs/rx7900xt/README.md) · [`NVFP4-23`](docs/rx7900xt/nvfp4_23_2026-11-26/README.md) |
-| **RX 9070 XT** | `gfx1201` · 16 GB | **`NVFP4-All`** · `s1 -c 73728` / `s4 -c 49152 q4_0` | `95.5 → 93.4 tok/s` (`72.7K`) | **`97.0 tok/s`** *(no MTP)* | **`163.8 tok/s`** (`c = 4`) | **`4,670 → 4,099 tok/s`** (`56K`) | [`docs/rx9070xt/`](docs/rx9070xt/README.md) |
+| **RX 9070 XT** | `gfx1201` · 16 GB | **`GSQ-RCO` (`IQ2_S`–`IQ3_S`)** · `s1` `106K–262K` **`q8_0`** + DSpark / DFlash 2 | `95.3–97.7 tok/s` *(base)* | **`134.6–140.5 tok/s`** *(MTP)* | — *(solo `s1`)* | **`5,290 → 4,351–4,829 tok/s`** (`82K–204K`, FP8) | [`docs/rx9070xt/`](docs/rx9070xt/README.md) |
+| **RX 9070 XT** | `gfx1201` · 16 GB | **`NVFP4-All`** · `s1 -c 73728` / `s4 -c 49152 q4_0` (`45K q4_1` FP8) | `95.5 → 93.4 tok/s` (`72.7K`) | **`98.0 tok/s`** *(no MTP)* | **`163.8 tok/s`** (`c = 4`) | **`5,981 → 5,781 tok/s`** (`34K`, FP8) | [`docs/rx9070xt/`](docs/rx9070xt/README.md) |
 | **RX 7800 XT** | `gfx1101` · 16 GB | **`NVFP4-All`** · `s1 -c 69632` / `s8 -c 12288` | `97.9 → 93.1 tok/s` (`68.6K`) | **`97.9 tok/s`** *(no MTP)* | **`174.8 tok/s`** (`c = 8`) | `3,251 → 2,452 tok/s` (`53K`) | [`docs/rx7800xt/`](docs/rx7800xt/README.md) |
 | **RX 9060 XT** | `gfx1200` · 16 GB | **`NVFP4-All`** · `s1 -c 73728` / `s4 -c 49152 q4_0` | `55.8 → 53.7 tok/s` (`72.7K`) | **`56.1 tok/s`** *(no MTP)* | **`93.9 tok/s`** (`c = 4`) | `2,852 → 2,243 tok/s` (`56K`) | [`docs/rx9060xt/`](docs/rx9060xt/README.md) |
 
@@ -120,12 +121,12 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 
 ## Architecture
 
-- **Custom RDNA3 & RDNA4 HIP Kernels (`gfx1100`–`gfx1103`, `gfx1200`, `gfx1201`)**: Hand-written Wave32 kernels (`v_dot4_i32_i8`, `v_dot2_f32_f16`, native RDNA3 256-bit and RDNA4 128-bit FP16 WMMA prefill via [`include/nib_arch.h`](include/nib_arch.h), fused RMSNorm+QKV, fused MoE gate/up/down, split-K FlashAttention with relative bias and sinks, and arch-native L0/L1 cache coherence) with **WGP-aware co-residency guards** (safe across 48/42/35/32/30/16-WGP GPUs) and **0 register spills / 0 hollow stubs** verified via `scripts/spill_audit.sh`.
-- **16-Byte-Aligned GPU SoA Repacking (Dynamic Per-Layer NVFP4)**: Loads `NVFP4-Mixed` (`L0..19` NVFP4), `NVFP4-23` (`L0..22` NVFP4), or `NVFP4-All` (`L0..23` NVFP4) directly via `mmap` and dynamically detects each MoE layer's precision (`NVFP4` or `Q8_0`) while repacking weights into coalesced Structure-of-Arrays layouts on GPU in ~1.6s.
-- **Full-Graph Static HIP Graphs**: Single-token decode (288–452 nodes), batched MTP verification (`m=2..8`, 698–704 nodes), DSpark draft steps (4 static graphs), and per-slot-combination multi-stream decode (`B=2..8`) execute with near-zero CPU launch overhead.
-- **Multi-Slot Continuous Batching (`--slots 1..8`)**: Zero-copy Global KV + Quest page partitioning (`65,536` tokens/slot at 4 slots, `32,768` tokens/slot at 8 slots, full `262,848` context on slot 0 when solo), per-slot SWA rings + short-conv histories + prefix KV caches, chunked prefill interleaving, and automatic switch between solo DSpark MTP and batched multi-slot HIP Graphs. Prefix caches cover **multimodal** prompts too: image segments are keyed by a 128-bit content hash, so a conversation that keeps re-sending the same image(s) replays the cached KV instead of re-running the ViT and prefill on every turn.
+- **Custom RDNA3 & RDNA4 HIP Kernels (`gfx1100`–`gfx1103`, `gfx1200`, `gfx1201`)**: Hand-written Wave32 kernels (`v_dot4_i32_i8`, `v_dot2_f32_f16`, native RDNA3 256-bit and RDNA4 128-bit FP16 WMMA prefill, plus **RDNA4 native FP8 WMMA prefill** via `--fp8-prefill --ubatch 1024` on `gfx1200`/`gfx1201`, fused RMSNorm+QKV, fused MoE gate/up/down, split-K FlashAttention with relative bias and sinks, and arch-native L0/L1 cache coherence) with **WGP-aware co-residency guards** (safe across 48/42/35/32/30/16-WGP GPUs) and **0 register spills / 0 hollow stubs** verified via `scripts/spill_audit.sh`.
+- **16-Byte-Aligned GPU SoA Repacking (Dynamic NVFP4, Q8_0, and ISTA-DASLab GSQ-RCO)**: Loads `NVFP4-Mixed` (`L0..19` NVFP4), `NVFP4-23` (`L0..22` NVFP4), `NVFP4-All` (`L0..23` NVFP4), or **ISTA-DASLab GSQ-RCO GGUFs** (`IQ3_S`, `IQ3_XXS`, `Q2_K_XL`, `IQ2_S` — supporting `IQ2_S`, `IQ2_XXS`, `IQ3_S`, `IQ3_XXS`, `Q2_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_0`) directly via `mmap` and repacks weights on GPU into coalesced layouts.
+- **Full-Graph Static HIP Graphs**: Single-token decode (288–452 nodes), batched MTP verification (`m=2..8`, 698–1208 nodes), DSpark & DFlash 2 draft/commit steps, and per-slot-combination multi-stream decode (`B=2..8`) execute with near-zero CPU launch overhead.
+- **Multi-Slot Continuous Batching (`--slots 1..8`)**: Zero-copy Global KV + Quest page partitioning (`65,536` tokens/slot at 4 slots, `32,768` tokens/slot at 8 slots, full `262,848` context on slot 0 when solo), per-slot SWA rings + short-conv histories + prefix KV caches, chunked prefill interleaving, and automatic switch between solo MTP and batched multi-slot HIP Graphs. Prefix caches cover **multimodal** prompts too: image segments are keyed by a 128-bit content hash, so a conversation that keeps re-sending the same image(s) replays the cached KV instead of re-running the ViT and prefill on every turn.
 - **262k Centroid-Damped Quest Sparse Global Attention + SWA**: Sliding-window attention (`1536` cap) paired with native NoPE-basis centroid-damped Quest (`k_mean`, `k_rad`, $\alpha = 0.25$, up to 254 pages; recommended `--sparse-pages 224`) on global attention layers and FWHT-rotated `Q8_0` / `Q4_1` KV cache. Prefill runs **exact dense FA** up to 64K tokens and an exact per-token FP16 WMMA scorer (`>= 224` pages) beyond 64K.
-- **Lossless DSpark MTP Speculative Decoding (Any Temperature)**: 3-layer DSpark drafter (`mtp.safetensors`) with a 32,834-token shortlist head (`models/draft_shortlist.bin`), adaptive confidence-threshold drafting (1–7 draft tokens/round), exact target-model verification + rollback, and lossless rejection sampling at both `temperature = 0` and `temperature > 0` (`top_k`, `min_p`, `top_p`) via a zero-spill GPU verify top-256 kernel.
+- **Lossless DSpark & DFlash 2 MTP Speculative Decoding (Any Temperature)**: Pass either `--mtp models/mtp.safetensors` (3-layer **DSpark** drafter with 32,834-token shortlist head, `~687 MiB` VRAM) or `--mtp models/dflash2` (5-layer **DFlash 2** parallel block drafter with dynamic 2-tap convolutions, bidirectional SWA-2048, and Candidate Path Selector, `~549 MiB` VRAM) — Nib auto-detects the drafter format from the safetensors header. Both use adaptive confidence-threshold drafting (1–7 draft tokens/round), exact target-model verification + rollback, and lossless rejection sampling at `temperature = 0` and `temperature > 0`.
 - **Native Vision Encoder (Aliased Single-Arena Workspace)**: 23-layer ViT (`mmproj-Inkling-2-Mini-Q8_0.gguf`) wired directly into both the CLI and OpenAI multimodal chat API. Non-overlapping ViT activation buffers are packed into a single 256-byte-aligned transient workspace (`~132 MiB` at `1080p`, `~416 MiB` max at `4K`/`2560×2560` — `-56%` peak scratch, bit-identical) that is freed immediately after each encode (leaving only `11–36 MiB` for the projected embeddings), with graceful `HTTP 400` protection if an image exceeds free VRAM.
 - **16–20 GB Tight-VRAM Awareness (`--cpu-embd` & `< 22 GiB` Auto-Defaults)**: Zero behavioral change on `>= 22 GiB` GPUs. On `< 22 GiB` cards (such as 20 GB RX 7900 XT or 16 GB RX 9070 XT / RX 7800 XT / RX 9060 XT), unset flags automatically select `q4_1` KV, size `-c` to preserve safe headroom (including worst-case ViT workspace), and enable `--cpu-embd` (GPU-mapped pinned host RAM for `token_embd.weight`, saving `469.3 MiB` VRAM at `< 0.8%` plain decode delta while keeping `lm_head` in VRAM). Startup logs and `/health` report exact `llm + mtp + vision` VRAM, live `hipMemGetInfo` free VRAM, and PCIe GTT spillover warnings.
 - **Built-in OpenAI-Compatible HTTP Server & Web UI**: Zero-dependency C++ HTTP/SSE server (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`, `/api/activity`, `/api/logs`, `/api/outputs`, `/api/reset-kv`) with live per-slot telemetry and an embedded SPA (Activity, Playground Chat with HTML Live Preview + Save-As folder picker + Files drawer, Load Test, Models, Logs, Performance, Settings, Light/Dark + 11 theme presets).
@@ -138,13 +139,13 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 |---|---|---:|---|---|---|
 | **RX 7900 XTX** | `gfx1100` (RDNA3) | 96 CU / 24 GiB | `NVFP4-Mixed` | **Measured on hardware** ([report](docs/rx7900xtx/README.md)) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + 4K Vision (`22.18–23.08 GiB` @ `--slots 1..8`; WSL2 WDDM: `-c 196608` or `--cpu-embd`) |
 | **RX 7900 XT** | `gfx1100` (RDNA3) | 84 CU / 20 GiB | **`NVFP4-23`** *(or `Mixed`)* | **Measured on hardware** ([Mixed](docs/rx7900xt/README.md) · [NVFP4-23](docs/rx7900xt/nvfp4_23_2026-11-26/README.md)) | **`NVFP4-23`:** full **`262,848`** `q4_1`/`q4_0` + MTP across `--slots 1, 4, 8` (`163.2` solo / `206.4 tok/s` `c = 8` agg) + **`4K`/`2560²` Vision + MTP at `262K` (`s1`)**; `q8_0` up to `256K` (`no MTP`) / `201K` (`+ MTP`). **`NVFP4-Mixed`:** auto-defaults `65K q4_1` `s4` + MTP + `4K` Vision (`128K` `1080p`) |
-| **RX 9070 XT** | `gfx1201` (RDNA4) | 64 CU / 16 GiB | **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx9070xt/README.md)) | Build with `-DGPU_TARGET=gfx1201`; up to **`73,728`** `q4_0` / `65,536` `q4_1` / `32,768` `q8_0` (`s1`, `97.0 tok/s` decode, `4,449–5,092 tok/s` prefill), **`--slots 4` @ `49,152`** (`163.8 tok/s` agg), `1440p` Vision @ `≤ 8K` *(no MTP on 16 GB)* |
-| **RX 7800 XT** | `gfx1101` (RDNA3) | 60 CU / 16 GiB | **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx7800xt/README.md)) | Build with `-DGPU_TARGET=gfx1101`; up to **`69,632`** `q4_0` / `65,536` `q4_1` / `32,768` `q8_0` (`s1`, `97.9 tok/s` decode), **`--slots 4` @ `45,056`** (`159.1 tok/s` agg), **`--slots 8` @ `12,288`** (`174.8 tok/s` agg), `1080p` Vision @ `≤ 20K` *(no MTP on 16 GB)* |
-| **RX 9060 XT (16 GB)** | `gfx1200` (RDNA4) | 32 CU / 16 GiB | **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx9060xt/README.md)) | Build with `-DGPU_TARGET=gfx1200`; up to **`73,728`** `q4_0` (`s1`, `56.1 tok/s` decode, `2,425–2,852 tok/s` prefill), **`--slots 4` @ `49,152`** (`93.9 tok/s` agg, `0` hangs, 452-node co-residency graph; `--cpu-embd`, no MTP) |
-| **Radeon AI PRO R9700** | `gfx1201` (RDNA4) | 64 CU / 32 GiB | `NVFP4-Mixed` | **Silicon-verified `gfx1201`** (RX 9070 XT + [projection](docs/rx9070xt/README.md#3-theoretical-projection--amd-radeon-ai-pro-r9700-32-gb-gfx1201)) | Drop-in `-DGPU_TARGET=gfx1201`; fits full `262,848` `Q8_0` KV + `--sparse-pages 224` + MTP + 4K Vision + `--slots 8` (`~23.4 GiB` peak, ~8 GiB free) |
+| **RX 9070 XT** | `gfx1201` (RDNA4) | 64 CU / 16 GiB | **`GSQ-RCO` (`IQ3_S`–`IQ2_S`)** or **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx9070xt/README.md)) | Build with `-DGPU_TARGET=gfx1201`; **`GSQ-RCO` + `--fp8-prefill --ubatch 1024`**: **`106K–262K` `q8_0` KV + DSpark or DFlash 2** (`134.6–140.5 tok/s` decode, `4,351–4,829 tok/s` deep prefill, 100% VRAM). **`NVFP4-All`**: up to `73,728` `q4_0` / `45,056` `q4_1` FP8 (`98.0 tok/s`, `--slots 4` `163.8 tok/s` agg, no MTP) |
+| **RX 7800 XT** | `gfx1101` (RDNA3) | 60 CU / 16 GiB | **`GSQ-RCO`** or **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx7800xt/README.md)) | Build with `-DGPU_TARGET=gfx1101`; **`NVFP4-All`** up to `69,632` `q4_0` (`97.9 tok/s`), `--slots 8` `174.8 tok/s` agg; **`GSQ-RCO`** unlocks deep `q8_0` + DSpark/DFlash 2 on 16 GB |
+| **RX 9060 XT (16 GB)** | `gfx1200` (RDNA4) | 32 CU / 16 GiB | **`GSQ-RCO`** or **`NVFP4-All`** | **Measured on hardware** ([report](docs/rx9060xt/README.md)) | Build with `-DGPU_TARGET=gfx1200`; **`NVFP4-All`** up to `73,728` `q4_0` (`56.1 tok/s`), `--slots 4` `93.9 tok/s` agg; **`GSQ-RCO`** + `--fp8-prefill` unlocks deep `q8_0` + MTP |
+| **Radeon AI PRO R9700** | `gfx1201` (RDNA4) | 64 CU / 32 GiB | `NVFP4-Mixed` | **Silicon-verified `gfx1201`** (RX 9070 XT + [projection](docs/rx9070xt/README.md#3-theoretical-projection--amd-radeon-ai-pro-r9700-32-gb-gfx1201)) | Drop-in `-DGPU_TARGET=gfx1201`; fits full `262,848` `Q8_0` KV + `--sparse-pages 224` + MTP + 4K Vision + `--slots 8` (`~23.4 GiB` peak, ~8 GiB free) *(theoretical — R9700 hardware not yet tested)* |
 | **Radeon PRO W7900 / W7800** | `gfx1100` (RDNA3) | 96 / 70 CU · 48 / 32 GiB | `NVFP4-Mixed` | **Simulated** (`sim_gpu.sh`) | Full `262,848` ctx + `Q8_0` KV + `--sparse-pages 224` + MTP + 4K Vision (`22.18–23.08 GiB`) |
 
-> **Note on RDNA3 & RDNA4 GPUs**: Five distinct AMD GPUs spanning RDNA3 and RDNA4 — **RX 7900 XTX (`gfx1100`, 24 GB)**, **RX 7900 XT (`gfx1100`, 20 GB)**, **RX 9070 XT (`gfx1201`, 16 GB)**, **RX 7800 XT (`gfx1101`, 16 GB)**, and **RX 9060 XT (`gfx1200`, 16 GB)** — have been verified and benchmarked end-to-end on real silicon (`./build/nib_kernel_test` 9/9 PASS, `nib bench`, and full BetterBench `0.6.1` single-stream, multi-slot concurrency, and long-context prefill). Multi-arch fatbin builds (`gfx1100;gfx1101;gfx1200;gfx1201`) pass `./scripts/spill_audit.sh` with **0 spills / 0 private bytes / 0 stubs across all 19 kernel objects** on both **ROCm 7.2.4 / AMD clang 22** and **HIP 7.16 / AMD clang 24**. See [`docs/rx9070xt/README.md`](docs/rx9070xt/README.md) for the **Radeon AI PRO R9700 (32 GB)** theoretical projection — real-hardware R9700 reports are welcome!
+> **Note on RDNA3 & RDNA4 GPUs**: Five distinct AMD GPUs spanning RDNA3 and RDNA4 — **RX 7900 XTX (`gfx1100`, 24 GB)**, **RX 7900 XT (`gfx1100`, 20 GB)**, **RX 9070 XT (`gfx1201`, 16 GB)**, **RX 7800 XT (`gfx1101`, 16 GB)**, and **RX 9060 XT (`gfx1200`, 16 GB)** — have been verified and benchmarked end-to-end on real silicon (`./build/nib_kernel_test` 9/9 PASS, `nib bench`, and full BetterBench `0.6.1` single-stream, multi-slot concurrency, and long-context prefill). Multi-arch fatbin builds (`gfx1100;gfx1101;gfx1200;gfx1201`) pass `./scripts/spill_audit.sh` with **0 spills / 0 private bytes / 0 stubs across all 23 kernel objects** on both **ROCm 7.2.4 / AMD clang 22** and **HIP 7.16 / AMD clang 24**. See [`docs/rx9070xt/README.md`](docs/rx9070xt/README.md) for the **Radeon AI PRO R9700 (32 GB)** theoretical projection — real-hardware R9700 reports are welcome!
 
 - **Vision VRAM**: `mmproj-Inkling-2-Mini-Q8_0.gguf` takes **`0.32 GiB`** at startup. During each image encode, [`VisionEncoder`](src/vision_encoder.cpp) allocates a single aliased workspace (**`~132 MiB`** at `1080p`, **`~234 MiB`** at `1440p`, **`~416 MiB`** max at `4K`/`2560×2560`) and frees it immediately after encoding (`0 MiB` retained workspace; only the `11–36 MiB` projected embedding buffer stays resident). Pass `--vision-keep-scratch` to keep the workspace resident across images.
 - **16–20 GB Tight-VRAM Tuning**: Passing `--cpu-embd` places `token_embd.weight` (`469.3 MiB`) in GPU-mapped pinned host RAM (`lm_head` stays in VRAM) at `< 0.8%` plain decode cost; pass `--no-cpu-embd` to keep embeddings in VRAM on `< 22 GiB` cards.
@@ -159,7 +160,7 @@ Full breakdown (including MRCR per-bin heatmap, `nexusraven_api_eval`, `docvqa`,
 - CMake ≥ 3.21 and a C++17 host compiler
 - AMD RDNA3 (`gfx1100`–`gfx1103`) or RDNA4 (`gfx1200`, `gfx1201`) GPU (default target `gfx1100`)
 
-> **ROCm / Compiler note:** Zero-spill, zero-stub builds (`./scripts/spill_audit.sh` passing across all 19 kernel objects: 0 SGPR/VGPR spills, 0 private bytes, 0 hollow stubs) are verified on both **HIP 7.16 / AMD clang 24** and stable **ROCm 7.2.4 / AMD clang 22** (on Ubuntu 24.04 ROCm 7.2.4 PIE toolchains, pass `-DCMAKE_EXE_LINKER_FLAGS="-no-pie"` if clang emits non-PIE HIP host stubs).
+> **ROCm / Compiler note:** Zero-spill, zero-stub builds (`./scripts/spill_audit.sh` passing across all 23 kernel objects: 0 SGPR/VGPR spills, 0 private bytes, 0 hollow stubs) are verified on both **HIP 7.16 / AMD clang 24** and stable **ROCm 7.2.4 / AMD clang 22** (on Ubuntu 24.04 ROCm 7.2.4 PIE toolchains, pass `-DCMAKE_EXE_LINKER_FLAGS="-no-pie"` if clang emits non-PIE HIP host stubs).
 
 ### Compile & Spill Audit
 ```bash
@@ -188,20 +189,21 @@ cmake --build build -j
 
 ## Weights Setup
 
-Download **only the GGUF tier for your GPU's VRAM** from Hugging Face ([`degenmeowster/Inkling-2-Mini-Nib-Pack`](https://huggingface.co/degenmeowster/Inkling-2-Mini-Nib-Pack)) into `models/`:
+Download the GGUF tier for your GPU's VRAM from Hugging Face — either [`degenmeowster/Inkling-2-Mini-Nib-Pack`](https://huggingface.co/degenmeowster/Inkling-2-Mini-Nib-Pack) (NVFP4 tiers + DSpark MTP + Vision) or [`ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF) (2–3 bit GSQ-RCO quants for deep `q8_0` context + MTP on 16 GB GPUs) — and optionally the **DFlash 2** drafter ([`incoai/Inkling-2-Mini-DFlash2`](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)):
 
 ```bash
-# 24–48 GB GPUs (RX 7900 XTX, R9700, W7900, W7800) — NVFP4-Mixed + MTP + Vision
+# 24–48 GB GPUs (RX 7900 XTX, R9700, W7900, W7800) — NVFP4-Mixed + DSpark MTP + Vision
 hf download degenmeowster/Inkling-2-Mini-Nib-Pack --local-dir models \
   --include "Inkling-2-Mini-NVFP4-Mixed.gguf" "mtp.safetensors" "draft_shortlist.bin" "mmproj-Inkling-2-Mini-Q8_0.gguf"
 
-# 20 GB GPUs (RX 7900 XT) — NVFP4-23 + MTP + Vision
+# 20 GB GPUs (RX 7900 XT) — NVFP4-23 + DSpark MTP + Vision
 hf download degenmeowster/Inkling-2-Mini-Nib-Pack --local-dir models \
   --include "Inkling-2-Mini-NVFP4-23.gguf" "mtp.safetensors" "draft_shortlist.bin" "mmproj-Inkling-2-Mini-Q8_0.gguf"
 
-# 16 GB GPUs (RX 9070 XT, RX 7800 XT, RX 9060 XT) — NVFP4-All + Vision
-hf download degenmeowster/Inkling-2-Mini-Nib-Pack --local-dir models \
-  --include "Inkling-2-Mini-NVFP4-All.gguf" "mmproj-Inkling-2-Mini-Q8_0.gguf"
+# 16 GB GPUs (RX 9070 XT, RX 7800 XT, RX 9060 XT) — GSQ-RCO (deep q8_0 + MTP) or NVFP4-All
+hf download ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF --local-dir models \
+  --include "Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf"
+hf download incoai/Inkling-2-Mini-DFlash2 --local-dir models/dflash2
 ```
 
 Or place/symlink the files manually in `models/` (or pass paths via CLI flags `-m`, `--mtp`, `--mmproj` or env vars `NIB_MODEL`, `NIB_MMPROJ`):
@@ -210,12 +212,14 @@ Or place/symlink the files manually in `models/` (or pass paths via CLI flags `-
 |---|---|--:|--:|---|
 | `models/Inkling-2-Mini-NVFP4-Mixed.gguf` | NVFP4 (`L0..19` MoE) + Q8_0 (`L20..23` MoE, attn, embd, head) | 16.42 GiB | `0.0033` | **24–48 GB** (native precision grid) |
 | `models/Inkling-2-Mini-NVFP4-23.gguf` | NVFP4 (`L0..22` MoE) + Q8_0 (`L23` MoE, attn, embd, head) | 14.99 GiB | `0.00483` | **20 GB** (`-1.43 GiB`; unlocks 262K + MTP + Vision) |
-| `models/Inkling-2-Mini-NVFP4-All.gguf` | NVFP4 (`L0..23` MoE) + Q8_0 (attn, embd, head) | 14.52 GiB | `0.00529` | **16 GB** (`-1.90 GiB`; unlocks 70–74K + Vision) |
-| `models/mtp.safetensors` | BF16 (repacked to SoA Q8_0 on load) | 606 MiB | — | Official DSpark MTP drafter (`20 GB+`) |
-| `models/draft_shortlist.bin` | int32 vocab map (32,834 rows) | 256 KiB | — | Included in repo; looked up next to `mtp.safetensors` or `models/` |
+| `models/Inkling-2-Mini-NVFP4-All.gguf` | NVFP4 (`L0..23` MoE) + Q8_0 (attn, embd, head) | 14.52 GiB | `0.00529` | **16 GB** (`-1.90 GiB`; up to 74K `q4_0` + Vision, no MTP) |
+| `models/Inkling-2-Mini-GSQ-RCO-{IQ3_S,IQ3_XXS,Q2_K_XL,IQ2_S}.gguf` | ISTA-DASLab GSQ-RCO (IQ2/IQ3/Q2_K MoE + K-quant/Q8_0 dense) | 8.36–10.64 GiB | — | **16 GB** (unlocks **106K–262K `q8_0` KV + DSpark / DFlash 2**) |
+| `models/mtp.safetensors` | BF16 (repacked to SoA Q8_0 on load) | 606 MiB | — | **DSpark** 3-layer MTP drafter (`~687 MiB` VRAM) |
+| `models/dflash2/` | BF16 (repacked to SoA Q8_0 on load) | 945 MiB | — | **DFlash 2** 5-layer parallel block drafter (`~549 MiB` VRAM, auto-detected by `--mtp`) |
+| `models/draft_shortlist.bin` | int32 vocab map (32,834 rows) | 256 KiB | — | Included in repo; used by DSpark (`mtp.safetensors`) |
 | `models/mmproj-Inkling-2-Mini-Q8_0.gguf` | Q8_0 + F16/F32 | 330 MiB | — | Optional 23-layer Vision Encoder |
 
-> **Why three NVFP4 tiers?** Thinking Machines trained and released `Inkling-2-Mini` natively with layers `0..19` MoE experts in NVFP4 and layers `20..23` in MXFP8. `NVFP4-Mixed` matches that native grid for 24 GB+ GPUs, while `NVFP4-23` (`-1.43 GiB`) and `NVFP4-All` (`-1.90 GiB`) extend NVFP4 into `L20..22` / `L20..23` at minimal KLD cost (`0.00483` / `0.00529`, still nearly half the KLD of standard 4-bit GGUFs) so 20 GB and 16 GB RDNA3/RDNA4 cards run smoothly with zero GTT spillover.
+> **Why three NVFP4 tiers + GSQ-RCO?** Thinking Machines trained and released `Inkling-2-Mini` natively with layers `0..19` MoE experts in NVFP4 and layers `20..23` in MXFP8. `NVFP4-Mixed` matches that native grid for 24 GB+ GPUs, while `NVFP4-23` and `NVFP4-All` extend NVFP4 into `L20..23` at minimal KLD cost (`0.00483` / `0.00529`). For 16 GB GPUs that want **deep `q8_0` KV context (106K–262K) AND speculative decoding (135–141 tok/s)**, ISTA-DASLab's GSQ-RCO GGUFs drop model weights to `8.36–10.49 GiB` in VRAM.
 
 ---
 
@@ -240,7 +244,15 @@ HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
   --slots 1 -c 262848 --kv-type q4_1 --sparse-pages 224 \
   --host 127.0.0.1 --port 4444
 
-# 16 GB GPUs (RX 9070 XT, RX 7800 XT, RX 9060 XT): NVFP4-All up to 64K–72K solo or 48K @ 4 slots (no MTP)
+# 16 GB RDNA4 (RX 9070 XT): GSQ-RCO-IQ3_S + 114K q8_0 KV + DFlash 2 + FP8 WMMA prefill (100% VRAM)
+./build/nib serve \
+  -m models/Inkling-2-Mini-GSQ-RCO-IQ3_S.gguf \
+  --mtp models/dflash2 \
+  --no-vision --slots 1 -c 114688 --kv-type q8_0 --sparse-pages 224 \
+  --fp8-prefill --ubatch 1024 \
+  --host 127.0.0.1 --port 4444
+
+# 16 GB GPUs (NVFP4-All): up to 64K–72K solo or 48K @ 4 slots (no MTP)
 ./build/nib serve \
   -m models/Inkling-2-Mini-NVFP4-All.gguf \
   --slots 1 -c 65536 --kv-type q4_0 --sparse-pages 224 --cpu-embd \

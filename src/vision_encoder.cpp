@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "vision_encoder.hpp"
+#include "kernels_iq.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -68,6 +69,7 @@ enum : uint32_t {
 enum : uint32_t {
     GGML_T_F32  = 0,
     GGML_T_Q8_0 = 8,
+    GGML_T_BF16 = 30,
 };
 
 struct VReader {
@@ -141,6 +143,7 @@ struct VTensorInfo {
     size_t n_bytes() const {
         if (type == GGML_T_F32)  return n_elems() * 4;
         if (type == GGML_T_Q8_0) return (n_elems() / 32) * 34;
+        if (type == GGML_T_BF16) return n_elems() * 2;
         throw std::runtime_error("mmproj gguf: unsupported tensor type for " + name);
     }
 };
@@ -326,15 +329,26 @@ bool VisionEncoder::init(const std::string & mmproj_path, hipStream_t stream) {
             return d;
         };
 
-        // Reusable staging buffer for Q8_0 repacking (max tensor is mm.1.weight: 4096*4096/32*34 = 17.8 MB)
+        // Reusable staging buffer for Q8_0 / BF16 repacking
         size_t max_q8_bytes = 0;
         for (const auto & kv : tmap) {
-            if (kv.second.type == GGML_T_Q8_0) {
+            if (kv.second.type == GGML_T_Q8_0 || kv.second.type == GGML_T_BF16) {
                 max_q8_bytes = std::max(max_q8_bytes, kv.second.n_bytes());
             }
         }
         void * d_stage = nullptr;
         V_HIP_CHECK(hipMalloc(&d_stage, max_q8_bytes));
+
+        auto repack_matrix = [&](const VTensorInfo & ti, int rows, int K, int8_t * qs, __half * d, int row_off) {
+            V_HIP_CHECK(hipMemcpyAsync(d_stage, data_ptr + ti.offset, ti.n_bytes(), hipMemcpyHostToDevice, stream_));
+            if (ti.type == GGML_T_Q8_0) {
+                detail::repack_q8_0_to_soa(d_stage, qs, d, rows, K, row_off, stream_);
+            } else if (ti.type == GGML_T_BF16) {
+                detail::repack_dense_to_soa_q8(ti.type, d_stage, qs, d, rows, K, row_off, stream_);
+            } else {
+                throw std::runtime_error("mmproj gguf: unsupported matrix type for " + ti.name);
+            }
+        };
 
         auto load_q8_soa = [&](const std::string & name) -> SoaQ8Matrix {
             const auto & ti = get_tensor(name);
@@ -345,8 +359,7 @@ bool VisionEncoder::init(const std::string & mmproj_path, hipStream_t stream) {
             m.K    = K;
             m.qs   = static_cast<int8_t *>(alloc_w((size_t)rows * K));
             m.d    = static_cast<__half *>(alloc_w((size_t)rows * (K / 32) * sizeof(__half)));
-            V_HIP_CHECK(hipMemcpyAsync(d_stage, data_ptr + ti.offset, ti.n_bytes(), hipMemcpyHostToDevice, stream_));
-            detail::repack_q8_0_to_soa(d_stage, m.qs, m.d, rows, K, 0, stream_);
+            repack_matrix(ti, rows, K, m.qs, m.d, 0);
             return m;
         };
 
@@ -388,8 +401,7 @@ bool VisionEncoder::init(const std::string & mmproj_path, hipStream_t stream) {
             L.qkv_b = static_cast<float *>(alloc_w((size_t)(3 * D) * sizeof(float)));
             for (int j = 0; j < 3; ++j) {
                 const auto & tw = get_tensor(pfx + qkv_names[j]);
-                V_HIP_CHECK(hipMemcpyAsync(d_stage, data_ptr + tw.offset, tw.n_bytes(), hipMemcpyHostToDevice, stream_));
-                detail::repack_q8_0_to_soa(d_stage, L.qkv_w.qs, L.qkv_w.d, D, D, j * D, stream_);
+                repack_matrix(tw, D, D, L.qkv_w.qs, L.qkv_w.d, j * D);
 
                 const auto & tb = get_tensor(pfx + qkv_bnames[j]);
                 V_HIP_CHECK(hipMemcpyAsync(L.qkv_b + j * D, data_ptr + tb.offset, tb.n_bytes(),

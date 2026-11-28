@@ -9,6 +9,7 @@
 #include "kernels_step7j_fdot2.h"
 #include "kernels_mtp_verify.h"
 #include "kernels_verify_batch.h"
+#include "kernels_iq.h"
 
 // Step 7F: per-stage launchers of the shipped MoE decode (src/kernels_gemv_soa.hip),
 // split out so each stage can be A/B benchmarked against its kernels_moe_v3
@@ -263,12 +264,15 @@ bool InklingEngine::init(const std::string & model_path, const EngineConfig & cf
     }
     if (cfg_.fp8_prefill != FP8_PREFILL_OFF && set_fp8_prefill(cfg_.fp8_prefill)) {
         bool any_nvfp4 = false;
+        bool any_iq    = false;
         for (int il = 0; il < N_LAYER_PHYS; ++il) {
             any_nvfp4 |= weights_.layers[il].is_nvfp4;
+            any_iq    |= weights_.layers[il].is_iq_moe;
         }
-        std::printf("[nib] prefill: FP8 WMMA NVFP4 MoE (%s, M>%d, ubatch=%d)%s\n", nib_device_info().gcn_arch,
-                    cfg_.fp8_min_m, cfg_.prefill_ubatch,
-                    any_nvfp4 ? "" : " -- this model has no NVFP4 expert layers: no effect");
+        const char * moe_kind = (any_nvfp4 && any_iq) ? "NVFP4+IQ" : any_iq ? "IQ" : "NVFP4";
+        std::printf("[nib] prefill: FP8 WMMA %s MoE (%s, M>%d, ubatch=%d)%s\n", moe_kind,
+                    nib_device_info().gcn_arch, cfg_.fp8_min_m, cfg_.prefill_ubatch,
+                    (any_nvfp4 || any_iq) ? "" : " -- this model has no NVFP4/IQ expert layers: no effect");
     }
     std::fflush(stdout);
     // Step 7K: the fa_*_v4 defaults reorder the split-K combine by <= 1 ulp and
@@ -2123,6 +2127,14 @@ void InklingEngine::record_layer(
                                                L.ffn_post_conv, ffn_hist, buf_ffn_inp_ + (size_t)vr * N_EMBD,
                                                buf_router_scratch_,
                                                (ffn_raw != nullptr) ? (ffn_raw + (size_t)vr * N_SCONV_CHANNELS) : nullptr);
+            } else if (L.is_iq_moe) {
+                launch_moe_iq_decode(L.gate_up_iq, L.down_iq,
+                                     x_norm_ + (size_t)vr * N_EMBD,
+                                     topk_ids_ + (size_t)vr * TOP_K,
+                                     topk_w_ + (size_t)vr * TOP_K,
+                                     buf_verify_act_, cur_out + (size_t)vr * N_EMBD, stream_,
+                                     L.ffn_post_conv, ffn_hist, buf_ffn_inp_ + (size_t)vr * N_EMBD,
+                                     (ffn_raw != nullptr) ? (ffn_raw + (size_t)vr * N_SCONV_CHANNELS) : nullptr);
             } else {
                 launch_moe_q8_decode(L.gate_up_q8, L.down_q8,
                                      x_norm_ + (size_t)vr * N_EMBD,
@@ -2193,6 +2205,17 @@ void InklingEngine::record_layer(
                 }
                 std::fflush(stdout);
             }
+        } else if (L.is_iq_moe) {
+            launch_verify_moe_gu_iq(L.gate_up_iq, x_norm_, N_EMBD,
+                                    d_verify_unique_, d_verify_mask_, d_verify_slot_,
+                                    d_verify_w_, d_verify_cnt_, d_verify_list_,
+                                    d_num_unique_, n_tokens,
+                                    buf_verify_act_, stream_);
+            launch_verify_moe_dn_iq(L.down_iq, buf_verify_act_,
+                                    d_verify_unique_, d_verify_mask_, d_verify_slot_,
+                                    d_verify_w_, d_verify_cnt_, d_verify_list_,
+                                    d_num_unique_, n_tokens,
+                                    buf_moe_slot_, stream_);
         } else {
             launch_verify_moe_gu_q8(L.gate_up_q8, x_norm_, N_EMBD,
                                     d_verify_unique_, d_verify_mask_, d_verify_slot_,
@@ -2285,6 +2308,11 @@ void InklingEngine::record_layer(
                     topk_ids_, topk_w_, buf_moe_act_dec_, cur_out, stream_,
                     L.ffn_post_conv, ffn_hist, buf_ffn_inp_);
             }
+        } else if (L.is_iq_moe) {
+            launch_moe_iq_decode(
+                L.gate_up_iq, L.down_iq, x_norm_,
+                topk_ids_, topk_w_, buf_moe_act_dec_, cur_out, stream_,
+                L.ffn_post_conv, ffn_hist, buf_ffn_inp_, ffn_raw);
         } else {
             if (cfg_.fdot2_q8moe == 1) {
                 launch_moe_q8_fdot2_fused(
@@ -2342,6 +2370,16 @@ void InklingEngine::record_layer(
                 L.gate_up_nvfp4, L.down_nvfp4, x_norm_,
                 topk_ids_, topk_w_, moe_scratch_, cur_out, n_tokens, stream_,
                 L.ffn_post_conv, ffn_hist, buf_ffn_inp_);
+        } else if (L.is_iq_moe && fp8_moe_prefill_ && n_tokens > cfg_.fp8_min_m) {
+            launch_moe_iq_prefill_fp8_wmma(
+                L.gate_up_iq, L.down_iq, x_norm_,
+                topk_ids_, topk_w_, moe_scratch_, cur_out, n_tokens, stream_,
+                L.ffn_post_conv, ffn_hist, buf_ffn_inp_, cfg_.prefill_ubatch);
+        } else if (L.is_iq_moe) {
+            launch_moe_iq_prefill_wmma(
+                L.gate_up_iq, L.down_iq, x_norm_,
+                topk_ids_, topk_w_, moe_scratch_, cur_out, n_tokens, stream_,
+                L.ffn_post_conv, ffn_hist, buf_ffn_inp_, cfg_.prefill_ubatch);
         } else {
             launch_moe_q8_prefill_wmma(
                 L.gate_up_q8, L.down_q8, x_norm_,

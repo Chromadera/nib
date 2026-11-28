@@ -1496,7 +1496,7 @@ struct StreamJob {
 class InklingServer {
 public:
     InklingServer(InklingEngine & eng, const BpeTokenizer & bpe,
-                  DSparkDrafter * drafter, VisionEncoder * vision,
+                  SpecDrafter * drafter, VisionEncoder * vision,
                   const ServerConfig & cfg)
         : eng_(eng), bpe_(bpe), drafter_(drafter), vision_(vision), cfg_(cfg),
           start_time_(std::chrono::steady_clock::now()) {
@@ -4345,7 +4345,7 @@ private:
 
     InklingEngine & eng_;
     const BpeTokenizer & bpe_;
-    DSparkDrafter * drafter_;
+    SpecDrafter * drafter_;
     VisionEncoder * vision_;
     ServerConfig cfg_;
 
@@ -4383,7 +4383,7 @@ private:
     std::vector<SlotCacheSeg> slot0_ckpt_mm_prologue_;
     std::vector<int32_t> slot0_ckpt_toks_;
     InklingEngine::Slot0Checkpoint slot0_ckpt_eng_;
-    DSparkDrafter::Checkpoint slot0_ckpt_drafter_;
+    SpecDrafter::Checkpoint slot0_ckpt_drafter_;
     bool slot0_ckpt_valid_ = false;
     bool slot0_ckpt_drafter_valid_ = false;
     int  slot0_ckpt_span_ = 0;
@@ -4417,7 +4417,7 @@ private:
 int run_http_server(
     InklingEngine & eng,
     const BpeTokenizer & bpe,
-    DSparkDrafter * drafter,
+    SpecDrafter * drafter,
     VisionEncoder * vision,
     const ServerConfig & cfg)
 {

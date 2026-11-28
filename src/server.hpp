@@ -1,7 +1,7 @@
 #pragma once
 
 #include "bpe_tokenizer.hpp"
-#include "dspark_mtp.h"
+#include "dflash2_mtp.h"
 #include "engine.hpp"
 #include "vision_encoder.hpp"
 
@@ -33,7 +33,7 @@ struct ServerConfig {
 int run_http_server(
     InklingEngine & eng,
     const BpeTokenizer & bpe,
-    DSparkDrafter * drafter,      // nullptr if --mtp not loaded
+    SpecDrafter * drafter,        // nullptr if --mtp not loaded
     VisionEncoder * vision,       // nullptr if --mmproj not loaded
     const ServerConfig & cfg);
 

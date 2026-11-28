@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "nib_arch.h"
+#include "iq_types.h"
 
 namespace inkling {
 
@@ -237,11 +238,14 @@ struct PhysLayerWeights {
     __half * ffn_gate_inp   = nullptr; // [128, 2304] FP16 on GPU (converted from F32 at load)
     float  * ffn_exp_probs_b = nullptr; // [128] (optional, present in Inkling 2 Mini)
 
-    // Routed MoE experts (only one pair populated depending on is_nvfp4)
+    // Routed MoE experts (only one pair populated depending on is_nvfp4 / is_iq_moe)
     SoaNVFP4Experts gate_up_nvfp4; // [128, 2304, 2304]
     SoaNVFP4Experts down_nvfp4;    // [128, 2304, 1152]
     SoaQ8Experts    gate_up_q8;    // [128, 2304, 2304]
     SoaQ8Experts    down_q8;       // [128, 2304, 1152]
+    bool            is_iq_moe = false;
+    SoaIQExperts    gate_up_iq;    // [128, 2304, 2304] (GSQ-RCO IQ/Q2_0)
+    SoaIQExperts    down_iq;       // [128, 2304, 1152] (GSQ-RCO Q2_0/IQ4_NL)
 };
 
 struct LoopLayerWeights {
@@ -304,6 +308,10 @@ bool load_inkling_gguf(
     TokenizerData & out_tok,
     bool verify_repack_self_test = false,
     bool tok_embd_host = false);
+
+// Lightweight GGUF header scan returning exact post-repack GPU weight VRAM bytes
+// (returns 0 on error so callers can fall back to file size).
+size_t estimate_gguf_gpu_weight_bytes(const std::string & path, bool tok_embd_host);
 
 // ============================================================================
 // Core Wave32 Kernels API (src/kernels_core.hip)

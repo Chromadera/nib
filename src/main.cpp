@@ -1,5 +1,5 @@
 #include "bpe_tokenizer.hpp"
-#include "dspark_mtp.h"
+#include "dflash2_mtp.h"
 #include "engine.hpp"
 #include "server.hpp"
 #include "sparse_global.h"
@@ -104,7 +104,7 @@ static double compute_nll_from_logits(
 }
 
 #ifndef NIB_VERSION
-#define NIB_VERSION "0.3.0"
+#define NIB_VERSION "0.4.0"
 #endif
 #ifndef NIB_GIT_SHA
 #define NIB_GIT_SHA "unknown"
@@ -208,20 +208,28 @@ static void apply_vram_profile(EngineConfig & cfg, const VramProfileIn & in) {
         std::printf("[vram]   --kv-type not set -> q4_1 (5.0 bits/val, ~40%% of q8_0 KV bytes; PPL-neutral on this model)\n");
     }
 
-    const bool   mtp_on     = !in.mtp_path.empty();
-    const size_t model_b    = file_size_or_zero(in.model_path);
-    if (model_b == 0) {
+    const bool   mtp_on       = !in.mtp_path.empty();
+    const size_t file_b       = file_size_or_zero(in.model_path);
+    if (file_b == 0) {
         std::printf("[vram]   cannot stat model '%s'; keeping -c %d\n", in.model_path.c_str(), cfg.max_ctx);
         return;
     }
-    const size_t tok_embd_b = (size_t)VOCAB_PADDED * N_EMBD + (size_t)VOCAB_PADDED * (N_EMBD / 32) * sizeof(__half);
+    const size_t tok_embd_b   = (size_t)VOCAB_PADDED * N_EMBD + (size_t)VOCAB_PADDED * (N_EMBD / 32) * sizeof(__half);
+    const size_t est_gpu_full = estimate_gguf_gpu_weight_bytes(in.model_path, false);
+    const size_t est_gpu_host = estimate_gguf_gpu_weight_bytes(in.model_path, true);
+    const size_t model_b      = (est_gpu_full > 0) ? est_gpu_full : file_b;
+    const size_t model_b_host = (est_gpu_host > 0) ? est_gpu_host : (model_b > tok_embd_b ? model_b - tok_embd_b : 0);
     if (model_b > dev_total) {
         std::printf("[vram]   WARNING: model weights (%.2f GiB) exceed total GPU VRAM (%.2f GiB) — "
                     "a >=20 GiB GPU (e.g. Radeon AI PRO R9700 32 GB / RX 7900 XT 20 GB / XTX 24 GB) is required "
                     "for full resident weights.\n",
                     (double)model_b / kGiB, (double)dev_total / kGiB);
     }
-    const size_t mtp_b      = mtp_on ? file_size_or_zero(in.mtp_path) + (size_t)96 * 1024 * 1024 : 0;
+    const size_t mtp_b      = mtp_on
+        ? (DFlash2Drafter::is_dflash2_checkpoint(in.mtp_path)
+               ? DFlash2Drafter::estimate_vram_bytes()
+               : file_size_or_zero(in.mtp_path) + (size_t)96 * 1024 * 1024)
+        : 0;
     const size_t vis_w_b    = in.vision_on ? file_size_or_zero(in.mmproj_path) : 0;
     const size_t vis_ws_b   = in.vision_on ? VisionEncoder().estimate_max_encode_bytes() : 0;
     const size_t runtime_b  = (size_t)(0.42 * kGiB);   // measured ~0.41 GiB on RX 7900 XT / WSL2 (MTP + vision + graphs)
@@ -231,7 +239,7 @@ static void apply_vram_profile(EngineConfig & cfg, const VramProfileIn & in) {
 
     // Free VRAM projected after loading everything with `c` and `host_embd`.
     auto projected_free = [&](const EngineConfig & c, bool host_embd) -> double {
-        const double used = (double)(model_b - (host_embd ? tok_embd_b : 0)) + (double)mtp_b + (double)vis_w_b
+        const double used = (double)(host_embd ? model_b_host : model_b) + (double)mtp_b + (double)vis_w_b
                           + (double)runtime_b + (double)InklingEngine::estimate_state_bytes(c, mtp_on);
         return (double)dev_free - used;
     };
@@ -305,7 +313,7 @@ namespace {
 
 struct MtpSession {
     InklingEngine * eng = nullptr;
-    DSparkDrafter * drafter = nullptr;
+    SpecDrafter   * drafter = nullptr;
     float           threshold = 0.8f;
     bool            active = false;
 
@@ -329,7 +337,7 @@ struct MtpSession {
 bool mtp_session_init(MtpSession & s, const std::string & mtp_path, InklingEngine & eng,
                       float threshold, bool verbose,
                       int draft_ctx = DSparkDrafter::DEFAULT_DRAFT_CTX) {
-    static DSparkDrafter holder;  // one drafter per process (see mtp_session_init callers)
+    static SpecDrafter holder;  // one drafter per process (see mtp_session_init callers)
     s.eng = &eng;
     s.threshold = threshold;
     s.drafter = &holder;
@@ -346,8 +354,8 @@ bool mtp_session_init(MtpSession & s, const std::string & mtp_path, InklingEngin
     if (verbose) {
         const double mtp_gib = (double)s.drafter->vram_bytes() / (1024.0 * 1024.0 * 1024.0);
         const double tot_gib = (double)(eng.total_vram_bytes() + s.drafter->vram_bytes()) / (1024.0 * 1024.0 * 1024.0);
-        std::printf("[mtp] drafter online (threshold=%.2f, ctx=%d, shortlist=%d rows, mtp=%.2f GiB, vram=%.2f GiB total)\n",
-                    threshold, s.drafter->ctx(), s.drafter->short_rows(), mtp_gib, tot_gib);
+        std::printf("[mtp] %s drafter online (threshold=%.2f, ctx=%d, head=%d rows, mtp=%.2f GiB, vram=%.2f GiB total)\n",
+                    s.drafter->kind_name(), threshold, s.drafter->ctx(), s.drafter->short_rows(), mtp_gib, tot_gib);
         std::fflush(stdout);
     }
     return true;
@@ -414,19 +422,19 @@ bool mtp_generate(MtpSession & s, int32_t anchor, int n_gen, std::vector<int32_t
         const int32_t * target = eng.host_target_ids();
         if (std::getenv("INKLING_MTP_DEBUG") != nullptr && s.rounds < 4) {
             {
-                static std::vector<int32_t> cand(7 * 1024);
-                static std::vector<float> cval(7 * 1024);
+                const int ck = s.drafter->cand_k();
+                std::vector<int32_t> cand((size_t)7 * ck);
+                std::vector<float> cval((size_t)7 * ck);
                 (void)hipMemcpy(cand.data(), s.drafter->debug_cand_idx(), cand.size() * 4, hipMemcpyDeviceToHost);
                 (void)hipMemcpy(cval.data(), s.drafter->debug_cand_val(), cval.size() * 4, hipMemcpyDeviceToHost);
                 int in0 = -1, in1 = -1;
-                for (int k = 0; k < 1024; ++k) {
+                for (int k = 0; k < ck; ++k) {
                     if (cand[(size_t)k] == target[0]) in0 = k;
-                    if (cand[(size_t)k] == target[1]) in1 = k;
+                    if (cand[(size_t)ck + k] == target[1]) in1 = k;
                 }
-                // rank of target[0] by base value among candidates (like the Markov head would see)
                 std::printf("  [mtp-dbg] target0=%d in_cands=%d (val %.3f) | target1=%d in_cands=%d | base_max0=%.3f\n",
                             target[0], in0, in0 >= 0 ? cval[(size_t)in0] : 0.0f, target[1], in1,
-                            *std::max_element(cval.begin(), cval.begin() + 1024));
+                            *std::max_element(cval.begin(), cval.begin() + ck));
             }
             std::printf("  [mtp-dbg] P=%d m=%d conf=[", P, m);
             for (int i = 0; i < 7; ++i) std::printf("%.3f%s", conf_f[i], i < 6 ? " " : "");
@@ -513,7 +521,7 @@ bool st_logits_equal(const std::vector<float> & a, const std::vector<float> & b,
 }
 
 // Prefill the fixture prompt on a fresh state (and a fresh drafter context).
-bool st_prefill_fixture(InklingEngine & eng, DSparkDrafter * dr, const std::vector<int32_t> & prompt,
+bool st_prefill_fixture(InklingEngine & eng, SpecDrafter * dr, const std::vector<int32_t> & prompt,
                         std::vector<float> * logits) {
     eng.reset_state();
     if (dr) dr->reset();
@@ -778,7 +786,7 @@ int run_selftest_fp8_prefill(InklingEngine & eng, int32_t min_m) {
     return pass ? 0 : 1;
 }
 
-SelftestResult run_selftest_mtp(InklingEngine & eng, DSparkDrafter & dr, float threshold, bool bench) {
+SelftestResult run_selftest_mtp(InklingEngine & eng, SpecDrafter & dr, float threshold, bool bench) {
     SelftestResult res;
     const std::vector<int32_t> prompt = { 1, 100, 200, 300, 400 };
     const int32_t probe = 77;
@@ -790,7 +798,8 @@ SelftestResult run_selftest_mtp(InklingEngine & eng, DSparkDrafter & dr, float t
     {
         // anchor sensitivity: the block input must depend on the anchor token
         std::vector<float> l0(N_EMBD);
-        std::vector<float> b0(7 * 1024), b1(7 * 1024);
+        const size_t ncand = (size_t)7 * (size_t)dr.cand_k();
+        std::vector<float> b0(ncand), b1(ncand);
         (void)hipStreamSynchronize(eng.stream());
         (void)dr.draft(100, 5);
         (void)dr.debug_base_copy(b0.data());
@@ -1369,7 +1378,7 @@ int main(int argc, char ** argv) {
             failures += run_selftest_fp8_prefill(eng, cfg.fp8_min_m);
         }
         if (!mtp_path.empty()) {
-            DSparkDrafter dr;
+            SpecDrafter dr;
             if (!eng.enable_mtp_io()) { std::fprintf(stderr, "enable_mtp_io failed\n"); return 1; }
             if (!dr.init(mtp_path, eng.weights(), eng.max_ctx(), VOCAB_UNPADDED, eng.stream(), draft_ctx)) return 1;
             eng.set_tap_hook([&dr](const uint16_t * taps, const int32_t * toks, int n, int start) {
@@ -1799,7 +1808,7 @@ int main(int argc, char ** argv) {
         bpe.init(eng.tokenizer());
 
         MtpSession mtp;
-        DSparkDrafter * drafter_ptr = nullptr;
+        SpecDrafter * drafter_ptr = nullptr;
         if (!mtp_path.empty()) {
             if (!mtp_session_init(mtp, mtp_path, eng, spec_threshold, true, draft_ctx)) return 1;
             drafter_ptr = mtp.drafter;

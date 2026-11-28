@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(nib VERSION 0.3.0 LANGUAGES CXX)
+project(nib VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -115,10 +115,30 @@ add_hip_object(kernels_dspark_mtp    "src/kernels_dspark_mtp.hip"
 add_hip_object(kernels_verify_batch  "src/kernels_verify_batch.hip"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_verify_batch.h")
 
+add_hip_object(repack_iq             "src/repack_iq.hip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_types.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_tables.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_dequant_device.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_iq.h")
+add_hip_object(kernels_moe_iq        "src/kernels_moe_iq.hip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_types.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_tables.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_dequant_device.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_iq.h")
+add_hip_object(kernels_dflash2_mtp   "src/kernels_dflash2_mtp.hip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/dflash2_mtp_kernels.h")
+
 if(NIB_HAVE_RDNA4_FP8)
     add_hip_object(kernels_wmma_fp8  "src/kernels_wmma_fp8_rdna4.hip"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/nib_arch_fp8.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_wmma_fp8.h")
+    add_hip_object(kernels_wmma_fp8_iq "src/kernels_wmma_fp8_iq_rdna4.hip"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/nib_arch_fp8.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_wmma_fp8.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_types.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_tables.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/iq_dequant_device.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/kernels_iq.h")
 endif()
 
 set(NIB_HIP_OBJECTS
@@ -140,10 +160,13 @@ set(NIB_HIP_OBJECTS
     ${kernels_mtp_verify_OBJ}
     ${kernels_dspark_mtp_OBJ}
     ${kernels_verify_batch_OBJ}
+    ${repack_iq_OBJ}
+    ${kernels_moe_iq_OBJ}
+    ${kernels_dflash2_mtp_OBJ}
 )
 set(NIB_FP8_HOST_SOURCES "")
 if(NIB_HAVE_RDNA4_FP8)
-    list(APPEND NIB_HIP_OBJECTS ${kernels_wmma_fp8_OBJ})
+    list(APPEND NIB_HIP_OBJECTS ${kernels_wmma_fp8_OBJ} ${kernels_wmma_fp8_iq_OBJ})
 else()
     set(NIB_FP8_HOST_SOURCES src/kernels_wmma_fp8_stub.cpp)
 endif()
@@ -154,6 +177,7 @@ add_executable(nib
     src/gguf_loader.cpp
     src/engine.cpp
     src/dspark_mtp.cpp
+    src/dflash2_mtp.cpp
     src/vision_encoder.cpp
     src/server.cpp
     src/main.cpp
