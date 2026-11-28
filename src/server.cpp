@@ -2,6 +2,7 @@
 #include "server_ui.hpp"
 #include "nib_logo.hpp"
 #include "kernels_mtp_verify.h"
+#include "json_constraint.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -686,10 +688,34 @@ struct SampleParams {
     int   top_k       = 0;
     uint64_t seed     = 0;
     bool  has_seed    = false;
+    // Hard-suppressed token ids: their logits are forced to -inf before any
+    // filtering.  Used by tool_choice:"none" to ban the tool-invoke tokens.
+    // Any non-empty list forces the request off the GPU fast sampler and off
+    // MTP (both sample from raw logits), so it also implies need_logits.
+    std::vector<int32_t> ban;
+    // Optional per-token allow mask (1 = allowed) driven by JSON constrained
+    // decoding.  Refilled in place before every sampling step, so only the
+    // pointer is shared between the job and its SampleParams copy.
+    std::shared_ptr<std::vector<uint8_t>> allow;
 };
 
 static int32_t sample_logits_ptr(const float * logits, int V, const SampleParams & sp, std::mt19937_64 & rng) {
     if (logits == nullptr || V <= 0) return 0;
+    std::vector<float> ban_scratch;
+    if (!sp.ban.empty() || sp.allow) {
+        ban_scratch.assign(logits, logits + V);
+        for (int32_t b : sp.ban) {
+            if (b >= 0 && b < V) ban_scratch[(size_t)b] = -INFINITY;
+        }
+        if (sp.allow) {
+            const std::vector<uint8_t> & m = *sp.allow;
+            const int n = std::min(V, (int)m.size());
+            for (int i = 0; i < n; ++i) {
+                if (!m[(size_t)i]) ban_scratch[(size_t)i] = -INFINITY;
+            }
+        }
+        logits = ban_scratch.data();
+    }
     if (sp.temperature <= 1e-5f) {
         return (int32_t)(std::max_element(logits, logits + V) - logits);
     }
@@ -842,7 +868,8 @@ static int32_t sample_logits(const std::vector<float> & logits, const SamplePara
 // logits to the host and sorting them.  Same target distribution as
 // sample_logits_ptr: softmax(l / T), min-p filter, renormalise.
 static bool use_gpu_full_sampler(const SampleParams & sp) {
-    return sp.temperature > 1e-5f &&
+    return sp.ban.empty() && !sp.allow &&
+           sp.temperature > 1e-5f &&
            (sp.top_k <= 0 || sp.top_k >= VOCAB_UNPADDED) &&
            !(sp.top_p > 0.0f && sp.top_p < 1.0f);
 }
@@ -1082,12 +1109,23 @@ static std::string format_effort_str(const JsonVal * v) {
     return std::string(buf);
 }
 
+// What the prompt builder appends after the last message, i.e. the state the
+// decoder starts in.  tool_choice forcing is emulated this way because the
+// upstream Inkling chat template has no tool_choice concept.
+struct ChatPrime {
+    bool        text        = false;  // <|message_model|><|content_text|>
+    bool        tool_header = false;  // <|message_model|>          (tool_choice:"required")
+    bool        tool_json   = false;  // <|message_model|>NAME<|content_invoke_tool_json|>
+    std::string tool_name;            // NAME for tool_json
+    bool        suppress_tools = false; // tool_choice:"none" -> drop declarations, ban invoke tokens
+};
+
 static bool build_inkling_chat_segments(
         const JsonVal & req_json,
         const BpeTokenizer & bpe,
         std::vector<PromptSegment> & segs,
         bool & has_images,
-        bool & primed_text,
+        ChatPrime & prime,
         std::string & err) {
     const JsonVal * msgs = req_json.get("messages");
     if (!msgs || !msgs->is_arr() || msgs->arr.empty()) {
@@ -1112,6 +1150,25 @@ static bool build_inkling_chat_segments(
     }
     const std::string effort_str = enable_thinking_off ? "0" : format_effort_str(eff_val);
 
+    // tool_choice.  OpenAI semantics, emulated: the Inkling chat template has no
+    // notion of forcing, so "required" and named forcing prime the assistant
+    // tool-call header (a decode-prefix nudge, not a hard constraint), while
+    // "none" drops the tool declarations and bans the invoke tokens so the turn
+    // has to end in prose.
+    std::string tool_choice_mode = "auto";
+    std::string forced_tool_name;
+    if (const JsonVal * tch = req_json.get("tool_choice")) {
+        if (tch->is_str()) {
+            tool_choice_mode = to_lower(tch->str);
+        } else if (tch->is_obj()) {
+            const JsonVal * fn = tch->get("function");
+            if (fn && fn->is_obj()) forced_tool_name = fn->get_str("name");
+            if (forced_tool_name.empty()) forced_tool_name = tch->get_str("name");
+            if (!forced_tool_name.empty()) tool_choice_mode = "function";
+        }
+    }
+    if (tool_choice_mode == "none") prime.suppress_tools = true;
+
     auto ensure_text_seg = [&]() -> std::vector<int32_t> & {
         if (segs.empty() || segs.back().is_image) {
             PromptSegment ps;
@@ -1135,11 +1192,15 @@ static bool build_inkling_chat_segments(
         push_special("<|end_message|>");
     };
 
-    // Native Inkling 2 Mini tool declaration block (exact match to GGUF tokenizer.chat_template)
-    if (const JsonVal * tools = req_json.get("tools"); tools && tools->is_arr() && !tools->arr.empty()) {
+    // Native Inkling 2 Mini tool declaration block (exact match to GGUF tokenizer.chat_template).
+    // tool_choice:"none" suppresses it entirely — declaring tools the model may not call only
+    // makes it burn its budget deciding not to reach for them.
+    const JsonVal * tool_list = req_json.get("tools");
+    if (tool_choice_mode != "none" &&
+        tool_list && tool_list->is_arr() && !tool_list->arr.empty()) {
         JsonVal specs;
         specs.type = JsonVal::J_ARR;
-        for (const JsonVal & tool : tools->arr) {
+        for (const JsonVal & tool : tool_list->arr) {
             if (!tool.is_obj()) continue;
             const JsonVal * fn = tool.get("function");
             if (!fn || !fn->is_obj()) fn = &tool;
@@ -1198,7 +1259,7 @@ static bool build_inkling_chat_segments(
     }
 
     has_images = false;
-    primed_text = false;
+    prime = ChatPrime{};
     bool effort_emitted = false;
     for (const JsonVal & m : msgs->arr) {
         if (!m.is_obj()) continue;
@@ -1335,7 +1396,35 @@ static bool build_inkling_chat_segments(
     if (effort_str == "0" && !has_tools) {
         push_special("<|message_model|>");
         push_special("<|content_text|>");
-        primed_text = true;
+        prime.text = true;
+    }
+
+    // tool_choice, continued: prime the assistant tool-call header.  The header
+    // alone is not enough when the client's own system prompt tells the model to
+    // skip tools, so forcing also emits a system directive that outranks it.
+    if (has_tools && tool_choice_mode != "none") {
+        if (tool_choice_mode == "function" && !forced_tool_name.empty()) {
+            push_special("<|message_system|>");
+            push_special("<|content_text|>");
+            push_plain("tool_choice=required for '" + forced_tool_name +
+                       "': you must call " + forced_tool_name +
+                       " in this turn. Do not answer in text.");
+            push_special("<|end_message|>");
+            push_special("<|message_model|>");
+            push_plain(forced_tool_name);
+            push_special("<|content_invoke_tool_json|>");
+            prime.tool_json = true;
+            prime.tool_name = forced_tool_name;
+        } else if (tool_choice_mode == "required") {
+            push_special("<|message_system|>");
+            push_special("<|content_text|>");
+            push_plain("tool_choice=required: the client requires a tool call in this turn. "
+                       "Call exactly one of the provided tools, even if you could answer "
+                       "from your own knowledge. Do not answer in text.");
+            push_special("<|end_message|>");
+            push_special("<|message_model|>");
+            prime.tool_header = true;
+        }
     }
     return true;
 }
@@ -1344,6 +1433,70 @@ static bool build_inkling_chat_segments(
 // ============================================================================
 // Server State & Generation Engine
 // ============================================================================
+
+// ---- response_format: JSON schema -> constrained decoder -------------------
+// Maps a JSON-schema node onto the constraint machine's value kind.  Anything
+// this engine does not model (nested containers, $ref, anyOf, pattern, ...)
+// degrades to "any JSON value" rather than mis-constraining the output.
+static int nibj_kind_of(const JsonVal & prop) {
+    if (const JsonVal * e = prop.get("enum"); e && e->is_arr() && !e->arr.empty()) {
+        bool all_str = true;
+        for (const JsonVal & v : e->arr) if (!v.is_str()) all_str = false;
+        if (all_str) return nibj::Node::ENUMV;
+    }
+    const std::string t = prop.get_str("type");
+    if (t == "string")  return nibj::Node::STR;
+    if (t == "integer") return nibj::Node::INT;
+    if (t == "number")  return nibj::Node::NUM;
+    if (t == "boolean") return nibj::Node::BOOL;
+    if (t == "null")    return nibj::Node::NUL;
+    if (t == "object")  return nibj::Node::OBJ;
+    if (t == "array")   return nibj::Node::ARR;
+    return -1;
+}
+
+static std::vector<std::string> nibj_enums_of(const JsonVal & prop) {
+    std::vector<std::string> out;
+    if (const JsonVal * e = prop.get("enum"); e && e->is_arr()) {
+        for (const JsonVal & v : e->arr) if (v.is_str()) out.push_back(v.str);
+    }
+    return out;
+}
+
+static void build_json_constraint(const JsonVal & schema, nibj::Constraint & out) {
+    const std::string type = schema.get_str("type");
+
+    if (type == "object") {
+        const JsonVal * props = schema.get("properties");
+        // no declared properties: any object, but still an object
+        if (!props || !props->is_obj() || props->obj.empty()) { out.build_any_object(); return; }
+
+        std::set<std::string> req;
+        if (const JsonVal * r = schema.get("required"); r && r->is_arr()) {
+            for (const JsonVal & v : r->arr) if (v.is_str()) req.insert(v.str);
+        }
+        std::vector<std::string> keys;
+        std::vector<std::vector<std::string>> enums;
+        std::vector<int> kinds;
+        std::vector<bool> required;
+        for (const auto & kv : props->obj) {   // std::map: canonical (sorted) order
+            keys.push_back(kv.first);
+            enums.push_back(nibj_enums_of(kv.second));
+            kinds.push_back(nibj_kind_of(kv.second));
+            required.push_back(req.empty() ? true : req.count(kv.first) > 0);
+        }
+        out.build_object(keys, enums, kinds, required);
+        return;
+    }
+    if (type == "array") {
+        const JsonVal * items = schema.get("items");
+        if (!items || !items->is_obj()) { out.build_any(); return; }
+        out.build_array(nibj_kind_of(*items), nibj_enums_of(*items));
+        return;
+    }
+    out.build_root(nibj_kind_of(schema), nibj_enums_of(schema));
+}
+
 struct ParsedToolCall {
     std::string id;
     std::string name;
@@ -1425,6 +1578,19 @@ struct StreamJob {
     int max_tokens = 1024;
     int est_prompt_toks = 0; // exact for text-only; pre-estimated for multimodal
     SampleParams sp;
+    // JSON constrained decoding (response_format).  `cst` is scheduler-owned
+    // state; `const_mask` is the same buffer sp.allow points at, refilled in
+    // place before each sampling step.
+    nibj::Constraint                       cst;
+    std::shared_ptr<std::vector<uint8_t>>  const_mask;
+    const std::vector<std::string> *       tok_bytes = nullptr;
+    bool                                   constrained = false;
+    // The constraint only governs the content block: thinking is emitted first
+    // and must stay free-form, so masking arms on <|content_text|> and disarms
+    // on the end-of-message token.
+    bool     cst_armed = false;
+    int32_t  cst_arm_tok = -1;
+    int32_t  cst_disarm_tok = -1;
     std::mt19937_64 rng;
     std::vector<int32_t> prompt_toks;       // populated for text-only
     std::vector<PromptSegment> segs;        // populated for multimodal
@@ -3567,9 +3733,11 @@ private:
                     update_cache_span(0);
                 }
                 if (drafter_ != nullptr) drafter_in_sync_ = false;
+                cst_before_sample(*job);
                 const int32_t sampled = gpu_samp
                     ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
                     : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
+                cst_after_sample(*job, sampled);
                 (void)emit_token(job, sampled);
                 continue;
             }
@@ -3652,9 +3820,11 @@ private:
                         update_cache_span(c);
                     }
                     if (c == 0 && drafter_ != nullptr) drafter_in_sync_ = false;
+                    cst_before_sample(*job);
                     const int32_t sampled = gpu_samp
                         ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
                         : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
+                    cst_after_sample(*job, sampled);
                     (void)emit_token(job, sampled);
                 }
             } else if (B >= 2) {
@@ -3711,12 +3881,14 @@ private:
                         slot_cached_toks_[c].push_back(b_toks[r]);
                         update_cache_span(c);
                     }
+                    cst_before_sample(*job);
                     const int32_t sampled = !job->need_logits
                         ? b_argmax[r]
                         : (use_gpu_full_sampler(job->sp)
                             ? (gpu_sampled_ok[r] ? gpu_sampled[r] : b_argmax[r])
                             : sample_logits_ptr(batch_logits_.data() + (size_t)r * VOCAB_UNPADDED,
                                                 VOCAB_UNPADDED, job->sp, job->rng));
+                    cst_after_sample(*job, sampled);
                     (void)emit_token(job, sampled);
                 }
             }
@@ -3740,6 +3912,38 @@ private:
         if (ev0_) { (void)hipEventDestroy(ev0_); ev0_ = nullptr; }
         if (ev1_) { (void)hipEventDestroy(ev1_); ev1_ = nullptr; }
         if (ev2_) { (void)hipEventDestroy(ev2_); ev2_ = nullptr; }
+    }
+
+    // Decoded byte string per token id, needed by the JSON constraint masker.
+    // Built once, on the first request that asks for constrained decoding.
+    void ensure_tok_bytes() {
+        std::call_once(tok_bytes_once_, [this]() {
+            tok_bytes_.resize((size_t)VOCAB_UNPADDED);
+            for (int i = 0; i < VOCAB_UNPADDED; ++i) {
+                tok_bytes_[(size_t)i] = bpe_.decode_token(i, /*skip_special=*/true);
+            }
+        });
+    }
+
+    // JSON constrained decoding: refill the allow mask right before sampling and
+    // advance the machine with the chosen token right after.  The constraint is
+    // armed only inside the content block, so thinking stays free-form.
+    void cst_before_sample(StreamJob & job) {
+        if (job.constrained && job.cst_armed) job.cst.fill(*job.const_mask, *job.tok_bytes);
+    }
+
+    void cst_after_sample(StreamJob & job, int32_t sampled) {
+        if (!job.constrained) return;
+        const std::string & bytes = (*job.tok_bytes)[(size_t)sampled];
+        if (!job.cst_armed && sampled == job.cst_arm_tok) {
+            job.cst_armed = true;                 // content block starts
+            job.cst.reset();
+        } else if (job.cst_armed && sampled == job.cst_disarm_tok) {
+            job.cst_armed = false;                // content block ended
+            std::fill(job.const_mask->begin(), job.const_mask->end(), (uint8_t)1);
+        } else if (job.cst_armed) {
+            job.cst.advance(bytes);
+        }
     }
 
     void handle_generate(int fd, const HttpRequest & req, bool is_chat) {
@@ -3780,13 +3984,17 @@ private:
 
         std::vector<PromptSegment> segs;
         bool has_images = false;
-        bool primed_text = false;
+        ChatPrime prime;
         std::string err;
         if (is_chat) {
-            if (!build_inkling_chat_segments(j, bpe_, segs, has_images, primed_text, err)) {
+            if (!build_inkling_chat_segments(j, bpe_, segs, has_images, prime, err)) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
                                    "{\"error\":{\"message\":" + json_str(err) + "}}");
                 return;
+            }
+            if (prime.suppress_tools) {
+                if (id_invoke_tool_json_ >= 0) sp.ban.push_back(id_invoke_tool_json_);
+                if (id_invoke_tool_text_ >= 0) sp.ban.push_back(id_invoke_tool_text_);
             }
             if (has_images && vision_ == nullptr) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
@@ -3807,14 +4015,59 @@ private:
             segs.push_back(std::move(ps));
         }
 
+        // response_format -> JSON constrained decoding.  Applied from the first
+        // sampled token, so the value can never be syntactically broken.
+        bool     want_constraint = false;
+        nibj::Constraint cst;
+        if (const JsonVal * rf = j.get("response_format"); rf && rf->is_obj()) {
+            const std::string rt = to_lower(rf->get_str("type"));
+            if (rt == "json_object") {
+                cst.build_any_object();
+                want_constraint = true;
+            } else if (rt == "json_schema") {
+                const JsonVal * js  = rf->get("json_schema");
+                const JsonVal * sch = nullptr;
+                if (js && js->is_obj()) {
+                    sch = js->get("schema");
+                    if (!sch) {
+                        // tolerate the flat form {"json_schema": {"type":"object", ...}}
+                        // but reject a json_schema that is clearly not a schema
+                        const bool looks_like_schema = js->get("type") || js->get("properties") ||
+                                                       js->get("items") || js->get("enum") ||
+                                                       js->get("required") || js->get("anyOf");
+                        if (looks_like_schema) sch = js;
+                    }
+                }
+                if (!sch || !sch->is_obj()) {
+                    send_http_response(fd, 400, "Bad Request", "application/json",
+                                       "{\"error\":{\"message\":\"response_format.json_schema requires an object schema\"}}");
+                    return;
+                }
+                build_json_constraint(*sch, cst);
+                want_constraint = true;
+            }
+        }
+
         auto job = std::make_shared<StreamJob>();
         job->req_id      = make_id();
         job->is_chat     = is_chat;
         job->stream      = stream;
         job->has_images  = has_images;
-        job->primed_text = primed_text;
-        job->allow_mtp   = allow_mtp;
-        job->need_logits = (sp.temperature > 1e-5f);
+        job->primed_text = prime.text;
+        if (want_constraint) {
+            ensure_tok_bytes();
+            job->constrained     = true;
+            job->cst             = cst;
+            job->tok_bytes       = &tok_bytes_;
+            job->cst_arm_tok     = id_text_;
+            job->cst_disarm_tok  = id_end_msg_;
+            job->cst_armed       = prime.text;   // primed requests start inside content
+            job->const_mask      = std::make_shared<std::vector<uint8_t>>((size_t)VOCAB_UNPADDED, (uint8_t)1);
+            sp.allow = job->const_mask;          // same buffer, refilled per step
+            sp.ban.clear();                      // the constraint already forbids those
+        }
+        job->allow_mtp   = allow_mtp && sp.ban.empty() && !sp.allow;
+        job->need_logits = (sp.temperature > 1e-5f) || !sp.ban.empty() || sp.allow != nullptr;
         job->max_tokens  = max_tokens;
         job->sp          = sp;
         job->rng.seed(sp.has_seed ? sp.seed : (uint64_t)std::random_device{}());
@@ -3904,7 +4157,9 @@ private:
 
         GenResult gr;
         enum ChatPart { PART_IDLE, PART_HEADER, PART_THINKING, PART_CONTENT, PART_TOOL_JSON, PART_TOOL_TEXT };
-        ChatPart part = (!is_chat || primed_text) ? PART_CONTENT : PART_IDLE;
+        ChatPart part = (!is_chat || prime.text) ? PART_CONTENT : PART_IDLE;
+        if (prime.tool_header) part = PART_HEADER;
+        else if (prime.tool_json) part = PART_TOOL_JSON;
         Utf8StreamBuf u8_think, u8_content, u8_tool;
         std::string header_buf, tool_buf;
         bool aborted = false;
@@ -3919,6 +4174,7 @@ private:
         size_t tool_scan_pos     = 0;
         size_t tool_cur_idx      = 0;
         std::string tool_cur_id, tool_cur_name, tool_args_out;
+        if (prime.tool_json) tool_cur_name = prime.tool_name;
 
         auto trim_str = [](const std::string & s) -> std::string {
             size_t a = 0, b = s.size();
@@ -4071,6 +4327,9 @@ private:
                     fn_args = trimmed;
                 }
             }
+            // Primed tool_choice:{"type":"function"} starts decoding inside the
+            // invoke block, so the model may emit only the args object.
+            if (fn_name.empty() && !tool_cur_name.empty()) fn_name = tool_cur_name;
             if (!fn_name.empty()) {
                 const size_t tc_idx = gr.tool_calls.size();
                 ParsedToolCall tc;
@@ -4357,6 +4616,11 @@ private:
     int32_t id_eot_              = -1;
     int32_t id_invoke_tool_json_ = -1;
     int32_t id_invoke_tool_text_ = -1;
+
+    // Decoded byte string per token id, built lazily the first time a request
+    // asks for constrained (response_format) decoding.  Empty for specials.
+    std::vector<std::string> tok_bytes_;
+    std::once_flag           tok_bytes_once_;
 
     // Continuous batching scheduler state
     std::mutex sched_mu_;
