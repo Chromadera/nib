@@ -2228,9 +2228,20 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                         : rel_table + ((int64_t)qi_rel * N_HEAD + h_rel) * N_REL_EXTENT;
                     const float * rp_row = USE_R_PREP
                         ? r_prep + ((size_t)qi_rel * N_HEAD + (size_t)h_rel) * N_REL : nullptr;
-                    #pragma unroll
+                    // Unroll cap (2x4 instead of the full 4x8): fully unrolling this
+                    // RelBias nest lets p7 keep all NK16*8 = 32 bias rows live at once
+                    // (NK16*8*N_REL = 512 loads on the r_prep path) and sink them into
+                    // the O-accumulation WMMA phase, where O_acc (64 VGPRs) + S (32) +
+                    // the KV fragments already own the 256-VGPR budget that 12
+                    // waves/EU imposes.  Scratch then takes 40-44 VGPRs per
+                    // instantiation on ROCm core 10.2 (HIP 7.17.26434 / clang 24); capping
+                    // the nest is what brings this object back to 0 spills.  The cap
+                    // keeps the per-element order of operations identical, so results
+                    // are bit-identical; it only costs loop bookkeeping on the
+                    // near-diagonal band (dist < N_REL_EXTENT).
+                    #pragma unroll 2
                     for (int nk = 0; nk < NK16; ++nk) {
-                        #pragma unroll
+                        #pragma unroll 4
                         for (int idx = 0; idx < 8; ++idx) {
                             const int32_t dist = qp_val - (k0 + nk * 16 + nib_wmma_c_row(l_halfw, idx));
                             if (dist < N_REL_EXTENT) {
@@ -2279,9 +2290,11 @@ static __global__ void inkling_fa_prefill_gqa_wmma_sparse_global_kernel(
                     : rel_table + ((int64_t)qi_rel * N_HEAD + h_rel) * N_REL_EXTENT;
                 const float * rp_row = USE_R_PREP
                     ? r_prep + ((size_t)qi_rel * N_HEAD + (size_t)h_rel) * N_REL : nullptr;
-                #pragma unroll
+                // Same 2x4 cap as the interior RelBias nest above: both nests have to
+                // be capped together for this object to reach 0 spills / 0 private bytes.
+                #pragma unroll 2
                 for (int nk = 0; nk < NK16; ++nk) {
-                    #pragma unroll
+                    #pragma unroll 4
                     for (int idx = 0; idx < 8; ++idx) {
                         if ((valid_bits[nk] >> idx) & 1u) {
                             const int32_t kp = k0 + nk * 16 + nib_wmma_c_row(l_halfw, idx);
