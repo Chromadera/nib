@@ -686,10 +686,23 @@ struct SampleParams {
     int   top_k       = 0;
     uint64_t seed     = 0;
     bool  has_seed    = false;
+    // Hard-suppressed token ids: their logits are forced to -inf before any
+    // filtering.  Used by tool_choice:"none" to ban the tool-invoke tokens.
+    // Any non-empty list forces the request off the GPU fast sampler and off
+    // MTP (both sample from raw logits), so it also implies need_logits.
+    std::vector<int32_t> ban;
 };
 
 static int32_t sample_logits_ptr(const float * logits, int V, const SampleParams & sp, std::mt19937_64 & rng) {
     if (logits == nullptr || V <= 0) return 0;
+    std::vector<float> ban_scratch;
+    if (!sp.ban.empty()) {
+        ban_scratch.assign(logits, logits + V);
+        for (int32_t b : sp.ban) {
+            if (b >= 0 && b < V) ban_scratch[(size_t)b] = -INFINITY;
+        }
+        logits = ban_scratch.data();
+    }
     if (sp.temperature <= 1e-5f) {
         return (int32_t)(std::max_element(logits, logits + V) - logits);
     }
@@ -842,7 +855,8 @@ static int32_t sample_logits(const std::vector<float> & logits, const SamplePara
 // logits to the host and sorting them.  Same target distribution as
 // sample_logits_ptr: softmax(l / T), min-p filter, renormalise.
 static bool use_gpu_full_sampler(const SampleParams & sp) {
-    return sp.temperature > 1e-5f &&
+    return sp.ban.empty() &&
+           sp.temperature > 1e-5f &&
            (sp.top_k <= 0 || sp.top_k >= VOCAB_UNPADDED) &&
            !(sp.top_p > 0.0f && sp.top_p < 1.0f);
 }
@@ -1082,12 +1096,23 @@ static std::string format_effort_str(const JsonVal * v) {
     return std::string(buf);
 }
 
+// What the prompt builder appends after the last message, i.e. the state the
+// decoder starts in.  tool_choice forcing is emulated this way because the
+// upstream Inkling chat template has no tool_choice concept.
+struct ChatPrime {
+    bool        text        = false;  // <|message_model|><|content_text|>
+    bool        tool_header = false;  // <|message_model|>          (tool_choice:"required")
+    bool        tool_json   = false;  // <|message_model|>NAME<|content_invoke_tool_json|>
+    std::string tool_name;            // NAME for tool_json
+    bool        suppress_tools = false; // tool_choice:"none" -> drop declarations, ban invoke tokens
+};
+
 static bool build_inkling_chat_segments(
         const JsonVal & req_json,
         const BpeTokenizer & bpe,
         std::vector<PromptSegment> & segs,
         bool & has_images,
-        bool & primed_text,
+        ChatPrime & prime,
         std::string & err) {
     const JsonVal * msgs = req_json.get("messages");
     if (!msgs || !msgs->is_arr() || msgs->arr.empty()) {
@@ -1112,6 +1137,25 @@ static bool build_inkling_chat_segments(
     }
     const std::string effort_str = enable_thinking_off ? "0" : format_effort_str(eff_val);
 
+    // tool_choice.  OpenAI semantics, emulated: the Inkling chat template has no
+    // notion of forcing, so "required" and named forcing prime the assistant
+    // tool-call header (a decode-prefix nudge, not a hard constraint), while
+    // "none" drops the tool declarations and bans the invoke tokens so the turn
+    // has to end in prose.
+    std::string tool_choice_mode = "auto";
+    std::string forced_tool_name;
+    if (const JsonVal * tch = req_json.get("tool_choice")) {
+        if (tch->is_str()) {
+            tool_choice_mode = to_lower(tch->str);
+        } else if (tch->is_obj()) {
+            const JsonVal * fn = tch->get("function");
+            if (fn && fn->is_obj()) forced_tool_name = fn->get_str("name");
+            if (forced_tool_name.empty()) forced_tool_name = tch->get_str("name");
+            if (!forced_tool_name.empty()) tool_choice_mode = "function";
+        }
+    }
+    if (tool_choice_mode == "none") prime.suppress_tools = true;
+
     auto ensure_text_seg = [&]() -> std::vector<int32_t> & {
         if (segs.empty() || segs.back().is_image) {
             PromptSegment ps;
@@ -1135,11 +1179,15 @@ static bool build_inkling_chat_segments(
         push_special("<|end_message|>");
     };
 
-    // Native Inkling 2 Mini tool declaration block (exact match to GGUF tokenizer.chat_template)
-    if (const JsonVal * tools = req_json.get("tools"); tools && tools->is_arr() && !tools->arr.empty()) {
+    // Native Inkling 2 Mini tool declaration block (exact match to GGUF tokenizer.chat_template).
+    // tool_choice:"none" suppresses it entirely — declaring tools the model may not call only
+    // makes it burn its budget deciding not to reach for them.
+    const JsonVal * tool_list = req_json.get("tools");
+    if (tool_choice_mode != "none" &&
+        tool_list && tool_list->is_arr() && !tool_list->arr.empty()) {
         JsonVal specs;
         specs.type = JsonVal::J_ARR;
-        for (const JsonVal & tool : tools->arr) {
+        for (const JsonVal & tool : tool_list->arr) {
             if (!tool.is_obj()) continue;
             const JsonVal * fn = tool.get("function");
             if (!fn || !fn->is_obj()) fn = &tool;
@@ -1198,7 +1246,7 @@ static bool build_inkling_chat_segments(
     }
 
     has_images = false;
-    primed_text = false;
+    prime = ChatPrime{};
     bool effort_emitted = false;
     for (const JsonVal & m : msgs->arr) {
         if (!m.is_obj()) continue;
@@ -1335,7 +1383,35 @@ static bool build_inkling_chat_segments(
     if (effort_str == "0" && !has_tools) {
         push_special("<|message_model|>");
         push_special("<|content_text|>");
-        primed_text = true;
+        prime.text = true;
+    }
+
+    // tool_choice, continued: prime the assistant tool-call header.  The header
+    // alone is not enough when the client's own system prompt tells the model to
+    // skip tools, so forcing also emits a system directive that outranks it.
+    if (has_tools && tool_choice_mode != "none") {
+        if (tool_choice_mode == "function" && !forced_tool_name.empty()) {
+            push_special("<|message_system|>");
+            push_special("<|content_text|>");
+            push_plain("tool_choice=required for '" + forced_tool_name +
+                       "': you must call " + forced_tool_name +
+                       " in this turn. Do not answer in text.");
+            push_special("<|end_message|>");
+            push_special("<|message_model|>");
+            push_plain(forced_tool_name);
+            push_special("<|content_invoke_tool_json|>");
+            prime.tool_json = true;
+            prime.tool_name = forced_tool_name;
+        } else if (tool_choice_mode == "required") {
+            push_special("<|message_system|>");
+            push_special("<|content_text|>");
+            push_plain("tool_choice=required: the client requires a tool call in this turn. "
+                       "Call exactly one of the provided tools, even if you could answer "
+                       "from your own knowledge. Do not answer in text.");
+            push_special("<|end_message|>");
+            push_special("<|message_model|>");
+            prime.tool_header = true;
+        }
     }
     return true;
 }
@@ -3780,13 +3856,17 @@ private:
 
         std::vector<PromptSegment> segs;
         bool has_images = false;
-        bool primed_text = false;
+        ChatPrime prime;
         std::string err;
         if (is_chat) {
-            if (!build_inkling_chat_segments(j, bpe_, segs, has_images, primed_text, err)) {
+            if (!build_inkling_chat_segments(j, bpe_, segs, has_images, prime, err)) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
                                    "{\"error\":{\"message\":" + json_str(err) + "}}");
                 return;
+            }
+            if (prime.suppress_tools) {
+                if (id_invoke_tool_json_ >= 0) sp.ban.push_back(id_invoke_tool_json_);
+                if (id_invoke_tool_text_ >= 0) sp.ban.push_back(id_invoke_tool_text_);
             }
             if (has_images && vision_ == nullptr) {
                 send_http_response(fd, 400, "Bad Request", "application/json",
@@ -3812,9 +3892,9 @@ private:
         job->is_chat     = is_chat;
         job->stream      = stream;
         job->has_images  = has_images;
-        job->primed_text = primed_text;
-        job->allow_mtp   = allow_mtp;
-        job->need_logits = (sp.temperature > 1e-5f);
+        job->primed_text = prime.text;
+        job->allow_mtp   = allow_mtp && sp.ban.empty();
+        job->need_logits = (sp.temperature > 1e-5f) || !sp.ban.empty();
         job->max_tokens  = max_tokens;
         job->sp          = sp;
         job->rng.seed(sp.has_seed ? sp.seed : (uint64_t)std::random_device{}());
@@ -3904,7 +3984,9 @@ private:
 
         GenResult gr;
         enum ChatPart { PART_IDLE, PART_HEADER, PART_THINKING, PART_CONTENT, PART_TOOL_JSON, PART_TOOL_TEXT };
-        ChatPart part = (!is_chat || primed_text) ? PART_CONTENT : PART_IDLE;
+        ChatPart part = (!is_chat || prime.text) ? PART_CONTENT : PART_IDLE;
+        if (prime.tool_header) part = PART_HEADER;
+        else if (prime.tool_json) part = PART_TOOL_JSON;
         Utf8StreamBuf u8_think, u8_content, u8_tool;
         std::string header_buf, tool_buf;
         bool aborted = false;
@@ -3919,6 +4001,7 @@ private:
         size_t tool_scan_pos     = 0;
         size_t tool_cur_idx      = 0;
         std::string tool_cur_id, tool_cur_name, tool_args_out;
+        if (prime.tool_json) tool_cur_name = prime.tool_name;
 
         auto trim_str = [](const std::string & s) -> std::string {
             size_t a = 0, b = s.size();
@@ -4071,6 +4154,9 @@ private:
                     fn_args = trimmed;
                 }
             }
+            // Primed tool_choice:{"type":"function"} starts decoding inside the
+            // invoke block, so the model may emit only the args object.
+            if (fn_name.empty() && !tool_cur_name.empty()) fn_name = tool_cur_name;
             if (!fn_name.empty()) {
                 const size_t tc_idx = gr.tool_calls.size();
                 ParsedToolCall tc;
