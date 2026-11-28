@@ -1,0 +1,65 @@
+{
+ "model": "inkling-2-mini",
+ "items": [
+  {
+   "prompt": 0,
+   "repeat": 0,
+   "text": " The compiler spills the excess VGPRs to local memory, so each access to a spilled value becomes a memory load or store. At runtime, the kernel still executes, but it spends extra cycles moving data between registers and local memory. This usually hurts performance because local memory traffic is slower and can",
+   "sha256": "b626fb2b40f73f75",
+   "completion_tokens": 64,
+   "prompt_ms": 51.11,
+   "decode_tps": 113.7,
+   "mtp_tok_per_round": 1.575
+  },
+  {
+   "prompt": 1,
+   "repeat": 0,
+   "text": " for each query token, score every page of the key/value cache, keep the top 224 pages, then attend only to those.\n\ndef top_k_attention(query, kv_pages, k=224):\n    scores = [score(query, page) for page in kv_pages",
+   "sha256": "14325c6fed6a316d",
+   "completion_tokens": 64,
+   "prompt_ms": 48.28,
+   "decode_tps": 163.51,
+   "mtp_tok_per_round": 2.783
+  },
+  {
+   "prompt": 2,
+   "repeat": 0,
+   "text": "\n- Bias-load bandwidth and cache pressure: unrolling increases the number of bias loads, which can saturate memory bandwidth and thrash L1/L2 caches, degrading overall kernel throughput.\n- Register pressure and spills: more unrolled iterations require more live registers, increasing the risk",
+   "sha256": "90c98c13bd1670be",
+   "completion_tokens": 64,
+   "prompt_ms": 43.39,
+   "decode_tps": 104.5,
+   "mtp_tok_per_round": 1.6
+  },
+  {
+   "prompt": 0,
+   "repeat": 1,
+   "text": " The compiler spills the excess VGPRs to local memory, so each access to a spilled value becomes a memory load or store. At runtime, the kernel still executes, but it spends extra cycles moving data between registers and local memory. This usually hurts performance because local memory traffic is slower and can",
+   "sha256": "b626fb2b40f73f75",
+   "completion_tokens": 64,
+   "prompt_ms": 45.94,
+   "decode_tps": 113.32,
+   "mtp_tok_per_round": 1.575
+  },
+  {
+   "prompt": 1,
+   "repeat": 1,
+   "text": " for each query token, score every page of the key/value cache, keep the top 224 pages, then attend only to those.\n\ndef top_k_attention(query, kv_pages, k=224):\n    scores = [score(query, page) for page in kv_pages",
+   "sha256": "14325c6fed6a316d",
+   "completion_tokens": 64,
+   "prompt_ms": 46.01,
+   "decode_tps": 162.93,
+   "mtp_tok_per_round": 2.783
+  },
+  {
+   "prompt": 2,
+   "repeat": 1,
+   "text": "\n- Bias-load bandwidth and cache pressure: unrolling increases the number of bias loads, which can saturate memory bandwidth and thrash L1/L2 caches, degrading overall kernel throughput.\n- Register pressure and spills: more unrolled iterations require more live registers, increasing the risk",
+   "sha256": "90c98c13bd1670be",
+   "completion_tokens": 64,
+   "prompt_ms": 43.58,
+   "decode_tps": 104.45,
+   "mtp_tok_per_round": 1.6
+  }
+ ]
+}
