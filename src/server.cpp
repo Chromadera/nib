@@ -2,6 +2,7 @@
 #include "server_ui.hpp"
 #include "nib_logo.hpp"
 #include "kernels_mtp_verify.h"
+#include "json_constraint.hpp"
 
 #include <hip/hip_runtime.h>
 
@@ -33,6 +34,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -691,15 +693,26 @@ struct SampleParams {
     // Any non-empty list forces the request off the GPU fast sampler and off
     // MTP (both sample from raw logits), so it also implies need_logits.
     std::vector<int32_t> ban;
+    // Optional per-token allow mask (1 = allowed) driven by JSON constrained
+    // decoding.  Refilled in place before every sampling step, so only the
+    // pointer is shared between the job and its SampleParams copy.
+    std::shared_ptr<std::vector<uint8_t>> allow;
 };
 
 static int32_t sample_logits_ptr(const float * logits, int V, const SampleParams & sp, std::mt19937_64 & rng) {
     if (logits == nullptr || V <= 0) return 0;
     std::vector<float> ban_scratch;
-    if (!sp.ban.empty()) {
+    if (!sp.ban.empty() || sp.allow) {
         ban_scratch.assign(logits, logits + V);
         for (int32_t b : sp.ban) {
             if (b >= 0 && b < V) ban_scratch[(size_t)b] = -INFINITY;
+        }
+        if (sp.allow) {
+            const std::vector<uint8_t> & m = *sp.allow;
+            const int n = std::min(V, (int)m.size());
+            for (int i = 0; i < n; ++i) {
+                if (!m[(size_t)i]) ban_scratch[(size_t)i] = -INFINITY;
+            }
         }
         logits = ban_scratch.data();
     }
@@ -855,7 +868,7 @@ static int32_t sample_logits(const std::vector<float> & logits, const SamplePara
 // logits to the host and sorting them.  Same target distribution as
 // sample_logits_ptr: softmax(l / T), min-p filter, renormalise.
 static bool use_gpu_full_sampler(const SampleParams & sp) {
-    return sp.ban.empty() &&
+    return sp.ban.empty() && !sp.allow &&
            sp.temperature > 1e-5f &&
            (sp.top_k <= 0 || sp.top_k >= VOCAB_UNPADDED) &&
            !(sp.top_p > 0.0f && sp.top_p < 1.0f);
@@ -1420,6 +1433,70 @@ static bool build_inkling_chat_segments(
 // ============================================================================
 // Server State & Generation Engine
 // ============================================================================
+
+// ---- response_format: JSON schema -> constrained decoder -------------------
+// Maps a JSON-schema node onto the constraint machine's value kind.  Anything
+// this engine does not model (nested containers, $ref, anyOf, pattern, ...)
+// degrades to "any JSON value" rather than mis-constraining the output.
+static int nibj_kind_of(const JsonVal & prop) {
+    if (const JsonVal * e = prop.get("enum"); e && e->is_arr() && !e->arr.empty()) {
+        bool all_str = true;
+        for (const JsonVal & v : e->arr) if (!v.is_str()) all_str = false;
+        if (all_str) return nibj::Node::ENUMV;
+    }
+    const std::string t = prop.get_str("type");
+    if (t == "string")  return nibj::Node::STR;
+    if (t == "integer") return nibj::Node::INT;
+    if (t == "number")  return nibj::Node::NUM;
+    if (t == "boolean") return nibj::Node::BOOL;
+    if (t == "null")    return nibj::Node::NUL;
+    if (t == "object")  return nibj::Node::OBJ;
+    if (t == "array")   return nibj::Node::ARR;
+    return -1;
+}
+
+static std::vector<std::string> nibj_enums_of(const JsonVal & prop) {
+    std::vector<std::string> out;
+    if (const JsonVal * e = prop.get("enum"); e && e->is_arr()) {
+        for (const JsonVal & v : e->arr) if (v.is_str()) out.push_back(v.str);
+    }
+    return out;
+}
+
+static void build_json_constraint(const JsonVal & schema, nibj::Constraint & out) {
+    const std::string type = schema.get_str("type");
+
+    if (type == "object") {
+        const JsonVal * props = schema.get("properties");
+        // no declared properties: any object, but still an object
+        if (!props || !props->is_obj() || props->obj.empty()) { out.build_any_object(); return; }
+
+        std::set<std::string> req;
+        if (const JsonVal * r = schema.get("required"); r && r->is_arr()) {
+            for (const JsonVal & v : r->arr) if (v.is_str()) req.insert(v.str);
+        }
+        std::vector<std::string> keys;
+        std::vector<std::vector<std::string>> enums;
+        std::vector<int> kinds;
+        std::vector<bool> required;
+        for (const auto & kv : props->obj) {   // std::map: canonical (sorted) order
+            keys.push_back(kv.first);
+            enums.push_back(nibj_enums_of(kv.second));
+            kinds.push_back(nibj_kind_of(kv.second));
+            required.push_back(req.empty() ? true : req.count(kv.first) > 0);
+        }
+        out.build_object(keys, enums, kinds, required);
+        return;
+    }
+    if (type == "array") {
+        const JsonVal * items = schema.get("items");
+        if (!items || !items->is_obj()) { out.build_any(); return; }
+        out.build_array(nibj_kind_of(*items), nibj_enums_of(*items));
+        return;
+    }
+    out.build_root(nibj_kind_of(schema), nibj_enums_of(schema));
+}
+
 struct ParsedToolCall {
     std::string id;
     std::string name;
@@ -1501,6 +1578,19 @@ struct StreamJob {
     int max_tokens = 1024;
     int est_prompt_toks = 0; // exact for text-only; pre-estimated for multimodal
     SampleParams sp;
+    // JSON constrained decoding (response_format).  `cst` is scheduler-owned
+    // state; `const_mask` is the same buffer sp.allow points at, refilled in
+    // place before each sampling step.
+    nibj::Constraint                       cst;
+    std::shared_ptr<std::vector<uint8_t>>  const_mask;
+    const std::vector<std::string> *       tok_bytes = nullptr;
+    bool                                   constrained = false;
+    // The constraint only governs the content block: thinking is emitted first
+    // and must stay free-form, so masking arms on <|content_text|> and disarms
+    // on the end-of-message token.
+    bool     cst_armed = false;
+    int32_t  cst_arm_tok = -1;
+    int32_t  cst_disarm_tok = -1;
     std::mt19937_64 rng;
     std::vector<int32_t> prompt_toks;       // populated for text-only
     std::vector<PromptSegment> segs;        // populated for multimodal
@@ -3643,9 +3733,11 @@ private:
                     update_cache_span(0);
                 }
                 if (drafter_ != nullptr) drafter_in_sync_ = false;
+                cst_before_sample(*job);
                 const int32_t sampled = gpu_samp
                     ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
                     : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
+                cst_after_sample(*job, sampled);
                 (void)emit_token(job, sampled);
                 continue;
             }
@@ -3728,9 +3820,11 @@ private:
                         update_cache_span(c);
                     }
                     if (c == 0 && drafter_ != nullptr) drafter_in_sync_ = false;
+                    cst_before_sample(*job);
                     const int32_t sampled = gpu_samp
                         ? sample_decode_row_gpu(eng_, job->sp, job->rng, next)
                         : (job->need_logits ? sample_logits(single_logits, job->sp, job->rng) : next);
+                    cst_after_sample(*job, sampled);
                     (void)emit_token(job, sampled);
                 }
             } else if (B >= 2) {
@@ -3787,12 +3881,14 @@ private:
                         slot_cached_toks_[c].push_back(b_toks[r]);
                         update_cache_span(c);
                     }
+                    cst_before_sample(*job);
                     const int32_t sampled = !job->need_logits
                         ? b_argmax[r]
                         : (use_gpu_full_sampler(job->sp)
                             ? (gpu_sampled_ok[r] ? gpu_sampled[r] : b_argmax[r])
                             : sample_logits_ptr(batch_logits_.data() + (size_t)r * VOCAB_UNPADDED,
                                                 VOCAB_UNPADDED, job->sp, job->rng));
+                    cst_after_sample(*job, sampled);
                     (void)emit_token(job, sampled);
                 }
             }
@@ -3816,6 +3912,38 @@ private:
         if (ev0_) { (void)hipEventDestroy(ev0_); ev0_ = nullptr; }
         if (ev1_) { (void)hipEventDestroy(ev1_); ev1_ = nullptr; }
         if (ev2_) { (void)hipEventDestroy(ev2_); ev2_ = nullptr; }
+    }
+
+    // Decoded byte string per token id, needed by the JSON constraint masker.
+    // Built once, on the first request that asks for constrained decoding.
+    void ensure_tok_bytes() {
+        std::call_once(tok_bytes_once_, [this]() {
+            tok_bytes_.resize((size_t)VOCAB_UNPADDED);
+            for (int i = 0; i < VOCAB_UNPADDED; ++i) {
+                tok_bytes_[(size_t)i] = bpe_.decode_token(i, /*skip_special=*/true);
+            }
+        });
+    }
+
+    // JSON constrained decoding: refill the allow mask right before sampling and
+    // advance the machine with the chosen token right after.  The constraint is
+    // armed only inside the content block, so thinking stays free-form.
+    void cst_before_sample(StreamJob & job) {
+        if (job.constrained && job.cst_armed) job.cst.fill(*job.const_mask, *job.tok_bytes);
+    }
+
+    void cst_after_sample(StreamJob & job, int32_t sampled) {
+        if (!job.constrained) return;
+        const std::string & bytes = (*job.tok_bytes)[(size_t)sampled];
+        if (!job.cst_armed && sampled == job.cst_arm_tok) {
+            job.cst_armed = true;                 // content block starts
+            job.cst.reset();
+        } else if (job.cst_armed && sampled == job.cst_disarm_tok) {
+            job.cst_armed = false;                // content block ended
+            std::fill(job.const_mask->begin(), job.const_mask->end(), (uint8_t)1);
+        } else if (job.cst_armed) {
+            job.cst.advance(bytes);
+        }
     }
 
     void handle_generate(int fd, const HttpRequest & req, bool is_chat) {
@@ -3887,14 +4015,59 @@ private:
             segs.push_back(std::move(ps));
         }
 
+        // response_format -> JSON constrained decoding.  Applied from the first
+        // sampled token, so the value can never be syntactically broken.
+        bool     want_constraint = false;
+        nibj::Constraint cst;
+        if (const JsonVal * rf = j.get("response_format"); rf && rf->is_obj()) {
+            const std::string rt = to_lower(rf->get_str("type"));
+            if (rt == "json_object") {
+                cst.build_any_object();
+                want_constraint = true;
+            } else if (rt == "json_schema") {
+                const JsonVal * js  = rf->get("json_schema");
+                const JsonVal * sch = nullptr;
+                if (js && js->is_obj()) {
+                    sch = js->get("schema");
+                    if (!sch) {
+                        // tolerate the flat form {"json_schema": {"type":"object", ...}}
+                        // but reject a json_schema that is clearly not a schema
+                        const bool looks_like_schema = js->get("type") || js->get("properties") ||
+                                                       js->get("items") || js->get("enum") ||
+                                                       js->get("required") || js->get("anyOf");
+                        if (looks_like_schema) sch = js;
+                    }
+                }
+                if (!sch || !sch->is_obj()) {
+                    send_http_response(fd, 400, "Bad Request", "application/json",
+                                       "{\"error\":{\"message\":\"response_format.json_schema requires an object schema\"}}");
+                    return;
+                }
+                build_json_constraint(*sch, cst);
+                want_constraint = true;
+            }
+        }
+
         auto job = std::make_shared<StreamJob>();
         job->req_id      = make_id();
         job->is_chat     = is_chat;
         job->stream      = stream;
         job->has_images  = has_images;
         job->primed_text = prime.text;
-        job->allow_mtp   = allow_mtp && sp.ban.empty();
-        job->need_logits = (sp.temperature > 1e-5f) || !sp.ban.empty();
+        if (want_constraint) {
+            ensure_tok_bytes();
+            job->constrained     = true;
+            job->cst             = cst;
+            job->tok_bytes       = &tok_bytes_;
+            job->cst_arm_tok     = id_text_;
+            job->cst_disarm_tok  = id_end_msg_;
+            job->cst_armed       = prime.text;   // primed requests start inside content
+            job->const_mask      = std::make_shared<std::vector<uint8_t>>((size_t)VOCAB_UNPADDED, (uint8_t)1);
+            sp.allow = job->const_mask;          // same buffer, refilled per step
+            sp.ban.clear();                      // the constraint already forbids those
+        }
+        job->allow_mtp   = allow_mtp && sp.ban.empty() && !sp.allow;
+        job->need_logits = (sp.temperature > 1e-5f) || !sp.ban.empty() || sp.allow != nullptr;
         job->max_tokens  = max_tokens;
         job->sp          = sp;
         job->rng.seed(sp.has_seed ? sp.seed : (uint64_t)std::random_device{}());
@@ -4443,6 +4616,11 @@ private:
     int32_t id_eot_              = -1;
     int32_t id_invoke_tool_json_ = -1;
     int32_t id_invoke_tool_text_ = -1;
+
+    // Decoded byte string per token id, built lazily the first time a request
+    // asks for constrained (response_format) decoding.  Empty for specials.
+    std::vector<std::string> tok_bytes_;
+    std::once_flag           tok_bytes_once_;
 
     // Continuous batching scheduler state
     std::mutex sched_mu_;
