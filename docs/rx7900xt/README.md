@@ -30,6 +30,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
 | [`scripts/bench_mtp.sh`](scripts/bench_mtp.sh) | MTP `nib gen --mtp` prefill + decode benchmark across `q8_0 @ 90K`, `q4_1 @ 163K`, `q4_0 @ 180K` |
 | [`scripts/bench_concurrency_local.sh`](scripts/bench_concurrency_local.sh) | Zero-WAN-RTT localhost BetterBench `--decode --concurrency` sweep for `--slots 8 -c 65536 q4_1 + MTP` |
 | [`scripts/bench_vision_matrix.sh`](scripts/bench_vision_matrix.sh) | Vision (`--mmproj`) + MTP matrix (`1024×512` + `1920×1080` + post-image regression) reproducing Issue #5 |
+| [`hip717_clang24_2026-11-28/NOTES.md`](hip717_clang24_2026-11-28/NOTES.md) | Native-Linux ROCm core 10.2 / HIP 7.17 / clang 24 rerun: `kernels_sparse_global.o` spill regression on `v0.2.1` source, the RelBias unroll-cap fix, and kernel + live-server A/B evidence |
 
 ---
 
@@ -53,6 +54,7 @@ Real-silicon characterization of **Nib** running **Inkling 2 Mini** (`Inkling-2-
    - Local native Linux **ROCm 7.16 (clang 24)** compiles all 18 `nib` objects with **0 spills**.
    - Container **ROCm 7.2.4 (clang 22)** spills `1312 VGPR / 4 SGPR` in `kernels_fa.o` and `1286 VGPR` in `kernels_sparse_global.o`, while **all decode kernels remain 0-spill**.
    - Result: decode hits **90–92% of RX 7900 XTX**, while dense `32K` and sparse `64K–256K` prefill land at **~72–75% of XTX** (estimated ~85% on native Linux ROCm 7.16 / `7.14.1-full`).
+   - **Update (2026-11-28, native Linux, ROCm core 10.2 / HIP 7.17 / clang 24):** the same `v0.2.1` source now spills `252 VGPR` there (6 prefill instantiations at `40-44` each, `maxPriv=96`), so the native-Linux line above no longer holds on the newer package. Capping the RelBias unroll restores `0/0/0/0` across all 19 objects, makes FA-prefill launches **17-29% faster** in isolation with **bit-identical** output, and moves the live server by **< 1%** (kernel-bound share is small at `--sparse-pages 224`) — see [`hip717_clang24_2026-11-28/NOTES.md`](hip717_clang24_2026-11-28/NOTES.md).
 4. **Co-Residency Guards Verified on 42 WGPs:** Startup logged `occupancy blocks/WGP (wgp=42): wo_b=2 wo_c=2 wo_c_h2=3 mix_rms_qkv=4 a_qkv=4` and captured the 312-node static decode HIP graph with zero hangs or parity issues.
 
 ---

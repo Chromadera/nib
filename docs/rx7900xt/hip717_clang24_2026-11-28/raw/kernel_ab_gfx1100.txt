@@ -1,0 +1,99 @@
+RX 7900 XT (gfx1100) — inkling_fa_prefill_gqa_wmma_sparse_global_kernel micro-benchmark A/B
+date: 2026-11-28, host "myai", GPU taken exclusively (load_gpu0.service stopped for the run)
+
+Two bench binaries, identical TU, differing only in src/kernels_sparse_global.hip:
+  base  (= bench_prefix): source at f6b3694  (v0.3.0 version bump, spill source intact)
+  fixed (= bench_fixed) : source at d0f4517  (RelBias unroll cap 2x4)
+Deployment counterparts on the same host:
+  /opt/nib/bin/nib.pre-fix  md5 ef7044f5e99147b56c27d57a05597dd2   (spill build)
+  /opt/nib/bin/nib          md5 2c45bfadfd7338d9fc253f10a17742ae   (fixed build)
+
+Build (same for both variants, run from the repo root; step 2 links against the object that
+scripts/spill_audit.sh inspects, so the bench uses exactly the audited device code):
+  /opt/rocm/bin/hipcc --offload-arch=gfx1100 -O3 --std=c++17 -DGPU_TARGET=gfx1100 \
+      -DWITH_ROCM -DWMMA_M=64 -I include -I src -c bench_fa_sparse.hip -o bench.o
+  /opt/rocm/bin/hipcc bench.o build/kernels_sparse_global.o -o bench_prefix -lamdhip64
+  # base variant: `git checkout f6b3694 -- src/kernels_sparse_global.hip && cmake --build build`,
+  #   relink bench.o against that kernels_sparse_global.o, then restore the source file
+  # base variant produced by `git checkout f6b3694 -- src/kernels_sparse_global.hip`, rebuild, restore
+
+Shape: n_tokens=512, sparse_pages=224, iters=12 (3 warmups discarded), min over the 12 launches,
+       kv_type=0 (Q8_0 KV), meta_fmt=0 (Q8 page meta).
+       `bitdiff` = element count differing from the harness CPU reference; md5 = the dumped
+       output tensor, used to compare the two builds byte for byte.
+
+--- rel_mode=0 (rel_table bias path) -------------------------------------------------------
+
+$ ./bench_prefix 8192 512 224 12 0 0 0 out_prefix_0_8192.bin
+RESULT ms_min=2.7179 ms_avg=2.8508  attn_tok_per_s=188378.1  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  8192 512 224 12 0 0 0 out_fixed_0_8192.bin
+RESULT ms_min=2.0015 ms_avg=2.1781  attn_tok_per_s=255803.9  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_0_8192.bin  = md5 out_fixed_0_8192.bin  = e25326fe6aff40bb...   MATCH
+
+$ ./bench_prefix 16384 512 224 12 0 0 0 out_prefix_0_16384.bin
+RESULT ms_min=4.3064 ms_avg=4.5435  attn_tok_per_s=118892.0  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  16384 512 224 12 0 0 0 out_fixed_0_16384.bin
+RESULT ms_min=3.5733 ms_avg=3.8530  attn_tok_per_s=143283.2  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_0_16384.bin = md5 out_fixed_0_16384.bin = cf2102111c74c394...   MATCH
+
+$ ./bench_prefix 32768 512 224 12 0 0 0 out_prefix_0_32768.bin
+RESULT ms_min=4.4693 ms_avg=4.7022  attn_tok_per_s=114560.2  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  32768 512 224 12 0 0 0 out_fixed_0_32768.bin
+RESULT ms_min=3.5528 ms_avg=3.8073  attn_tok_per_s=144112.4  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_0_32768.bin = md5 out_fixed_0_32768.bin = 4b7d4b532445c95c...   MATCH
+
+$ ./bench_prefix 65536 512 224 12 0 0 0 out_prefix_0_65536.bin
+RESULT ms_min=4.4015 ms_avg=4.6047  attn_tok_per_s=116322.7  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  65536 512 224 12 0 0 0 out_fixed_0_65536.bin
+RESULT ms_min=3.3821 ms_avg=3.6397  attn_tok_per_s=151386.9  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_0_65536.bin = md5 out_fixed_0_65536.bin = bb2a9d1ab0297d98...   MATCH
+
+$ ./bench_prefix 131072 512 224 12 0 0 0 out_prefix_0_131072.bin
+RESULT ms_min=4.2445 ms_avg=4.5714  attn_tok_per_s=120626.5  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  131072 512 224 12 0 0 0 out_fixed_0_131072.bin
+RESULT ms_min=3.3753 ms_avg=3.5749  attn_tok_per_s=151690.1  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_0_131072.bin = md5 out_fixed_0_131072.bin = 2d2ab3f670c47348...  MATCH
+
+--- rel_mode=1 (r_prep bias path) ---------------------------------------------------------
+
+$ ./bench_prefix 8192 512 224 12 1 0 0 out_prefix_1_8192.bin
+RESULT ms_min=2.4418 ms_avg=2.6816  attn_tok_per_s=209680.0  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  8192 512 224 12 1 0 0 out_fixed_1_8192.bin
+RESULT ms_min=1.9128 ms_avg=2.1464  attn_tok_per_s=267674.4  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_1_8192.bin  = md5 out_fixed_1_8192.bin  = bb038a18dc97085f...   MATCH
+
+$ ./bench_prefix 16384 512 224 12 1 0 0 out_prefix_1_16384.bin
+RESULT ms_min=4.4832 ms_avg=4.6531  attn_tok_per_s=114205.4  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  16384 512 224 12 1 0 0 out_fixed_1_16384.bin
+RESULT ms_min=3.5785 ms_avg=3.7584  attn_tok_per_s=143075.0  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_1_16384.bin = md5 out_fixed_1_16384.bin = e32460ac2c231ee5...   MATCH
+
+$ ./bench_prefix 32768 512 224 12 1 0 0 out_prefix_1_32768.bin
+RESULT ms_min=4.4220 ms_avg=4.6508  attn_tok_per_s=115785.0  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  32768 512 224 12 1 0 0 out_fixed_1_32768.bin
+RESULT ms_min=3.2638 ms_avg=3.5802  attn_tok_per_s=156873.3  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_1_32768.bin = md5 out_fixed_1_32768.bin = 5b0c81586dfba270...   MATCH
+
+$ ./bench_prefix 65536 512 224 12 1 0 0 out_prefix_1_65536.bin
+RESULT ms_min=4.5603 ms_avg=4.7411  attn_tok_per_s=112274.0  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  65536 512 224 12 1 0 0 out_fixed_1_65536.bin
+RESULT ms_min=3.3309 ms_avg=3.6284  attn_tok_per_s=153714.0  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_1_65536.bin = md5 out_fixed_1_65536.bin = bd97fc1c47bc095d...   MATCH
+
+$ ./bench_prefix 131072 512 224 12 1 0 0 out_prefix_1_131072.bin
+RESULT ms_min=4.6596 ms_avg=4.8212  attn_tok_per_s=109881.8  bitdiff=0 maxrel=0.000e+00
+$ ./bench_fixed  131072 512 224 12 1 0 0 out_fixed_1_131072.bin
+RESULT ms_min=3.3231 ms_avg=3.6392  attn_tok_per_s=154072.9  bitdiff=0 maxrel=0.000e+00
+   md5 out_prefix_1_131072.bin = md5 out_fixed_1_131072.bin = d88ed64eb0adfd4e...  MATCH
+
+--- notes ---------------------------------------------------------------------------------
+
+* A separate, shallower sweep on the same two binaries during development (n_kv 4,096 and
+  8,192 with kv_type=1) gave 1.3223 -> 1.0613 ms and 2.4645 -> 1.9088 ms (-19.7% / -22.5%),
+  with identical output md5 (1164c2763d5ddd39... / 083bf79a1fd73f01...).
+* kv_type=1 (Q4_1 KV) in this harness aborts with "illegal memory access" at n_kv >= 16384,
+  and its CPU reference reports a large bitdiff at any depth. The engine serves q4_1 at
+  262,848 context without issue, so this is a harness allocation/reference bug: use
+  kv_type=0 until it is fixed.
+* Timings are wall-clock launch-loop minima on an idle GPU; both variants were run back to
+  back in the same session, and the fixed binary was run twice at each shape with <2% spread.

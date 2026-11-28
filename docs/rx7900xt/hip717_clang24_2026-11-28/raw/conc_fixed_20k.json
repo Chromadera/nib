@@ -1,0 +1,26 @@
+{
+ "n": 2,
+ "target_tokens": 20480,
+ "rounds": [
+  {
+   "prompt_tokens": 12774,
+   "prompt_ms": [
+    6622.0,
+    6655.1
+   ],
+   "wall_s": 6.671,
+   "agg_prefill_tps": 3833.7
+  },
+  {
+   "prompt_tokens": 12802,
+   "prompt_ms": [
+    6677.5,
+    6656.8
+   ],
+   "wall_s": 6.701,
+   "agg_prefill_tps": 3818.8
+  }
+ ],
+ "best": 3833.7,
+ "median": 3833.7
+}

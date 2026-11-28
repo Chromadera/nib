@@ -1,0 +1,66 @@
+{
+ "url": "http://myai:8081",
+ "sizes": [
+  {
+   "prompt_tokens": 63895,
+   "prompt_ms_median": 19832.97,
+   "prefill_tps_best": 3254.4529391690567,
+   "rounds": [
+    3254.5,
+    3220.4
+   ],
+   "round_ms": [
+    19633.1,
+    19833.0
+   ]
+  },
+  {
+   "prompt_tokens": 95867,
+   "prompt_ms_median": 30019.6,
+   "prefill_tps_best": 3199.2500699138272,
+   "rounds": [
+    3199.3,
+    3192.2
+   ],
+   "round_ms": [
+    29965.5,
+    30019.6
+   ]
+  },
+  {
+   "prompt_tokens": 124159,
+   "prompt_ms_median": 38757.61,
+   "prefill_tps_best": 3206.2464795691803,
+   "rounds": [
+    3203.5,
+    3206.2
+   ],
+   "round_ms": [
+    38757.6,
+    38755.9
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "best": 16666.666666666668,
+   "mean": 15476.190476190477,
+   "rounds": [
+    0.1,
+    0.1
+   ]
+  }
+ ],
+ "seed": 7,
+ "health": {
+  "model": "inkling-2-mini",
+  "gpu_name": "AMD Radeon RX 7900 XT",
+  "gpu_arch": "gfx1100",
+  "max_ctx": 132768,
+  "max_slots": 2,
+  "kv_type": "q4_1",
+  "sparse_pages": 224,
+  "mtp": true,
+  "version": "0.3.0"
+ }
+}

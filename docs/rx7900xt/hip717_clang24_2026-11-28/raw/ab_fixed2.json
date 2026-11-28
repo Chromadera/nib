@@ -1,0 +1,118 @@
+{
+ "url": "http://myai:8081",
+ "sizes": [
+  {
+   "prompt_tokens": 645,
+   "prompt_ms_median": 203.25,
+   "prefill_tps_best": 3198.0319803198036,
+   "rounds": [
+    3079.5,
+    3196.5,
+    3198.0
+   ],
+   "round_ms": [
+    209.4,
+    201.2,
+    203.2
+   ]
+  },
+  {
+   "prompt_tokens": 2580,
+   "prompt_ms_median": 690.89,
+   "prefill_tps_best": 3817.250980509566,
+   "rounds": [
+    3659.4,
+    3709.7,
+    3817.3
+   ],
+   "round_ms": [
+    705.0,
+    690.9,
+    668.0
+   ]
+  },
+  {
+   "prompt_tokens": 5133,
+   "prompt_ms_median": 1366.63,
+   "prefill_tps_best": 3760.8528409715354,
+   "rounds": [
+    3760.9,
+    3753.0,
+    3752.8
+   ],
+   "round_ms": [
+    1364.8,
+    1366.6,
+    1367.5
+   ]
+  },
+  {
+   "prompt_tokens": 10241,
+   "prompt_ms_median": 2709.69,
+   "prefill_tps_best": 3779.032204472371,
+   "rounds": [
+    3766.0,
+    3779.0,
+    3768.0
+   ],
+   "round_ms": [
+    2719.3,
+    2708.6,
+    2709.7
+   ]
+  },
+  {
+   "prompt_tokens": 20468,
+   "prompt_ms_median": 5595.54,
+   "prefill_tps_best": 3656.240510173094,
+   "rounds": [
+    3656.2,
+    3655.9,
+    3654.6
+   ],
+   "round_ms": [
+    5598.1,
+    5595.5,
+    5592.2
+   ]
+  },
+  {
+   "prompt_tokens": 30672,
+   "prompt_ms_median": 8676.33,
+   "prefill_tps_best": 3535.755366442564,
+   "rounds": [
+    3535.1,
+    3535.8,
+    3533.1
+   ],
+   "round_ms": [
+    8676.3,
+    8685.0,
+    8671.5
+   ]
+  }
+ ],
+ "decode": [
+  {
+   "best": 121.82934373958977,
+   "mean": 120.65662248803858,
+   "rounds": [
+    1054.5,
+    1077.8,
+    1050.7
+   ]
+  }
+ ],
+ "seed": 7,
+ "health": {
+  "model": "inkling-2-mini",
+  "gpu_name": "AMD Radeon RX 7900 XT",
+  "gpu_arch": "gfx1100",
+  "max_ctx": 132768,
+  "max_slots": 2,
+  "kv_type": "q4_1",
+  "sparse_pages": 224,
+  "mtp": true,
+  "version": "0.3.0"
+ }
+}
